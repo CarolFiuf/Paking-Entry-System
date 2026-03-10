@@ -1,0 +1,5 @@
+path: /home/somethink/parking_system/yolo_plate_data
+train: images/train
+val: images/val
+nc: 1
+names: ['plate']

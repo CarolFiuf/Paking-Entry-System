@@ -1,0 +1,61 @@
+# nvinfer config — YOLOv8n Plate Detection
+# Dùng với DeepStream pipeline
+#
+# SETUP:
+# 1. Export model sang TensorRT engine:
+#    yolo export model=models/plate_yolov8n.pt format=engine half=True imgsz=640
+#    → tạo file models/plate_yolov8n.engine
+#
+# 2. Hoặc dùng trtexec:
+#    /usr/src/tensorrt/bin/trtexec \
+#      --onnx=models/plate_yolov8n.onnx \
+#      --saveEngine=models/plate_yolov8n.engine \
+#      --fp16
+
+[property]
+gpu-id=0
+net-scale-factor=0.003921569
+# 1/255 = 0.003921569 (normalize to 0-1)
+
+model-engine-file=/home/somethink/parking_system/models/plate_yolov8n.engine
+# Nếu chưa có .engine, dùng ONNX + auto-build:
+onnx-file=/home/somethink/parking_system/models/plate_yolov8n.onnx
+# model-engine-file=./models/plate_yolov8n.engine
+
+batch-size=2
+# 2 sources trong pipeline
+
+network-mode=2
+# 0=FP32, 1=INT8, 2=FP16
+
+num-detected-classes=1
+# 1 class: license_plate
+
+interval=0
+# Inference mỗi frame (0 = no skip)
+
+gie-unique-id=1
+process-mode=1
+# 1=primary detector
+
+network-type=0
+# 0=detector, 1=classifier
+
+cluster-mode=2
+# 2=NMS
+
+maintain-aspect-ratio=1
+symmetric-padding=1
+infer-dims=3;640;640
+# CHW format, 640x640 input
+
+output-blob-names=output0
+parse-func=0
+parse-bbox-func-name=NvDsInferParseYoloV8
+custom-lib-path=/home/somethink/parking_system/parsers/libnvds_yolov8_parser.so
+output-tensor-meta=0
+
+[class-attrs-all]
+pre-cluster-threshold=0.4
+nms-iou-threshold=0.45
+

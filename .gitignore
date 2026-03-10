@@ -1,0 +1,53 @@
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Logs / temp
+*.log
+tmp/
+temp/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# DB
+*.db
+*.sqlite
+*.sqlite3
+
+# Heavy model files
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.plan
+*.ckpt
+*.weights
+*.bin
+*.tflite
+
+# Native build artifacts
+*.so
+*.o
+*.a
+
+# Install packages
+*.whl
+*.deb
+
+# Project outputs / datasets
+runs/
+yolo_plate_data/
+yolo_plate_dataset/
+yolo_plate_ocr_dataset/
+models/

@@ -1,0 +1,24 @@
+# Smart Parking System — Jetson Orin Nano
+# pip install -r requirements.txt --break-system-packages
+
+# AI
+numpy>=1.24
+opencv-python-headless>=4.8
+ultralytics>=8.1
+insightface>=0.7.3
+onnxruntime-gpu>=1.16
+
+# OCR (PaddlePaddle GPU cài riêng cho Jetson)
+paddleocr>=3.0
+
+# Database
+psycopg2-binary>=2.9
+pgvector>=0.2
+
+# Web dashboard
+fastapi>=0.104
+uvicorn[standard]>=0.24
+websockets>=12.0
+
+# Config
+pyyaml>=6.0

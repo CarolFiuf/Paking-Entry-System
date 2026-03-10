@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Parking Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0b;--card:#111113;--border:#1e1e22;--text:#d4d4d8;
+  --dim:#71717a;--green:#22c55e;--red:#ef4444;--yellow:#eab308;
+  --blue:#3b82f6;--font:'SF Mono',Consolas,'Courier New',monospace}
+body{font-family:var(--font);background:var(--bg);color:var(--text);
+  min-height:100vh;padding:16px}
+.header{display:flex;align-items:center;gap:12px;padding:12px 0;
+  border-bottom:1px solid var(--border);margin-bottom:16px}
+.header h1{font-size:15px;font-weight:700;letter-spacing:1px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot.on{background:var(--green);box-shadow:0 0 8px var(--green)}
+.dot.off{background:var(--red)}
+.badge{font-size:10px;padding:2px 8px;border-radius:10px;
+  font-weight:600;letter-spacing:1px}
+.badge.ds{background:#7c3aed22;color:#a78bfa;border:1px solid #7c3aed44}
+.badge.gs{background:#f5920822;color:#fbbf24;border:1px solid #f5920844}
+
+/* Stats grid */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:10px;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;
+  padding:14px 16px}
+.stat .label{font-size:9px;color:var(--dim);font-weight:600;
+  letter-spacing:1.5px;margin-bottom:6px}
+.stat .value{font-size:22px;font-weight:800}
+.stat .value.green{color:var(--green)}
+.stat .value.yellow{color:var(--yellow)}
+.stat .value.blue{color:var(--blue)}
+
+/* Tables */
+.panel{background:var(--card);border:1px solid var(--border);
+  border-radius:8px;margin-bottom:16px;overflow:hidden}
+.panel-head{padding:12px 16px;border-bottom:1px solid var(--border);
+  font-size:11px;font-weight:700;color:var(--dim);letter-spacing:1.5px;
+  display:flex;justify-content:space-between;align-items:center}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:8px 14px;color:var(--dim);font-size:9px;
+  font-weight:600;letter-spacing:1px;border-bottom:1px solid var(--border)}
+td{padding:8px 14px;border-bottom:1px solid #15151a}
+tr:hover td{background:#15151a}
+.plate{color:var(--green);font-weight:700;font-size:13px}
+.conf{color:var(--dim)}
+.time{color:var(--dim);font-size:11px}
+
+/* Live events feed */
+.events{max-height:280px;overflow-y:auto}
+.event{padding:10px 16px;border-bottom:1px solid #15151a;
+  display:flex;gap:12px;align-items:center;animation:fadeIn .3s ease}
+.event .icon{font-size:16px}
+.event .info{flex:1}
+.event .info .plate{font-size:13px}
+.event .info .detail{font-size:10px;color:var(--dim);margin-top:2px}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+
+/* Connection status */
+.cams{display:flex;gap:10px;margin-bottom:16px}
+.cam-status{background:var(--card);border:1px solid var(--border);
+  border-radius:8px;padding:10px 16px;flex:1;display:flex;
+  align-items:center;gap:8px;font-size:11px}
+
+/* Footer */
+.footer{text-align:center;color:var(--dim);font-size:10px;
+  padding:16px 0;letter-spacing:1px}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>SMART PARKING</h1>
+  <span class="dot" id="ws-dot"></span>
+  <span id="ws-status" style="font-size:10px;color:var(--dim)">connecting...</span>
+  <span style="flex:1"></span>
+  <span class="badge" id="engine-badge">—</span>
+  <span style="font-size:11px;color:var(--dim)" id="mode-label">—</span>
+</div>
+
+<!-- Camera status -->
+<div class="cams">
+  <div class="cam-status">
+    <span class="dot" id="cam-plate-dot"></span>
+    <span>PLATE CAM</span>
+  </div>
+  <div class="cam-status">
+    <span class="dot" id="cam-face-dot"></span>
+    <span>FACE CAM</span>
+  </div>
+</div>
+
+<!-- Live streams -->
+<div style="display:flex;gap:10px;margin-bottom:16px">
+  <div style="flex:1;background:var(--card);border:1px solid var(--border);
+    border-radius:8px;overflow:hidden">
+    <div style="padding:8px 14px;font-size:10px;font-weight:700;
+      color:var(--dim);letter-spacing:1.5px;border-bottom:1px solid var(--border)">
+      PLATE CAM</div>
+    <img id="stream-plate" style="width:100%;display:block"
+      onerror="this.style.opacity=0.3" alt="plate cam">
+  </div>
+  <div style="flex:1;background:var(--card);border:1px solid var(--border);
+    border-radius:8px;overflow:hidden">
+    <div style="padding:8px 14px;font-size:10px;font-weight:700;
+      color:var(--dim);letter-spacing:1.5px;border-bottom:1px solid var(--border)">
+      FACE CAM</div>
+    <img id="stream-face" style="width:100%;display:block"
+      onerror="this.style.opacity=0.3" alt="face cam">
+  </div>
+</div>
+
+<!-- Stats -->
+<div class="stats">
+  <div class="stat">
+    <div class="label">XE TRONG BÃI</div>
+    <div class="value green" id="s-current">—</div>
+  </div>
+  <div class="stat">
+    <div class="label">SỨC CHỨA</div>
+    <div class="value" id="s-capacity">—</div>
+  </div>
+  <div class="stat">
+    <div class="label">% ĐẦY</div>
+    <div class="value yellow" id="s-pct">—</div>
+  </div>
+  <div class="stat">
+    <div class="label">FPS</div>
+    <div class="value blue" id="s-fps">—</div>
+  </div>
+</div>
+
+<!-- Live events -->
+<div class="panel">
+  <div class="panel-head">
+    <span>SỰ KIỆN TRỰC TIẾP</span>
+    <span id="event-count" style="color:var(--green)">0</span>
+  </div>
+  <div class="events" id="events"></div>
+</div>
+
+<!-- Active vehicles -->
+<div class="panel">
+  <div class="panel-head">XE ĐANG TRONG BÃI</div>
+  <table>
+    <thead><tr>
+      <th>BIỂN SỐ</th><th>GIỜ VÀO</th><th>CONF</th>
+    </tr></thead>
+    <tbody id="active-body"></tbody>
+  </table>
+</div>
+
+<!-- History -->
+<div class="panel">
+  <div class="panel-head">LỊCH SỬ GẦN ĐÂY</div>
+  <table>
+    <thead><tr>
+      <th>BIỂN SỐ</th><th>VÀO</th><th>RA</th><th>THỜI GIAN</th><th>ĐỘ KHỚP</th>
+    </tr></thead>
+    <tbody id="history-body"></tbody>
+  </table>
+</div>
+
+<div class="footer">SMART PARKING SYSTEM — JETSON ORIN NANO</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let eventCount = 0;
+
+// ── Fetch REST data ──
+async function fetchData() {
+  try {
+    const [stats, active, history] = await Promise.all([
+      fetch('/api/stats').then(r => r.json()),
+      fetch('/api/active').then(r => r.json()),
+      fetch('/api/history').then(r => r.json()),
+    ]);
+    updateStats(stats);
+    updateActive(active);
+    updateHistory(history);
+  } catch(e) { console.error('Fetch error:', e); }
+}
+
+function updateStats(s) {
+  $('#s-current').textContent = s.current ?? '—';
+  $('#s-capacity').textContent = s.capacity ?? '—';
+  $('#s-pct').textContent = s.pct != null ? s.pct + '%' : '—';
+  $('#s-fps').textContent = s.fps != null ? Math.round(s.fps) : '—';
+  $('#mode-label').textContent = (s.mode || '').toUpperCase();
+
+  const eb = $('#engine-badge');
+  if (s.deepstream) {
+    eb.textContent = 'DEEPSTREAM';
+    eb.className = 'badge ds';
+  } else {
+    eb.textContent = 'GSTREAMER';
+    eb.className = 'badge gs';
+  }
+
+  setCamDot('cam-plate-dot', s.plate_cam);
+  setCamDot('cam-face-dot', s.face_cam);
+}
+
+function setCamDot(id, ok) {
+  const d = document.getElementById(id);
+  d.className = 'dot ' + (ok ? 'on' : 'off');
+}
+
+function updateActive(list) {
+  const tb = $('#active-body');
+  tb.innerHTML = list.map(v => `<tr>
+    <td class="plate">${v.plate}</td>
+    <td class="time">${fmtTime(v.entry_time)}</td>
+    <td class="conf">${(v.conf_plate*100).toFixed(0)}%</td>
+  </tr>`).join('');
+}
+
+function updateHistory(list) {
+  const tb = $('#history-body');
+  tb.innerHTML = list.map(v => `<tr>
+    <td class="plate">${v.plate}</td>
+    <td class="time">${fmtTime(v.entry)}</td>
+    <td class="time">${fmtTime(v.exit)}</td>
+    <td>${v.duration != null ? v.duration + ' phút' : '—'}</td>
+    <td class="conf">${v.conf != null ? (v.conf*100).toFixed(1)+'%' : '—'}</td>
+  </tr>`).join('');
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString('vi-VN', {hour:'2-digit',minute:'2-digit'})
+      + ' ' + d.toLocaleDateString('vi-VN',{day:'2-digit',month:'2-digit'});
+  } catch { return iso; }
+}
+
+// ── WebSocket ──
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    $('#ws-dot').className = 'dot on';
+    $('#ws-status').textContent = 'connected';
+  };
+
+  ws.onclose = () => {
+    $('#ws-dot').className = 'dot off';
+    $('#ws-status').textContent = 'disconnected';
+    setTimeout(connectWS, 3000);
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'ping') return;
+
+    if (msg.type === 'stats') {
+      updateStats(msg.data);
+    }
+    else if (msg.type === 'entry' || msg.type === 'exit') {
+      addEvent(msg);
+      fetchData();  // Refresh tables
+    }
+  };
+}
+
+function addEvent(msg) {
+  const el = document.createElement('div');
+  el.className = 'event';
+  const icon = msg.type === 'entry' ? '🚗→' : '←🚗';
+  const label = msg.type === 'entry' ? 'VÀO' : 'RA';
+  const detail = msg.type === 'exit' && msg.data?.sim
+    ? `sim=${(msg.data.sim*100).toFixed(1)}%`
+    : '';
+  el.innerHTML = `
+    <span class="icon">${icon}</span>
+    <div class="info">
+      <div class="plate">${msg.data?.plate || '?'} — ${label}</div>
+      <div class="detail">${new Date().toLocaleTimeString('vi-VN')} ${detail}</div>
+    </div>`;
+
+  const container = $('#events');
+  container.prepend(el);
+  // Giữ max 50 events
+  while (container.children.length > 50)
+    container.removeChild(container.lastChild);
+
+  eventCount++;
+  $('#event-count').textContent = eventCount;
+}
+
+// MJPEG streams — thêm timestamp chống cache
+function startStreams() {
+  const t = Date.now();
+  document.getElementById('stream-plate').src = '/stream/plate?t=' + t;
+  document.getElementById('stream-face').src = '/stream/face?t=' + t;
+}
+startStreams();
+// Restart stream mỗi 60s phòng trường hợp bị treo
+setInterval(startStreams, 60000);
+
+// ── Init ──
+fetchData();
+setInterval(fetchData, 10000);  // Refresh mỗi 10s
+connectWS();
+</script>
+</body>
+</html>
