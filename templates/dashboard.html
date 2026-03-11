@@ -22,7 +22,6 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);
 .badge.ds{background:#7c3aed22;color:#a78bfa;border:1px solid #7c3aed44}
 .badge.gs{background:#f5920822;color:#fbbf24;border:1px solid #f5920844}
 
-/* Stats grid */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
   gap:10px;margin-bottom:16px}
 .stat{background:var(--card);border:1px solid var(--border);border-radius:8px;
@@ -34,7 +33,6 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);
 .stat .value.yellow{color:var(--yellow)}
 .stat .value.blue{color:var(--blue)}
 
-/* Tables */
 .panel{background:var(--card);border:1px solid var(--border);
   border-radius:8px;margin-bottom:16px;overflow:hidden}
 .panel-head{padding:12px 16px;border-bottom:1px solid var(--border);
@@ -49,7 +47,6 @@ tr:hover td{background:#15151a}
 .conf{color:var(--dim)}
 .time{color:var(--dim);font-size:11px}
 
-/* Live events feed */
 .events{max-height:280px;overflow-y:auto}
 .event{padding:10px 16px;border-bottom:1px solid #15151a;
   display:flex;gap:12px;align-items:center;animation:fadeIn .3s ease}
@@ -59,13 +56,11 @@ tr:hover td{background:#15151a}
 .event .info .detail{font-size:10px;color:var(--dim);margin-top:2px}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
 
-/* Connection status */
 .cams{display:flex;gap:10px;margin-bottom:16px}
 .cam-status{background:var(--card);border:1px solid var(--border);
   border-radius:8px;padding:10px 16px;flex:1;display:flex;
   align-items:center;gap:8px;font-size:11px}
 
-/* Footer */
 .footer{text-align:center;color:var(--dim);font-size:10px;
   padding:16px 0;letter-spacing:1px}
 </style>
@@ -81,7 +76,6 @@ tr:hover td{background:#15151a}
   <span style="font-size:11px;color:var(--dim)" id="mode-label">—</span>
 </div>
 
-<!-- Camera status -->
 <div class="cams">
   <div class="cam-status">
     <span class="dot" id="cam-plate-dot"></span>
@@ -93,27 +87,25 @@ tr:hover td{background:#15151a}
   </div>
 </div>
 
-<!-- Live streams -->
 <div style="display:flex;gap:10px;margin-bottom:16px">
   <div style="flex:1;background:var(--card);border:1px solid var(--border);
     border-radius:8px;overflow:hidden">
     <div style="padding:8px 14px;font-size:10px;font-weight:700;
       color:var(--dim);letter-spacing:1.5px;border-bottom:1px solid var(--border)">
       PLATE CAM</div>
-    <img id="stream-plate" style="width:100%;display:block"
-      onerror="this.style.opacity=0.3" alt="plate cam">
+    <img id="stream-plate" style="width:100%;display:block;min-height:200px;
+      background:#000" alt="plate cam">
   </div>
   <div style="flex:1;background:var(--card);border:1px solid var(--border);
     border-radius:8px;overflow:hidden">
     <div style="padding:8px 14px;font-size:10px;font-weight:700;
       color:var(--dim);letter-spacing:1.5px;border-bottom:1px solid var(--border)">
       FACE CAM</div>
-    <img id="stream-face" style="width:100%;display:block"
-      onerror="this.style.opacity=0.3" alt="face cam">
+    <img id="stream-face" style="width:100%;display:block;min-height:200px;
+      background:#000" alt="face cam">
   </div>
 </div>
 
-<!-- Stats -->
 <div class="stats">
   <div class="stat">
     <div class="label">XE TRONG BÃI</div>
@@ -133,7 +125,6 @@ tr:hover td{background:#15151a}
   </div>
 </div>
 
-<!-- Live events -->
 <div class="panel">
   <div class="panel-head">
     <span>SỰ KIỆN TRỰC TIẾP</span>
@@ -142,7 +133,6 @@ tr:hover td{background:#15151a}
   <div class="events" id="events"></div>
 </div>
 
-<!-- Active vehicles -->
 <div class="panel">
   <div class="panel-head">XE ĐANG TRONG BÃI</div>
   <table>
@@ -153,7 +143,6 @@ tr:hover td{background:#15151a}
   </table>
 </div>
 
-<!-- History -->
 <div class="panel">
   <div class="panel-head">LỊCH SỬ GẦN ĐÂY</div>
   <table>
@@ -170,7 +159,7 @@ tr:hover td{background:#15151a}
 const $ = s => document.querySelector(s);
 let eventCount = 0;
 
-// ── Fetch REST data ──
+// ── REST data ──
 async function fetchData() {
   try {
     const [stats, active, history] = await Promise.all([
@@ -263,7 +252,7 @@ function connectWS() {
     }
     else if (msg.type === 'entry' || msg.type === 'exit') {
       addEvent(msg);
-      fetchData();  // Refresh tables
+      fetchData();
     }
   };
 }
@@ -285,7 +274,6 @@ function addEvent(msg) {
 
   const container = $('#events');
   container.prepend(el);
-  // Giữ max 50 events
   while (container.children.length > 50)
     container.removeChild(container.lastChild);
 
@@ -293,19 +281,33 @@ function addEvent(msg) {
   $('#event-count').textContent = eventCount;
 }
 
-// MJPEG streams — thêm timestamp chống cache
-function startStreams() {
-  const t = Date.now();
-  document.getElementById('stream-plate').src = '/stream/plate?t=' + t;
-  document.getElementById('stream-face').src = '/stream/face?t=' + t;
+// ── Snapshot polling (FIX: thay MJPEG — không bị treo sau refresh) ──
+function pollStream(imgId, name) {
+  const img = document.getElementById(imgId);
+
+  function loadNext() {
+    const next = new Image();
+    next.onload = function() {
+      img.src = next.src;
+      // ~10fps cho web monitor — đủ mượt, nhẹ CPU
+      setTimeout(loadNext, 100);
+    };
+    next.onerror = function() {
+      // Retry chậm hơn khi lỗi
+      setTimeout(loadNext, 1000);
+    };
+    next.src = '/stream/' + name + '?t=' + Date.now();
+  }
+
+  loadNext();
 }
-startStreams();
-// Restart stream mỗi 60s phòng trường hợp bị treo
-setInterval(startStreams, 60000);
+
+pollStream('stream-plate', 'plate');
+pollStream('stream-face', 'face');
 
 // ── Init ──
 fetchData();
-setInterval(fetchData, 10000);  // Refresh mỗi 10s
+setInterval(fetchData, 5000);  // Refresh mỗi 5s (giảm từ 10s)
 connectWS();
 </script>
 </body>

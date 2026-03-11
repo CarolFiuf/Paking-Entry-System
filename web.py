@@ -18,8 +18,9 @@ from pathlib import Path
 from typing import Any
 import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
+import asyncio
 
 log = logging.getLogger("web")
 
@@ -27,22 +28,25 @@ app = FastAPI(title="Smart Parking Dashboard")
 
 # Global references (set by main.py)
 _db = None
-_state = {
-    "mode": "entry",
-    "fps": 0,
-    "last_event": None,
-    "plate_cam_ok": False,
-    "face_cam_ok": False,
-    "deepstream": False,
-}
+# _state = {
+#     "mode": "entry",
+#     "fps": 0,
+#     "last_event": None,
+#     "plate_cam_ok": False,
+#     "face_cam_ok": False,
+#     "deepstream": False,
+# }
 
+_state = {}
 
 # Connected WebSocket clients
 _clients: list[WebSocket] = []
 
+
 # Frame buffers cho MJPEG stream (latest frame only)
 _frames: dict[str, bytes] = {}  # {"plate": jpeg_bytes, "face": jpeg_bytes}
-_frame_lock = __import__("threading").Lock()
+# _frame_lock = __import__("threading").Lock()
+_loop = None # lưu reference tới uvicorn event loop
 
 
 def update_frame(name: str, frame):
@@ -50,8 +54,7 @@ def update_frame(name: str, frame):
     if frame is None:
         return
     _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-    with _frame_lock:
-        _frames[name] = jpg.tobytes()
+    _frames[name] = jpg.tobytes()  # atomic reference assignment in CPython
 
 
 def init(db, state: dict = None):
@@ -59,7 +62,13 @@ def init(db, state: dict = None):
     global _db, _state
     _db = db
     if state:
-        _state.update(state)
+        # _state.update(state)
+        _state = state
+        
+@app.on_event("startup")
+async def _save_loop():
+    global _loop
+    _loop = asyncio.get_event_loop()
 
 
 async def broadcast(event: dict):
@@ -75,14 +84,20 @@ async def broadcast(event: dict):
         _clients.remove(ws)
 
 
+# def notify_sync(event: dict):
+#     """Gọi từ sync code (pipeline thread) → async broadcast."""
+#     try:
+#         loop = asyncio.get_event_loop()
+#         if loop.is_running():
+#             asyncio.ensure_future(broadcast(event))
+#     except RuntimeError:
+#         pass  # No event loop, skip
+
+
 def notify_sync(event: dict):
-    """Gọi từ sync code (pipeline thread) → async broadcast."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(broadcast(event))
-    except RuntimeError:
-        pass  # No event loop, skip
+    if _loop and _loop.is_running():
+        _loop.call_soon_threadsafe(
+            asyncio.ensure_future, broadcast(event))
 
 
 
@@ -99,11 +114,11 @@ async def api_stats():
         return {"error": "DB not ready"}
     stats = _db.stats()
     stats.update({
-        "mode": _state["mode"],
-        "fps": _state["fps"],
-        "plate_cam": _state["plate_cam_ok"],
-        "face_cam": _state["face_cam_ok"],
-        "deepstream": _state["deepstream"],
+        "mode": _state.get("mode", "?"),
+        "fps": _state.get("fps", 0),
+        "plate_cam": _state.get("plate_cam_ok", False),
+        "face_cam": _state.get("face_cam_ok", False),
+        "deepstream": _state.get("deepstream", False),
     })
     return stats
 
@@ -121,59 +136,30 @@ async def api_history():
         return []
     return _db.recent_events()
 
-from fastapi.responses import StreamingResponse
-import asyncio
-
-
-# async def _mjpeg_gen(name: str):
-#     """Generator — yield JPEG frames liên tục."""
-#     while True:
-#         with _frame_lock:
-#             jpg = _frames.get(name)
-#         if jpg:
-#             yield (b"--frame\r\n"
-#                    b"Content-Type: image/jpeg\r\n\r\n"
-#                    + jpg + b"\r\n")
-#         await asyncio.sleep(0.05)
-
-
-# @app.get("/stream/{name}")
-# async def stream(name: str):
-#     """MJPEG stream: /stream/plate hoặc /stream/face"""
-#     if name not in ("plate", "face"):
-#         return {"error": "invalid stream name"}
-#     return StreamingResponse(
-#         _mjpeg_gen(name),
-#         media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/stream/{name}")
-async def stream(name: str):
+async def snapshot(name: str):
     if name not in ("plate", "face"):
-        return {"error": "invalid"}
+        return Response(status_code=404)
 
-    async def generate():
-        try:
-            while True:
-                with _frame_lock:
-                    jpg = _frames.get(name)
-                if jpg:
-                    yield (b"--frame\r\n"
-                           b"Content-Type: image/jpeg\r\n\r\n"
-                           + jpg + b"\r\n")
-                await asyncio.sleep(0.05)
-        except asyncio.CancelledError:
-            # Client disconnect → cleanup
-            return
+    jpg = _frames.get(name)
+    if not jpg:
+        # 1x1 transparent pixel để tránh broken image
+        return Response(
+            content=b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01'
+                    b'\x00\x00\x01\x00\x01\x00\x00\xff\xd9',
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-cache"}
+        )
 
-    return StreamingResponse(
-        generate(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
+    return Response(
+        content=jpg,
+        media_type="image/jpeg",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
-            "Expires": "0",
-            "Connection": "close",
-        })
+        }
+    )
 
 
 # ── WebSocket ──
@@ -185,8 +171,16 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         # Gửi stats ban đầu
         if _db:
+            stats = _db.stats()
+            stats.update({
+                "mode": _state.get("mode", "?"),
+                "fps": _state.get("fps", 0),
+                "plate_cam": _state.get("plate_cam_ok", False),
+                "face_cam": _state.get("face_cam_ok", False),
+                "deepstream": _state.get("deepstream", False),
+            })
             await ws.send_text(json.dumps({
-                "type": "stats", "data": _db.stats()
+                "type": "stats", "data": stats
             }, default=str))
 
         # Keep alive — chờ client disconnect

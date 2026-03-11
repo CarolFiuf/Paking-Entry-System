@@ -4,8 +4,10 @@
 # ============================================
 
 camera:
-  plate: "rtmp://192.168.1.13/live/plate"
-  face: "rtmp://192.168.1.13/live/face"
+  # plate: "rtmp://192.168.1.13/live/plate"
+  # face: "rtmp://192.168.1.13/live/face"
+  plate: "rtmp://192.168.118.112/live/plate"
+  face: "rtmp://192.168.118.112/live/face"
   hw_decode: true
   process_every_n: 2
   reconnect_sec: 3

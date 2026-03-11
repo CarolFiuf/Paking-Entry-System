@@ -3,14 +3,19 @@ pipeline.py — Video Pipeline
 DeepStream GPU pipeline (nếu có pyds) hoặc fallback GStreamer + OpenCV.
 
 DeepStream mode:
-  RTMP → nvstreammux → nvinfer (plate YOLO) → probe callback
+  RTMP → rtmpsrc → flvdemux → h264parse → nvv4l2decoder → nvstreammux
+       → nvinfer (plate YOLO) → probe callback
   - Zero-copy decode→detect trên GPU
   - Plate detection qua nvinfer, kết quả qua NvDsObjectMeta
   - Face camera: decode chung pipeline, extract frame cho insightface
 
 Fallback mode:
   RTMP → GStreamer NVDEC → OpenCV → Python inference
-  - Giống bản trước, dùng StreamReader
+
+FIX vs v3:
+  - Thay uridecodebin (dynamic pad, hay lỗi RTMP) bằng explicit elements
+  - Thêm bus watch để log lỗi GStreamer
+  - Thêm retry/reconnect khi source mất
 """
 
 import cv2
@@ -38,25 +43,20 @@ except ImportError:
 
 
 # ──────────────────────────────────────────────
-# DeepStream Pipeline
+# DeepStream Pipeline (FIXED)
 # ──────────────────────────────────────────────
 class DeepStreamPipeline:
     """
     DeepStream pipeline cho 2 camera RTMP.
 
-    Pipeline layout:
-      source0 (plate RTMP) ─┐
-                             ├→ nvstreammux → nvinfer (plate YOLOv8) → probe
-      source1 (face RTMP)  ─┘
+    Pipeline layout (explicit elements — không dùng uridecodebin):
+      rtmpsrc0 → flvdemux → h264parse → nvv4l2decoder ─┐
+                                                         ├→ nvstreammux → nvinfer → probe
+      rtmpsrc1 → flvdemux → h264parse → nvv4l2decoder ─┘
 
-    Probe callback tách kết quả theo source_id:
-      - source 0: plate detections (bbox + conf)
-      - source 1: raw frame cho insightface (detect+embed ở Python)
-
-    Lý do không dùng nvinfer cho face:
-      InsightFace FaceAnalysis.get() = detect + align + embed trong 1 call.
-      Tách detect ra nvinfer → phải tự align + chạy ArcFace riêng → phức tạp hơn.
-      Face camera chỉ cần frame, insightface đã đủ nhanh (~10ms).
+    FIX: uridecodebin tạo dynamic pad, khi dùng với RTMP trong
+    Gst.parse_launch thường không link được vào nvstreammux.
+    Thay bằng explicit elements + pad-added signal cho flvdemux.
     """
 
     def __init__(self, plate_src: str, face_src: str, cfg: dict):
@@ -68,54 +68,160 @@ class DeepStreamPipeline:
 
         # Kết quả mới nhất từ probe
         self._plate_frame = None
-        self._plate_detections = []  # [{bbox, conf}, ...]
+        self._plate_detections = []
         self._face_frame = None
 
         self._build_pipeline(plate_src, face_src)
 
     def _build_pipeline(self, plate_src: str, face_src: str):
-        """Xây dựng DeepStream pipeline bằng Gst.parse_launch."""
-        plate_engine = self.cfg["plate_detector"]["engine"]
+        """Xây dựng DeepStream pipeline bằng element API (không parse_launch)."""
 
-        # Pipeline string
-        pipe_str = (
-            # Source 0: plate camera
-            f'uridecodebin uri="{plate_src}" name=src0 ! '
-            "queue ! nvvideoconvert ! "
-            'video/x-raw(memory:NVMM),format=NV12 ! '
-            "mux.sink_0 "
+        self._pipeline = Gst.Pipeline.new("parking-pipeline")
 
-            # Source 1: face camera
-            f'uridecodebin uri="{face_src}" name=src1 ! '
-            "queue ! nvvideoconvert ! "
-            'video/x-raw(memory:NVMM),format=NV12 ! '
-            "mux.sink_1 "
+        # ── Streammux ──
+        mux = self._make_element("nvstreammux", "mux")
+        mux.set_property("batch-size", 2)
+        mux.set_property("width", 1280)
+        mux.set_property("height", 720)
+        mux.set_property("batched-push-timeout", 40000)
+        mux.set_property("live-source", 1)
 
-            # Streammux: batch 2 sources
-            "nvstreammux name=mux batch-size=2 "
-            "width=1280 height=720 "
-            "batched-push-timeout=40000 "
-            "live-source=1 ! "
+        # ── Source 0: plate camera ──
+        self._add_rtmp_source(plate_src, source_id=0, mux=mux,
+                              name_prefix="plate")
 
-            # Plate detection (nvinfer)
-            "nvinfer name=plate_det "
-            f'config-file-path="{self.cfg["deepstream"]["plate_config"]}" ! '
-            
-            # Convert to rgba
-            "nvvideoconvert ! "
-            'video/x-raw(memory:NVMM),format=RGBA ! '
+        # ── Source 1: face camera ──
+        self._add_rtmp_source(face_src, source_id=1, mux=mux,
+                              name_prefix="face")
 
-            # Dùng fakesink, lấy data qua probe
-            "fakesink name=sink sync=0"
-        )
+        # ── nvinfer (plate detection) ──
+        nvinfer = self._make_element("nvinfer", "plate_det")
+        nvinfer.set_property("config-file-path",
+                             self.cfg["deepstream"]["plate_config"])
 
-        self._pipeline = Gst.parse_launch(pipe_str)
+        # ── nvvideoconvert → RGBA (cho pyds.get_nvds_buf_surface) ──
+        nvconv = self._make_element("nvvideoconvert", "nvconv_out")
 
-        # Attach probe trước fakesink
-        sink = self._pipeline.get_by_name("sink")
+        # Caps filter: RGBA format
+        capsfilter = self._make_element("capsfilter", "caps_rgba")
+        caps = Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA")
+        capsfilter.set_property("caps", caps)
+
+        # ── Fakesink ──
+        sink = self._make_element("fakesink", "sink")
+        sink.set_property("sync", 0)
+        sink.set_property("async", 0)
+
+        # ── Link: mux → nvinfer → nvconv → caps → sink ──
+        if not mux.link(nvinfer):
+            log.error("Failed to link mux → nvinfer")
+        if not nvinfer.link(nvconv):
+            log.error("Failed to link nvinfer → nvconv")
+        if not nvconv.link(capsfilter):
+            log.error("Failed to link nvconv → capsfilter")
+        if not capsfilter.link(sink):
+            log.error("Failed to link capsfilter → sink")
+
+        # ── Probe trước sink ──
         sink_pad = sink.get_static_pad("sink")
         sink_pad.add_probe(
             Gst.PadProbeType.BUFFER, self._probe_callback, None)
+
+        # ── Bus watch cho error logging ──
+        bus = self._pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+
+        log.info("DeepStream pipeline built (explicit elements)")
+
+    def _make_element(self, factory: str, name: str):
+        """Tạo GStreamer element, add vào pipeline."""
+        elem = Gst.ElementFactory.make(factory, name)
+        if not elem:
+            raise RuntimeError(
+                f"Cannot create element: {factory} ({name}). "
+                f"Plugin missing? Try: gst-inspect-1.0 {factory}")
+        self._pipeline.add(elem)
+        return elem
+
+    def _add_rtmp_source(self, rtmp_url: str, source_id: int,
+                         mux, name_prefix: str):
+        """
+        Thêm 1 RTMP source vào pipeline.
+
+        Chain: rtmpsrc → flvdemux → (dynamic pad) → h264parse
+               → nvv4l2decoder → queue → mux.sink_N
+
+        flvdemux có dynamic pad nên cần connect signal "pad-added".
+        """
+        # rtmpsrc
+        src = self._make_element("rtmpsrc", f"{name_prefix}_src")
+        src.set_property("location", rtmp_url)
+        # Timeout để không treo mãi khi RTMP chưa sẵn sàng
+        src.set_property("timeout", 10)
+
+        # flvdemux — dynamic pad
+        demux = self._make_element("flvdemux", f"{name_prefix}_demux")
+
+        # h264parse
+        parse = self._make_element("h264parse", f"{name_prefix}_parse")
+
+        # nvv4l2decoder — hardware decode trên Jetson
+        decoder = self._make_element("nvv4l2decoder",
+                                     f"{name_prefix}_decoder")
+
+        # queue — buffer giữa decoder và mux
+        queue = self._make_element("queue", f"{name_prefix}_queue")
+        queue.set_property("max-size-buffers", 5)
+        queue.set_property("leaky", 2)  # downstream = drop old
+
+        # Link static elements: rtmpsrc → flvdemux
+        if not src.link(demux):
+            log.error(f"Failed to link {name_prefix}_src → demux")
+
+        # Link static: h264parse → decoder → queue
+        if not parse.link(decoder):
+            log.error(f"Failed to link {name_prefix}_parse → decoder")
+        if not decoder.link(queue):
+            log.error(f"Failed to link {name_prefix}_decoder → queue")
+
+        # Link queue → mux.sink_N (request pad)
+        mux_sink = mux.get_request_pad(f"sink_{source_id}")
+        queue_src = queue.get_static_pad("src")
+        if mux_sink and queue_src:
+            queue_src.link(mux_sink)
+        else:
+            log.error(f"Failed to get pads for mux.sink_{source_id}")
+
+        # flvdemux dynamic pad → h264parse
+        # Khi RTMP stream bắt đầu, flvdemux tạo pad "video"
+        demux.connect("pad-added", self._on_demux_pad_added,
+                       parse, name_prefix)
+
+    @staticmethod
+    def _on_demux_pad_added(demux, pad, parse, name_prefix):
+        """
+        Callback khi flvdemux tạo pad mới.
+        Chỉ link pad video (bỏ qua audio).
+        """
+        pad_name = pad.get_name()
+        caps = pad.get_current_caps()
+        struct_name = caps.get_structure(0).get_name() if caps else ""
+
+        log.info(f"[{name_prefix}] flvdemux pad added: {pad_name} "
+                 f"({struct_name})")
+
+        # Chỉ link video, bỏ audio
+        if pad_name.startswith("video") or "video" in struct_name:
+            sink_pad = parse.get_static_pad("sink")
+            if sink_pad and not sink_pad.is_linked():
+                ret = pad.link(sink_pad)
+                if ret == Gst.PadLinkReturn.OK:
+                    log.info(f"[{name_prefix}] Linked video → h264parse")
+                else:
+                    log.error(f"[{name_prefix}] Failed to link video: {ret}")
+        else:
+            log.debug(f"[{name_prefix}] Ignoring non-video pad: {pad_name}")
 
     def _probe_callback(self, pad, info, user_data):
         """
@@ -137,15 +243,13 @@ class DeepStreamPipeline:
 
             source_id = frame_meta.source_id
 
-            # Extract frame as numpy
-            # frame = pyds.get_nvds_buf_surface(hash(buf),
-            #                                    frame_meta.batch_id)
+            # Extract frame as numpy (RGBA → BGR)
             surface = pyds.get_nvds_buf_surface(hash(buf),
-                                               frame_meta.batch_id)
+                                                frame_meta.batch_id)
             frame = np.array(surface, copy=True, order='C')
             frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
 
-            # Extract detections (chỉ source 0 = plate cam có nvinfer)
+            # Extract detections (source 0 = plate cam có nvinfer)
             detections = []
             l_obj = frame_meta.obj_meta_list
             while l_obj is not None:
@@ -164,13 +268,18 @@ class DeepStreamPipeline:
 
             with self._lock:
                 if source_id == 0:
-                    self._plate_frame = frame.copy()
+                    self._plate_frame = frame
                     self._plate_detections = detections
-                    log.info(f"[probe] plate frame {frame.shape}, "
-                             f"{len(detections)} dets")
+                    # ★ DEBUG: save 1 frame từ probe để verify
+                    if not hasattr(self, '_probe_saved'):
+                        cv2.imwrite("/tmp/debug_probe_plate.jpg", frame)
+                        self._probe_saved = True
+                        log.info(f"★ Probe plate: shape={frame.shape} "
+                                 f"mean={frame.mean():.0f} "
+                                 f"dets={len(detections)} "
+                                 f"det_details={detections[:3]}")
                 elif source_id == 1:
-                    self._face_frame = frame.copy()
-                    log.info(f"[probe] face frame {frame.shape}")
+                    self._face_frame = frame
 
             try:
                 l_frame = l_frame.next
@@ -179,10 +288,41 @@ class DeepStreamPipeline:
 
         return Gst.PadProbeReturn.OK
 
+    def _on_bus_message(self, bus, message):
+        """Log GStreamer bus messages — rất quan trọng để debug."""
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            src = message.src.get_name() if message.src else "?"
+            log.error(f"GST ERROR [{src}]: {err.message}")
+            log.error(f"  Debug: {debug}")
+        elif t == Gst.MessageType.WARNING:
+            warn, debug = message.parse_warning()
+            src = message.src.get_name() if message.src else "?"
+            log.warning(f"GST WARN [{src}]: {warn.message}")
+        elif t == Gst.MessageType.STATE_CHANGED:
+            if message.src == self._pipeline:
+                old, new, pending = message.parse_state_changed()
+                log.info(f"Pipeline state: {old.value_nick} → "
+                         f"{new.value_nick}")
+        elif t == Gst.MessageType.STREAM_START:
+            src = message.src.get_name() if message.src else "?"
+            log.info(f"Stream started: {src}")
+        elif t == Gst.MessageType.EOS:
+            log.warning("End of stream")
+
     def start(self):
         """Start pipeline."""
-        self._pipeline.set_state(Gst.State.PLAYING)
-        # GLib main loop trên thread riêng
+        ret = self._pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            log.error("Failed to set pipeline to PLAYING")
+            # Log chi tiết
+            ret2 = self._pipeline.get_state(5 * Gst.SECOND)
+            log.error(f"Pipeline state: {ret2}")
+        else:
+            log.info(f"Pipeline set_state → PLAYING (ret={ret})")
+
+        # GLib main loop trên thread riêng (cần cho bus messages)
         self._loop = GLib.MainLoop()
         self._loop_thread = Thread(target=self._loop.run, daemon=True)
         self._loop_thread.start()
@@ -207,7 +347,7 @@ class DeepStreamPipeline:
 
 
 # ──────────────────────────────────────────────
-# GStreamer Fallback (StreamReader từ bản trước)
+# GStreamer Fallback (StreamReader)
 # ──────────────────────────────────────────────
 class StreamReader:
     """Threaded stream reader — fallback khi không có DeepStream."""
@@ -303,3 +443,4 @@ class StreamReader:
         self._stop.set()
         if self.cap:
             self.cap.release()
+            

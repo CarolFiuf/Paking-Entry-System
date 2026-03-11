@@ -3,11 +3,11 @@
 Smart Parking System
 DeepStream pipeline (hoặc GStreamer fallback) + FastAPI web dashboard.
 
-Usage:
-  python main.py --entry            # Entry mode
-  python main.py --exit             # Exit mode
-  python main.py --benchmark vid.mp4
-  python main.py --entry --no-web   # Không chạy web dashboard
+FIX vs v3:
+  - Annotated frames cho web stream (FIX: không thấy bbox face)
+  - Debug logging trong process_entry/exit (FIX: không biết flow dừng ở đâu)
+  - Throttle web frame update (FIX: CPU waste)
+  - State shared reference (FIX: FPS=0, cam dots đỏ)
 """
 
 import cv2
@@ -34,7 +34,7 @@ log = logging.getLogger("main")
 
 
 # ──────────────────────────────────────────────
-# Helpers (compact — không thay đổi logic)
+# Helpers
 # ──────────────────────────────────────────────
 class PlateValidator:
     def __init__(self, regex_str: str):
@@ -97,7 +97,6 @@ class ParkingSystem:
         log.info("Loading models...")
         t0 = time.time()
 
-        # PlateDetector chỉ cần cho fallback mode
         self.use_deepstream = (self.cfg["deepstream"]["enabled"]
                                and HAS_DEEPSTREAM)
         if not self.use_deepstream:
@@ -132,59 +131,92 @@ class ParkingSystem:
         self.face_avg = EmbeddingAvg(rcfg["face_avg_frames"])
         self.face_thr = rcfg["face_threshold"]
 
-        # ── Web state (shared with web.py) ──
+        # ── Web state (shared reference với web.py) ──
         self.state = {
             "mode": "entry", "fps": 0,
             "plate_cam_ok": False, "face_cam_ok": False,
             "deepstream": self.use_deepstream,
         }
+        
+        # Lưu result gần nhất để annotate frame
+        self._last_result = {"ok": False}
+        
         self.running = False
 
     # ── ENTRY ──
     def process_entry(self, frame_plate, plate_dets,
                       frame_face) -> dict:
-        """
-        Entry flow.
-        plate_dets: từ DeepStream nvinfer hoặc self.plate_det()
-        """
         result = {"ok": False, "plate": "", "face_conf": 0,
                   "plate_bbox": None, "face_bbox": None}
 
         # 1) Plate detection
         if plate_dets is None:
-            # Fallback mode: detect bằng Python
             plate_dets = self.plate_det(frame_plate) if self.plate_det else []
 
         if not plate_dets:
+            log.debug("ENTRY: no plate detected")
             return result
         best_p = max(plate_dets, key=lambda p: p["conf"])
         x1, y1, x2, y2 = best_p["bbox"]
         result["plate_bbox"] = best_p["bbox"]
+
+        # ★ DEBUG: save frame gốc 1 lần
+        if not hasattr(self, '_frame_saved'):
+            cv2.imwrite("/tmp/debug_plate_frame.jpg", frame_plate)
+            cv2.imwrite("/tmp/debug_face_frame.jpg", frame_face)
+            self._frame_saved = True
+            log.info(f"★ Saved debug frames → /tmp/debug_*.jpg "
+                     f"plate={frame_plate.shape} face={frame_face.shape}")
+
+        log.info(f"ENTRY: plate det bbox=({x1},{y1},{x2},{y2}) "
+                 f"conf={best_p['conf']:.2f}")
 
         # 2) Crop + OCR
         h, w = frame_plate.shape[:2]
         m = 5
         crop = frame_plate[max(0, y1-m):min(h, y2+m),
                            max(0, x1-m):min(w, x2+m)]
+
+        # ★ DEBUG: xem crop có đúng không
+        log.info(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
+                 f"crop={crop.shape if crop.size > 0 else 'EMPTY'} "
+                 f"mean_pixel={crop.mean():.0f}" if crop.size > 0 else "")
+
+        # Save 1 crop mẫu để kiểm tra bằng mắt
+        if crop.size > 0 and not hasattr(self, '_crop_saved'):
+            cv2.imwrite("/tmp/debug_crop.jpg", crop)
+            self._crop_saved = True
+            log.info("★ Saved sample crop → /tmp/debug_crop.jpg")
+
         raw_text, ocr_conf = self.plate_ocr(crop)
         plate = self.validator(raw_text)
+        log.info(f"ENTRY OCR: raw='{raw_text}' conf={ocr_conf:.2f} "
+                 f"→ valid='{plate}'")
 
         # 3) Vote
         stable = self.plate_voter.vote(plate)
         if not stable:
             result["plate"] = plate
+            log.debug(f"ENTRY: voting... buf={self.plate_voter._buf}")
             return result
         result["plate"] = stable
+        log.info(f"ENTRY: plate voted → '{stable}'")
 
-        # 4) Face (luôn dùng insightface — detect+align+embed 1 call)
+        # 4) Face
         faces = self.face_eng(frame_face)
+        # ★ LOG: face detection kết quả
+        log.info(f"ENTRY FACE: {len(faces)} faces detected")
         if not faces:
             return result
         best_f = max(faces, key=lambda f: f["conf"])
         result["face_bbox"] = best_f["bbox"]
         result["face_conf"] = best_f["conf"]
+        log.info(f"ENTRY FACE: best conf={best_f['conf']:.2f} "
+                 f"bbox={best_f['bbox']}")
 
-        if not FaceEngine.quality_ok(frame_face, best_f["bbox"]):
+        qok = FaceEngine.quality_ok(frame_face, best_f["bbox"])
+        log.info(f"ENTRY FACE: quality_ok={qok}")
+        if not qok:
             return result
 
         emb = self.face_avg.update(best_f["embedding"])
@@ -195,12 +227,12 @@ class ParkingSystem:
             result["ok"] = True
             self.plate_voter.clear()
             self.face_avg.clear()
-            log.info(f"✅ ENTRY: {stable}")
+            log.info(f"✅ ENTRY OK: {stable} (id={code})")
             self._emit("entry", {"plate": stable})
         elif code == -1:
-            log.warning("BÃI ĐẦY")
+            log.warning("❌ BÃI ĐẦY")
         elif code == -2:
-            log.warning(f"TRÙNG: {stable}")
+            log.warning(f"❌ TRÙNG BIỂN SỐ: {stable}")
 
         return result
 
@@ -258,9 +290,45 @@ class ParkingSystem:
         except Exception:
             pass
 
+    # ── ANNOTATE FRAMES CHO WEB ──
+    def _annotate_plate(self, frame, result):
+        """Vẽ plate bbox + text lên frame cho web stream."""
+        vis = frame.copy()
+        if result.get("plate_bbox"):
+            x1, y1, x2, y2 = result["plate_bbox"]
+            color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            plate = result.get("plate", "")
+            if plate:
+                cv2.rectangle(vis, (x1, y1-28), (x1+len(plate)*16, y1),
+                              (0, 0, 0), -1)
+                cv2.putText(vis, plate, (x1+4, y1-8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        return vis
+
+    def _annotate_face(self, frame, result):
+        """Vẽ face bbox + info lên frame cho web stream."""
+        vis = frame.copy()
+        if result.get("face_bbox"):
+            x1, y1, x2, y2 = result["face_bbox"]
+            color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+
+            label = ""
+            if result.get("ok") and result.get("sim"):
+                label = f"MATCH {result['sim']:.2f}"
+            elif result.get("face_conf"):
+                label = f"face {result['face_conf']:.2f}"
+
+            if label:
+                cv2.rectangle(vis, (x1, y1-28), (x1+len(label)*12, y1),
+                              (0, 0, 0), -1)
+                cv2.putText(vis, label, (x1+4, y1-8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        return vis
+
     # ── RUN (DEEPSTREAM MODE) ──
     def _run_deepstream(self, mode: str, show: bool):
-        """Main loop với DeepStream pipeline."""
         ccfg = self.cfg["camera"]
         ds = DeepStreamPipeline(ccfg["plate"], ccfg["face"], self.cfg)
         ds.start()
@@ -274,26 +342,40 @@ class ParkingSystem:
 
         try:
             while self.running:
-                # Lấy data từ DeepStream probe
                 fp, plate_dets = ds.get_plate_data()
                 ff = ds.get_face_frame()
 
                 if fp is None or ff is None:
                     time.sleep(0.01)
-                    if frame_idx % 300 == 0:
-                        log.warning(f"Waiting frames... plate={fp is not None} face={ff is not None}")
                     frame_idx += 1
+                    if frame_idx % 300 == 0:
+                        log.warning(f"Waiting frames... "
+                                    f"plate={'OK' if fp is not None else 'NONE'} "
+                                    f"face={'OK' if ff is not None else 'NONE'}")
                     continue
 
                 frame_idx += 1
+
+                # ★ FIX: Update cam status TRƯỚC skip check
+                self.state["plate_cam_ok"] = True
+                self.state["face_cam_ok"] = True
+
+                # ★ FIX: Web frame update — mỗi 3 frame, KHÔNG bị skip_n block
+                if frame_idx % 3 == 0:
+                    try:
+                        from web import update_frame
+                        update_frame("plate",
+                                     self._annotate_plate(fp, self._last_result))
+                        update_frame("face",
+                                     self._annotate_face(ff, self._last_result))
+                    except Exception:
+                        pass
+
+                # AI processing — skip frames
                 if skip_n > 1 and frame_idx % skip_n != 0:
                     continue
 
                 t0 = time.time()
-                self.state["plate_cam_ok"] = True
-                self.state["face_cam_ok"] = True
-                # log.info(f"Frame {frame_idx}: plate={fp.shape} face={ff.shape} "
-                #          f"dets={len(plate_dets)}")
 
                 if t0 < cooldown_until:
                     result = {"ok": False}
@@ -302,31 +384,21 @@ class ParkingSystem:
                 else:
                     result = self.process_exit(ff, fp, plate_dets)
 
+                # Lưu result để annotate frame tiếp theo
+                self._last_result = result
+
                 if result.get("ok"):
-                        # Feed frames cho web MJPEG stream
                     cooldown_until = t0 + 2.0
 
+                # FPS counter
                 n_fps += 1
                 if time.time() - t_fps >= 1.0:
                     fps = n_fps / (time.time() - t_fps)
                     n_fps, t_fps = 0, time.time()
                     self.state["fps"] = round(fps, 1)
-                    
-                # Feed frames cho web stream (MỌI frame, không chỉ khi match)
-                # Feed frames cho web stream — có vẽ kết quả detect
-                # Feed frames cho web stream (MỌI frame, không chỉ khi match)
-                try:
-                    from web import update_frame
-                    update_frame("plate", fp)
-                    update_frame("face", ff)
-                except Exception:
-                    pass
 
                 if show:
                     self._show_dual(fp, ff, result, mode, fps)
-
-                # Toggle mode
-                if show:
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
                         break
@@ -344,7 +416,6 @@ class ParkingSystem:
 
     # ── RUN (FALLBACK MODE) ──
     def _run_fallback(self, mode: str, show: bool):
-        """Main loop với GStreamer StreamReader + Python inference."""
         ccfg = self.cfg["camera"]
         hw = ccfg["hw_decode"]
         reconn = ccfg.get("reconnect_sec", 3)
@@ -376,6 +447,19 @@ class ParkingSystem:
                     break
 
                 frame_idx += 1
+
+                # Web frame update — mỗi 3 frame
+                if frame_idx % 3 == 0:
+                    try:
+                        from web import update_frame
+                        update_frame("plate",
+                                     self._annotate_plate(fp, self._last_result))
+                        update_frame("face",
+                                     self._annotate_face(ff, self._last_result))
+                    except Exception:
+                        pass
+
+                # AI processing — skip frames
                 if skip_n > 1 and frame_idx % skip_n != 0:
                     continue
 
@@ -388,8 +472,9 @@ class ParkingSystem:
                 else:
                     result = self.process_exit(ff, fp)
 
+                self._last_result = result
+
                 if result.get("ok"):
-                    # Feed frames cho web MJPEG stream
                     cooldown_until = t0 + 2.0
 
                 n_fps += 1
@@ -397,16 +482,6 @@ class ParkingSystem:
                     fps = n_fps / (time.time() - t_fps)
                     n_fps, t_fps = 0, time.time()
                     self.state["fps"] = round(fps, 1)
-                    
-                # Feed frames cho web stream (MỌI frame, không chỉ khi match)
-                # Feed frames cho web stream — có vẽ kết quả detect
-                # Feed frames cho web stream (MỌI frame, không chỉ khi match)
-                try:
-                    from web import update_frame
-                    update_frame("plate", fp)
-                    update_frame("face", ff)
-                except Exception:
-                    pass
 
                 if show:
                     self._show_dual(fp, ff, result, mode, fps)
@@ -425,43 +500,6 @@ class ParkingSystem:
         finally:
             cam_plate.release()
             cam_face.release()
-            
-    def _annotate_plate(self, frame, result):
-        """Vẽ plate bbox + text lên frame cho web stream."""
-        vis = frame.copy()
-        if result.get("plate_bbox"):
-            x1, y1, x2, y2 = result["plate_bbox"]
-            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            plate = result.get("plate", "")
-            if plate:
-                # Nền đen cho text dễ đọc
-                cv2.rectangle(vis, (x1, y1-28), (x1+len(plate)*16, y1),
-                              (0, 0, 0), -1)
-                cv2.putText(vis, plate, (x1+4, y1-8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        return vis
-
-    def _annotate_face(self, frame, result):
-        """Vẽ face bbox + similarity lên frame cho web stream."""
-        vis = frame.copy()
-        if result.get("face_bbox"):
-            x1, y1, x2, y2 = result["face_bbox"]
-            # Xanh lá khi match, vàng khi đang scan
-            color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-
-            label = ""
-            if result.get("ok") and result.get("sim"):
-                label = f"MATCH {result['sim']:.2f}"
-            elif result.get("face_conf"):
-                label = f"face {result['face_conf']:.2f}"
-
-            if label:
-                cv2.rectangle(vis, (x1, y1-28), (x1+len(label)*12, y1),
-                              (0, 0, 0), -1)
-                cv2.putText(vis, label, (x1+4, y1-8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        return vis
 
     def _show_dual(self, fp, ff, result, mode, fps):
         """Hiển thị 2 cam cạnh nhau (cho --show mode)."""
@@ -470,7 +508,6 @@ class ParkingSystem:
         p = cv2.resize(fp, (int(fp.shape[1]*h/fp.shape[0]), h))
         f = cv2.resize(ff, (int(ff.shape[1]*h/ff.shape[0]), h))
 
-        # Draw bboxes
         if result.get("plate_bbox"):
             sx = p.shape[1] / fp.shape[1]
             sy = p.shape[0] / fp.shape[0]
@@ -484,13 +521,12 @@ class ParkingSystem:
             cv2.rectangle(f, (int(x1*sx), int(y1*sy)),
                           (int(x2*sx), int(y2*sy)), (0, 255, 255), 2)
 
-        # Status bars
         color = (0, 255, 0) if result.get("ok") else (100, 100, 100)
         for img, label in [(p, "PLATE"), (f, "FACE")]:
             w = img.shape[1]
             cv2.rectangle(img, (0, 0), (w, 28), (0, 0, 0), -1)
-            info = f"{label}|{mode.upper()} FPS:{fps:.0f} " \
-                   f"Lot:{stats['current']}/{stats['capacity']}"
+            info = (f"{label}|{mode.upper()} FPS:{fps:.0f} "
+                    f"Lot:{stats['current']}/{stats['capacity']}")
             cv2.putText(img, info, (6, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
@@ -527,6 +563,7 @@ def start_web(cfg: dict, db, state: dict):
     """Chạy FastAPI trên thread riêng."""
     import uvicorn
     from web import app, init
+    # ★ FIX: pass state reference — web.py giờ dùng _state = state
     init(db, state)
     host = cfg["web"]["host"]
     port = cfg["web"]["port"]
@@ -549,7 +586,13 @@ def main():
     parser.add_argument("--no-show", action="store_true")
     parser.add_argument("--no-web", action="store_true")
     parser.add_argument("--frames", type=int, default=200)
+    # ★ Thêm --debug để bật debug log
+    parser.add_argument("--debug", action="store_true",
+                        help="Bật debug logging chi tiết")
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     system = ParkingSystem(args.config)
 
@@ -564,10 +607,9 @@ def main():
             args=(system.cfg, system.db, system.state),
             daemon=True)
         web_thread.start()
-        time.sleep(1)  # Đợi server ready
+        time.sleep(1)
 
     if args.benchmark:
-        # Benchmark dùng fallback mode
         reader = StreamReader(args.benchmark, name="bench",
                               hw_decode=system.cfg["camera"]["hw_decode"])
         times = {"plate_det": [], "ocr": [], "face": [],
@@ -623,3 +665,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    

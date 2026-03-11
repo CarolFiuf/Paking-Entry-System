@@ -24,6 +24,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
+import threading
 
 import psycopg2
 from psycopg2 import pool
@@ -53,19 +54,38 @@ class ParkingDB:
             host=host, port=port, dbname=dbname,
             user=user, password=password
         )
+        
+        self._registered_conns = set()
 
         self._init_schema()
-
+        self._stats_lock = threading.Lock()
         # Cache stats — chỉ cập nhật khi entry/exit (FIX #1)
         self._stats_cache = self._query_stats()
         log.info(f"DB ready: {self._stats_cache['current']} vehicles loaded")
 
+    # @contextmanager
+    # def _conn(self):
+    #     """Lấy connection từ pool, tự trả lại khi xong."""
+    #     conn = self._pool.getconn()
+    #     try:
+    #         register_vector(conn)
+    #         yield conn
+    #         conn.commit()
+    #     except Exception:
+    #         conn.rollback()
+    #         raise
+    #     finally:
+    #         self._pool.putconn(conn)
+    
     @contextmanager
     def _conn(self):
-        """Lấy connection từ pool, tự trả lại khi xong."""
         conn = self._pool.getconn()
         try:
-            register_vector(conn)
+            # Chỉ register 1 lần per connection
+            conn_id = id(conn)
+            if conn_id not in self._registered_conns:
+                register_vector(conn)
+                self._registered_conns.add(conn_id)
             yield conn
             conn.commit()
         except Exception:
@@ -146,8 +166,9 @@ class ParkingDB:
             rid = cur.fetchone()[0]
 
         # Cập nhật cache
-        self._stats_cache["current"] += 1
-        self._stats_cache["pct"] = round(
+        with self._stats_lock:
+            self._stats_cache["current"] += 1
+            self._stats_cache["pct"] = round(
             100 * self._stats_cache["current"] / max(self.max_cap, 1), 1)
 
         log.info(f"ENTRY: {plate} (id={rid}, "
@@ -227,7 +248,8 @@ class ParkingDB:
     # ── STATS ──
     def stats(self) -> dict:
         """Trả về cached stats. Không query DB mỗi lần gọi."""
-        return self._stats_cache
+        with self._stats_lock:
+            return self._stats_cache.copy()
 
     def _query_stats(self) -> dict:
         """Query thật từ DB — chỉ gọi khi init."""
