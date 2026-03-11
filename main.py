@@ -37,14 +37,56 @@ log = logging.getLogger("main")
 # Helpers
 # ──────────────────────────────────────────────
 class PlateValidator:
-    def __init__(self, regex_str: str):
-        self.regex = re.compile(regex_str)
+    """
+    Validate + normalize biển số VN.
+
+    Formats biển xe máy VN:
+      Mới: 99B1-257.39  → {2số}{chữ}{1số}-{3số}.{2số}   (có dot)
+      Cũ:  29B-12345    → {2số}{chữ}-{5số}               (không dot, không series)
+      Mới: 51G1-23456   → {2số}{chữ}{1số}-{5số}          (không dot, có series)
+    """
+    def __init__(self, regex_str: str = None):
         self._fix = str.maketrans("OI", "01")
 
     def __call__(self, text: str) -> str:
+        if not text:
+            return ""
         t = text.strip().upper().translate(self._fix)
-        t = t.replace(" ", "").replace("_", "-")
-        return t if self.regex.match(t) else ""
+        # Giữ dot, strip phần còn lại
+        clean = re.sub(r"[^A-Z0-9.]", "", t)
+
+        if len(clean) < 7 or len(clean) > 13:
+            return ""
+
+        # ── Có dot → format mới, parse chính xác ──
+        if "." in clean:
+            m = re.match(
+                r"^(\d{2})([A-Z])(\d{1,2})(\d{3,5})\.(\d{1,2})$",
+                clean)
+            if m:
+                return (f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                        f"-{m.group(4)}.{m.group(5)}")
+            return ""
+
+        # ── Không dot → thử nhiều format ──
+        nodot = clean
+
+        # Format cũ: XXY-NNNNN (không series, 5 số)
+        m = re.match(r"^(\d{2})([A-Z])(\d{5})$", nodot)
+        if m:
+            return f"{m.group(1)}{m.group(2)}-{m.group(3)}"
+
+        # Format mới: XXYN-NNNNN (1 series + 4-5 số)
+        m = re.match(r"^(\d{2})([A-Z])(\d)(\d{4,5})$", nodot)
+        if m:
+            return f"{m.group(1)}{m.group(2)}{m.group(3)}-{m.group(4)}"
+
+        # Format mới: XXYNN-NNNN (2 series + 3-4 số, hiếm)
+        m = re.match(r"^(\d{2})([A-Z])(\d{2})(\d{3,4})$", nodot)
+        if m:
+            return f"{m.group(1)}{m.group(2)}{m.group(3)}-{m.group(4)}"
+
+        return ""
 
 
 class PlateVoter:
@@ -126,7 +168,7 @@ class ParkingSystem:
 
         # ── Recognition helpers ──
         rcfg = self.cfg["recognition"]
-        self.validator = PlateValidator(rcfg["plate_regex"])
+        self.validator = PlateValidator()
         self.plate_voter = PlateVoter(rcfg["plate_vote_frames"])
         self.face_avg = EmbeddingAvg(rcfg["face_avg_frames"])
         self.face_thr = rcfg["face_threshold"]
@@ -140,7 +182,13 @@ class ParkingSystem:
         
         # Lưu result gần nhất để annotate frame
         self._last_result = {"ok": False}
-        
+
+        # Face rotation: iPhone RTMP thường gửi frame bị xoay 90°
+        # auto-detect lần đầu, hoặc set trong config
+        # 0=none, 1=90°CW, 2=180°, 3=90°CCW
+        self._face_rotate = self.cfg.get("camera", {}).get("face_rotate", -1)
+        # -1 = auto-detect
+
         self.running = False
 
     # ── ENTRY ──
@@ -290,6 +338,41 @@ class ParkingSystem:
         except Exception:
             pass
 
+    def _rotate_face(self, frame):
+        """
+        Rotate face frame nếu cần.
+        iPhone RTMP thường gửi frame landscape nhưng mặt bị xoay 90°.
+        Auto-detect: thử detect face ở 4 orientation, chọn cái detect được.
+        """
+        if self._face_rotate == 0:
+            return frame  # Không rotate
+        if self._face_rotate == 1:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if self._face_rotate == 2:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        if self._face_rotate == 3:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        # Auto-detect (-1): thử các orientation
+        orientations = [
+            (0, None, "no rotation"),
+            (1, cv2.ROTATE_90_CLOCKWISE, "90° CW"),
+            (3, cv2.ROTATE_90_COUNTERCLOCKWISE, "90° CCW"),
+            (2, cv2.ROTATE_180, "180°"),
+        ]
+        for code, rot, name in orientations:
+            test = frame if rot is None else cv2.rotate(frame, rot)
+            faces = self.face_eng(test)
+            if faces:
+                self._face_rotate = code
+                log.info(f"★ Face rotation auto-detected: {name} "
+                         f"(code={code}, {len(faces)} faces found)")
+                return test
+
+        # Không detect được ở bất kỳ orientation nào
+        # Giữ nguyên, sẽ thử lại frame sau
+        return frame
+
     # ── ANNOTATE FRAMES CHO WEB ──
     def _annotate_plate(self, frame, result):
         """Vẽ plate bbox + text lên frame cho web stream."""
@@ -355,6 +438,9 @@ class ParkingSystem:
                     continue
 
                 frame_idx += 1
+
+                # ★ FIX: Rotate face frame (iPhone RTMP xoay 90°)
+                ff = self._rotate_face(ff)
 
                 # ★ FIX: Update cam status TRƯỚC skip check
                 self.state["plate_cam_ok"] = True
@@ -447,6 +533,9 @@ class ParkingSystem:
                     break
 
                 frame_idx += 1
+
+                # ★ FIX: Rotate face frame
+                ff = self._rotate_face(ff)
 
                 # Web frame update — mỗi 3 frame
                 if frame_idx % 3 == 0:
@@ -665,5 +754,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
     
