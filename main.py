@@ -109,19 +109,44 @@ class PlateVoter:
         self._buf.clear()
 
 
+# class EmbeddingAvg:
+#     def __init__(self, n=3):
+#         self.n = n
+#         self._buf = []
+
+#     def update(self, emb):
+#         self._buf.append(emb)
+#         if len(self._buf) > self.n:
+#             self._buf.pop(0)
+#         avg = np.mean(self._buf, axis=0)
+#         n = np.linalg.norm(avg)
+#         return avg / n if n > 0 else avg
+
+#     def clear(self):
+#         self._buf.clear()
+
 class EmbeddingAvg:
+    """
+    Weighted average by quality score.
+    Frame chất lượng cao (ít blur, sáng vừa, face to) được weight cao hơn.
+    """
+ 
     def __init__(self, n=3):
         self.n = n
-        self._buf = []
-
-    def update(self, emb):
-        self._buf.append(emb)
+        self._buf = []  # list of (embedding, quality)
+ 
+    def update(self, emb, quality=1.0):
+        self._buf.append((emb, max(quality, 0.01)))  # avoid zero weight
         if len(self._buf) > self.n:
             self._buf.pop(0)
-        avg = np.mean(self._buf, axis=0)
+ 
+        # Weighted average
+        weights = np.array([q for _, q in self._buf])
+        weights = weights / weights.sum()
+        avg = sum(w * e for (e, _), w in zip(self._buf, weights))
         n = np.linalg.norm(avg)
         return avg / n if n > 0 else avg
-
+ 
     def clear(self):
         self._buf.clear()
 
@@ -172,6 +197,7 @@ class ParkingSystem:
         self.plate_voter = PlateVoter(rcfg["plate_vote_frames"])
         self.face_avg = EmbeddingAvg(rcfg["face_avg_frames"])
         self.face_thr = rcfg["face_threshold"]
+        self.blur_thr = self.cfg.get("face", {}).get("blur_threshold", 35.0)
 
         # ── Web state (shared reference với web.py) ──
         self.state = {
@@ -221,14 +247,22 @@ class ParkingSystem:
 
         # 2) Crop + OCR
         h, w = frame_plate.shape[:2]
-        m = 5
-        crop = frame_plate[max(0, y1-m):min(h, y2+m),
-                           max(0, x1-m):min(w, x2+m)]
+        # m = 5
+        # crop = frame_plate[max(0, y1-m):min(h, y2+m),
+        #                    max(0, x1-m):min(w, x2+m)]
+        box_w, box_h = x2 - x1, y2 - y1
+        mx = max(10, int(box_w * 0.08))
+        my = max(8, int(box_h * 0.12))
+        crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
+                           max(0, x1 - mx):min(w, x2 + mx)]
 
         # ★ DEBUG: xem crop có đúng không
+        # log.info(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
+        #          f"crop={crop.shape if crop.size > 0 else 'EMPTY'} "
+        #          f"mean_pixel={crop.mean():.0f}" if crop.size > 0 else "")
         log.info(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
-                 f"crop={crop.shape if crop.size > 0 else 'EMPTY'} "
-                 f"mean_pixel={crop.mean():.0f}" if crop.size > 0 else "")
+                 f"margin=({mx},{my}) "
+                 f"crop={crop.shape if crop.size > 0 else 'EMPTY'}")
 
         # Save 1 crop mẫu để kiểm tra bằng mắt
         if crop.size > 0 and not hasattr(self, '_crop_saved'):
@@ -262,12 +296,17 @@ class ParkingSystem:
         log.info(f"ENTRY FACE: best conf={best_f['conf']:.2f} "
                  f"bbox={best_f['bbox']}")
 
-        qok = FaceEngine.quality_ok(frame_face, best_f["bbox"])
+        # qok = FaceEngine.quality_ok(frame_face, best_f["bbox"])
+        qok = FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr)
+
         log.info(f"ENTRY FACE: quality_ok={qok}")
         if not qok:
             return result
 
-        emb = self.face_avg.update(best_f["embedding"])
+        # emb = self.face_avg.update(best_f["embedding"])
+        quality = FaceEngine.quality_score(frame_face, best_f["bbox"])
+        emb = self.face_avg.update(best_f["embedding"], quality)
+        log.debug(f"ENTRY FACE: quality_score={quality:.3f}")
 
         # 5) Register
         code = self.db.entry(stable, emb, ocr_conf, best_f["conf"])
@@ -296,10 +335,15 @@ class ParkingSystem:
         best_f = max(faces, key=lambda f: f["conf"])
         result["face_bbox"] = best_f["bbox"]
 
-        if not FaceEngine.quality_ok(frame_face, best_f["bbox"]):
+        # if not FaceEngine.quality_ok(frame_face, best_f["bbox"]):
+        #     return result
+        if not FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr):
             return result
 
-        emb = self.face_avg.update(best_f["embedding"])
+        # emb = self.face_avg.update(best_f["embedding"])
+        # match = self.db.match_exit(emb, self.face_thr)
+        quality = FaceEngine.quality_score(frame_face, best_f["bbox"])
+        emb = self.face_avg.update(best_f["embedding"], quality)
         match = self.db.match_exit(emb, self.face_thr)
         if not match:
             return result
@@ -312,8 +356,13 @@ class ParkingSystem:
             result["plate_bbox"] = best_p["bbox"]
             x1, y1, x2, y2 = best_p["bbox"]
             h, w = frame_plate.shape[:2]
-            crop = frame_plate[max(0, y1-5):min(h, y2+5),
-                               max(0, x1-5):min(w, x2+5)]
+            box_w, box_h = x2 - x1, y2 - y1
+            # crop = frame_plate[max(0, y1-5):min(h, y2+5),
+            #                    max(0, x1-5):min(w, x2+5)]
+            mx = max(10, int(box_w * 0.08))
+            my = max(8, int(box_h * 0.12))
+            crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
+                               max(0, x1 - mx):min(w, x2 + mx)]
             raw_text, _ = self.plate_ocr(crop)
             exit_plate = self.validator(raw_text)
             if exit_plate and exit_plate != match["plate"]:

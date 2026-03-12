@@ -36,6 +36,7 @@ plate_ocr:
 face:
   model_pack: "buffalo_sc"
   det_size: [640, 640]
+  blur_threshold: 10.0   
 
 recognition:
   face_threshold: 0.45

@@ -1,4 +1,4 @@
-# Smart Parking System v3
+# Smart Parking System
 
 Jetson Orin Nano | DeepStream + GStreamer | PostgreSQL + pgvector | Web Dashboard
 

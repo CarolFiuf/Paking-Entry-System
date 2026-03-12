@@ -85,11 +85,39 @@ class PlateOCR:
     def __call__(self, plate_crop: np.ndarray) -> tuple:
         if plate_crop.size == 0:
             return ("", 0.0)
-        gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+        
+        h, w = plate_crop.shape[:2]
+        if h < 48:
+            scale = 48.0 / h
+            plate_crop = cv2.resize(plate_crop, None, fx=scale, fy=scale,
+                                    interpolation=cv2.INTER_CUBIC)
+ 
+        # ★ FIX v4: Multi-preprocessing — thử nhiều variant
+        best_text, best_conf = "", 0.0
+        for img in self._preprocess_variants(plate_crop):
+            text, conf = (self._parse_v3(img) if self._v3
+                          else self._parse_v2(img))
+            if text and conf > best_conf:
+                best_text, best_conf = text, conf
+ 
+        return (best_text, best_conf)
+ 
+    def _preprocess_variants(self, crop):
+        """Trả về nhiều phiên bản preprocessed."""
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+ 
+        # Variant 1: CLAHE (tốt cho ảnh contrast thấp)
         enhanced = self._clahe.apply(gray)
-        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        return self._parse_v3(enhanced) if self._v3 \
-            else self._parse_v2(enhanced)
+        yield cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+ 
+        # Variant 2: Adaptive threshold (tốt ban đêm, ngược sáng)
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 15, 4)
+        yield cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+ 
+        # Variant 3: Original (đôi khi ảnh gốc cho kết quả tốt nhất)
+        yield crop
 
     def _parse_v3(self, img):
         """
@@ -221,11 +249,55 @@ class FaceEngine:
         } for f in faces]
 
     @staticmethod
-    def quality_ok(frame, bbox, blur_thr=80.0):
+    def quality_ok(frame, bbox, blur_thr=35.0):
+        """
+        Boolean check.
+        ★ v4: blur_thr hạ từ 80→35 cho RTMP stream (H.264 compression
+        giảm Laplacian variance đáng kể so với camera trực tiếp).
+        Thêm debug logging để biết chính xác tại sao fail.
+        """
         x1, y1, x2, y2 = bbox
         crop = frame[max(0, y1):y2, max(0, x1):x2]
         if crop.size == 0:
+            log.debug("FACE QUALITY: crop empty")
             return False
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        return (cv2.Laplacian(gray, cv2.CV_64F).var() >= blur_thr
-                and 30 < gray.mean() < 230)
+        blur_val = cv2.Laplacian(gray, cv2.CV_64F).var()
+        mean_val = gray.mean()
+        ok = blur_val >= blur_thr and 30 < mean_val < 230
+        # ★ Log mỗi lần check — rất hữu ích khi debug
+        log.info(f"FACE QUALITY: blur={blur_val:.1f} (thr={blur_thr}) "
+                 f"brightness={mean_val:.1f} size={crop.shape[1]}x{crop.shape[0]} "
+                 f"→ {'OK' if ok else 'FAIL'}"
+                 f"{' [TOO_BLURRY]' if blur_val < blur_thr else ''}"
+                 f"{' [TOO_DARK]' if mean_val <= 30 else ''}"
+                 f"{' [TOO_BRIGHT]' if mean_val >= 230 else ''}")
+        return ok
+ 
+    @staticmethod
+    def quality_score(frame, bbox, blur_thr=80.0):
+        """
+        ★ NEW v4: Trả về float 0.0~1.0 thay vì bool.
+        Dùng cho weighted embedding averaging.
+        """
+        x1, y1, x2, y2 = bbox
+        crop = frame[max(0, y1):y2, max(0, x1):x2]
+        if crop.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+ 
+        # Blur score (Laplacian variance, cap at 500)
+        blur = cv2.Laplacian(gray, cv2.CV_64F).var()
+        blur_score = min(blur / 500.0, 1.0)
+ 
+        # Brightness score (best at 128, penalty for too dark/bright)
+        brightness = gray.mean()
+        if brightness < 30 or brightness > 230:
+            return 0.0
+        bright_score = 1.0 - abs(brightness - 128) / 128.0
+ 
+        # Size score (bigger face = better features)
+        face_area = (x2 - x1) * (y2 - y1)
+        size_score = min(face_area / 20000.0, 1.0)
+ 
+        return blur_score * 0.5 + bright_score * 0.2 + size_score * 0.3
