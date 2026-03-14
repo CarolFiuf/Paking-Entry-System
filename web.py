@@ -20,7 +20,8 @@ import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
-import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 
 log = logging.getLogger("web")
 
@@ -47,7 +48,7 @@ _clients: list[WebSocket] = []
 _frames: dict[str, bytes] = {}  # {"plate": jpeg_bytes, "face": jpeg_bytes}
 # _frame_lock = __import__("threading").Lock()
 _loop = None # lưu reference tới uvicorn event loop
-
+# _encode_executor = ThreadPoolExecutor(max_workers=1)
 
 def update_frame(name: str, frame):
     """Gọi từ pipeline thread — encode + lưu JPEG."""
@@ -55,6 +56,12 @@ def update_frame(name: str, frame):
         return
     _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
     _frames[name] = jpg.tobytes()  # atomic reference assignment in CPython
+# def update_frame(name: str, frame):
+#     if frame is None: return
+#     def _encode():
+#         _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+#         _frames[name] = jpg.tobytes()
+#     _encode_executor.submit(_encode)
 
 
 def init(db, state: dict = None):

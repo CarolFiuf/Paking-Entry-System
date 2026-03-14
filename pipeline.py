@@ -361,6 +361,10 @@ class StreamReader:
         self._stop = Event()
         self._queue: Queue = Queue(maxsize=1)
         self._connected = False
+        
+        self._latest = None
+        self._latest_lock = Lock()
+        
         self.cap = None
         self.is_stream = isinstance(source, str) and \
             source.startswith(("rtmp://", "rtsp://", "http://"))
@@ -381,7 +385,16 @@ class StreamReader:
         if not self.cap or not self.cap.isOpened():
             if self.hw_decode:
                 log.warning(f"[{self.name}] GStreamer failed, fallback")
-            self.cap = cv2.VideoCapture(str(self.source))
+            # self.cap = cv2.VideoCapture(str(self.source))
+            self.cap = cv2.VideoCapture()
+            self.cap.open(
+                str(self.source),
+                cv2.CAP_FFMPEG,
+                [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,  # 3s thay vì 30-60s
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000,
+                ]
+            )  
 
         self._connected = self.cap.isOpened()
         if self._connected:
@@ -421,6 +434,9 @@ class StreamReader:
                     continue
                 self._queue.put(None)
                 break
+            
+            with self._latest_lock:
+                self._latest = frame
 
             if self._queue.full():
                 try:
@@ -435,6 +451,12 @@ class StreamReader:
         except Empty:
             return None
 
+    @property
+    def latest(self):
+        """Frame mới nhất, không pop khỏi queue. Dùng cho web update thread."""
+        with self._latest_lock:
+            return self._latest
+        
     @property
     def connected(self):
         return self._connected

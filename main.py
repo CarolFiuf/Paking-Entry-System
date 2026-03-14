@@ -214,6 +214,12 @@ class ParkingSystem:
         # 0=none, 1=90°CW, 2=180°, 3=90°CCW
         self._face_rotate = self.cfg.get("camera", {}).get("face_rotate", -1)
         # -1 = auto-detect
+        # rotation map dùng chung cho cả web thread và AI thread
+        self._rot_map = {
+            1: cv2.ROTATE_90_CLOCKWISE,
+            2: cv2.ROTATE_180,
+            3: cv2.ROTATE_90_COUNTERCLOCKWISE,
+        }
 
         self.running = False
 
@@ -257,9 +263,6 @@ class ParkingSystem:
                            max(0, x1 - mx):min(w, x2 + mx)]
 
         # ★ DEBUG: xem crop có đúng không
-        # log.info(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
-        #          f"crop={crop.shape if crop.size > 0 else 'EMPTY'} "
-        #          f"mean_pixel={crop.mean():.0f}" if crop.size > 0 else "")
         log.info(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
                  f"margin=({mx},{my}) "
                  f"crop={crop.shape if crop.size > 0 else 'EMPTY'}")
@@ -386,6 +389,12 @@ class ParkingSystem:
             notify_sync({"type": event_type, "data": data})
         except Exception:
             pass
+        
+    def _apply_rotation(self, frame):
+        """Áp dụng rotation đã biết (không auto-detect). Dùng cho web thread."""
+        if self._face_rotate > 0 and self._face_rotate in self._rot_map:
+            return cv2.rotate(frame, self._rot_map[self._face_rotate])
+        return frame
 
     def _rotate_face(self, frame):
         """
@@ -458,12 +467,83 @@ class ParkingSystem:
                 cv2.putText(vis, label, (x1+4, y1-8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         return vis
+    
+    def _web_update_loop(self, cam_plate, cam_face, interval: float = 0.1):
+        """
+        Web frame update chạy độc lập ở ~10fps cố định (interval=0.1s).
+ 
+        Đọc từ cam.latest (không pop queue) → encode → push tới dashboard.
+        Hoàn toàn độc lập với AI processing loop → dashboard không giật
+        dù AI đang xử lý frame nặng 300ms.
+ 
+        Chỉ áp dụng rotation đã biết (_face_rotate), không auto-detect
+        (auto-detect chạy trong AI thread, gọi face engine 4 lần).
+        """
+        from web import update_frame
+        log.info("Web update thread started (fallback mode)")
+ 
+        while self.running:
+            t0 = time.time()
+ 
+            fp = cam_plate.latest
+            ff = cam_face.latest
+ 
+            if fp is not None and ff is not None:
+                ff_rot = self._apply_rotation(ff)
+                try:
+                    update_frame("plate",
+                                 self._annotate_plate(fp, self._last_result))
+                    update_frame("face",
+                                 self._annotate_face(ff_rot, self._last_result))
+                except Exception:
+                    pass
+ 
+            elapsed = time.time() - t0
+            time.sleep(max(0.0, interval - elapsed))
+ 
+    def _web_update_loop_ds(self, ds, interval: float = 0.1):
+        """
+        Web frame update cho DeepStream mode.
+ 
+        DeepStreamPipeline.get_plate_data() / get_face_frame() trả về
+        latest frame với lock bên trong — an toàn để gọi từ thread riêng.
+        """
+        from web import update_frame
+        log.info("Web update thread started (DeepStream mode)")
+ 
+        while self.running:
+            t0 = time.time()
+ 
+            fp, _ = ds.get_plate_data()
+            ff = ds.get_face_frame()
+ 
+            if fp is not None and ff is not None:
+                ff_rot = self._apply_rotation(ff)
+                try:
+                    update_frame("plate",
+                                 self._annotate_plate(fp, self._last_result))
+                    update_frame("face",
+                                 self._annotate_face(ff_rot, self._last_result))
+                except Exception:
+                    pass
+ 
+            elapsed = time.time() - t0
+            time.sleep(max(0.0, interval - elapsed))
+
 
     # ── RUN (DEEPSTREAM MODE) ──
     def _run_deepstream(self, mode: str, show: bool):
         ccfg = self.cfg["camera"]
         ds = DeepStreamPipeline(ccfg["plate"], ccfg["face"], self.cfg)
         ds.start()
+        
+        web_thread = Thread(
+            target=self._web_update_loop_ds,
+            args=(ds,),
+            daemon=True,
+            name="web-update-ds"
+        )
+        web_thread.start()
 
         skip_n = ccfg["process_every_n"]
         frame_idx = 0
@@ -496,15 +576,15 @@ class ParkingSystem:
                 self.state["face_cam_ok"] = True
 
                 # ★ FIX: Web frame update — mỗi 3 frame, KHÔNG bị skip_n block
-                if frame_idx % 3 == 0:
-                    try:
-                        from web import update_frame
-                        update_frame("plate",
-                                     self._annotate_plate(fp, self._last_result))
-                        update_frame("face",
-                                     self._annotate_face(ff, self._last_result))
-                    except Exception:
-                        pass
+                # if frame_idx % 3 == 0:
+                #     try:
+                #         from web import update_frame
+                #         update_frame("plate",
+                #                      self._annotate_plate(fp, self._last_result))
+                #         update_frame("face",
+                #                      self._annotate_face(ff, self._last_result))
+                #     except Exception:
+                #         pass
 
                 # AI processing — skip frames
                 if skip_n > 1 and frame_idx % skip_n != 0:
@@ -527,10 +607,11 @@ class ParkingSystem:
 
                 # FPS counter
                 n_fps += 1
-                if time.time() - t_fps >= 1.0:
-                    fps = n_fps / (time.time() - t_fps)
-                    n_fps, t_fps = 0, time.time()
-                    self.state["fps"] = round(fps, 1)
+                now = time.time()
+                elapsed = now - t_fps
+                if elapsed >= 1.0:
+                    self.state["fps"] = round(n_fps / elapsed, 1)
+                    n_fps, t_fps = 0, now
 
                 if show:
                     self._show_dual(fp, ff, result, mode, fps)
@@ -560,6 +641,14 @@ class ParkingSystem:
         cam_face = StreamReader(ccfg["face"], name="face",
                                 hw_decode=hw, reconnect_sec=reconn)
 
+        web_thread = Thread(
+            target=self._web_update_loop,
+            args=(cam_plate, cam_face),
+            daemon=True,
+            name="web-update"
+        )
+        web_thread.start()
+        
         skip_n = ccfg["process_every_n"]
         frame_idx = 0
         fps, t_fps, n_fps = 0.0, time.time(), 0
@@ -587,15 +676,15 @@ class ParkingSystem:
                 ff = self._rotate_face(ff)
 
                 # Web frame update — mỗi 3 frame
-                if frame_idx % 3 == 0:
-                    try:
-                        from web import update_frame
-                        update_frame("plate",
-                                     self._annotate_plate(fp, self._last_result))
-                        update_frame("face",
-                                     self._annotate_face(ff, self._last_result))
-                    except Exception:
-                        pass
+                # if frame_idx % 3 == 0:
+                #     try:
+                #         from web import update_frame
+                #         update_frame("plate",
+                #                      self._annotate_plate(fp, self._last_result))
+                #         update_frame("face",
+                #                      self._annotate_face(ff, self._last_result))
+                #     except Exception:
+                #         pass
 
                 # AI processing — skip frames
                 if skip_n > 1 and frame_idx % skip_n != 0:
@@ -616,11 +705,12 @@ class ParkingSystem:
                     cooldown_until = t0 + 2.0
 
                 n_fps += 1
-                if time.time() - t_fps >= 1.0:
-                    fps = n_fps / (time.time() - t_fps)
-                    n_fps, t_fps = 0, time.time()
-                    self.state["fps"] = round(fps, 1)
-
+                now = time.time()
+                elapsed = now - t_fps
+                if elapsed >= 1.0:
+                    self.state["fps"] = round(n_fps / elapsed, 1)
+                    n_fps, t_fps = 0, now
+                    
                 if show:
                     self._show_dual(fp, ff, result, mode, fps)
                     key = cv2.waitKey(1) & 0xFF
