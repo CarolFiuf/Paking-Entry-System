@@ -123,6 +123,7 @@ async def api_stats():
     stats.update({
         "mode": _state.get("mode", "?"),
         "fps": _state.get("fps", 0),
+        "stream_fps": _state.get("stream_fps", 0),
         "plate_cam": _state.get("plate_cam_ok", False),
         "face_cam": _state.get("face_cam_ok", False),
         "deepstream": _state.get("deepstream", False),

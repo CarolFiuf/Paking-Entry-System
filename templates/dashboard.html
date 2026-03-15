@@ -123,6 +123,10 @@ tr:hover td{background:#15151a}
     <div class="label">FPS</div>
     <div class="value blue" id="s-fps">—</div>
   </div>
+  <div class="stat">
+    <div class="label">STREAM FPS</div>
+    <div class="value blue" id="s-stream-fps">—</div>
+  </div>
 </div>
 
 <div class="panel">
@@ -178,6 +182,7 @@ function updateStats(s) {
   $('#s-capacity').textContent = s.capacity ?? '—';
   $('#s-pct').textContent = s.pct != null ? s.pct + '%' : '—';
   $('#s-fps').textContent = s.fps != null ? Math.round(s.fps) : '—';
+  $('#s-stream-fps').textContent = s.stream_fps != null ? Math.round(s.stream_fps) : '—';
   $('#mode-label').textContent = (s.mode || '').toUpperCase();
 
   const eb = $('#engine-badge');

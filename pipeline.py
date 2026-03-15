@@ -70,6 +70,13 @@ class DeepStreamPipeline:
         self._plate_frame = None
         self._plate_detections = []
         self._face_frame = None
+        
+        self._frame_seq = 0          # ← thêm counter
+        self._frame_event = Event()  # ← thêm event
+
+        self._probe_count = 0
+        self._probe_fps = 0.0
+        self._probe_t0 = time.time()
 
         self._build_pipeline(plate_src, face_src)
 
@@ -270,6 +277,8 @@ class DeepStreamPipeline:
                 if source_id == 0:
                     self._plate_frame = frame
                     self._plate_detections = detections
+                    self._frame_seq += 1        # ← tăng counter
+                    self._frame_event.set()     # ← signal frame mới
                     # ★ DEBUG: save 1 frame từ probe để verify
                     if not hasattr(self, '_probe_saved'):
                         cv2.imwrite("/tmp/debug_probe_plate.jpg", frame)
@@ -285,8 +294,24 @@ class DeepStreamPipeline:
                 l_frame = l_frame.next
             except StopIteration:
                 break
+            
+        self._probe_count += 1
+        now = time.time()
+        if now - self._probe_t0 >= 1.0:
+            self._probe_fps = self._probe_count / (now - self._probe_t0)
+            self._probe_count = 0
+            self._probe_t0 = now
 
         return Gst.PadProbeReturn.OK
+    
+    @property
+    def stream_fps(self):
+        return round(self._probe_fps, 1)
+    
+    def wait_new_frame(self, timeout=0.5) -> bool:
+        """Block cho tới khi có frame mới từ probe."""
+        self._frame_event.clear()
+        return self._frame_event.wait(timeout=timeout)
 
     def _on_bus_message(self, bus, message):
         """Log GStreamer bus messages — rất quan trọng để debug."""
@@ -373,6 +398,10 @@ class StreamReader:
         self._thread = Thread(target=self._reader, daemon=True,
                               name=f"reader-{name}")
         self._thread.start()
+        
+        self._read_count = 0
+        self._read_fps = 0.0
+        self._read_t0 = time.time()
 
     def _connect(self):
         if self.cap:
@@ -435,6 +464,13 @@ class StreamReader:
                 self._queue.put(None)
                 break
             
+            self._read_count += 1
+            now = time.time()
+            if now - self._read_t0 >= 1.0:
+                self._read_fps = self._read_count / (now - self._read_t0)
+                self._read_count = 0
+                self._read_t0 = now
+                
             with self._latest_lock:
                 self._latest = frame
 
@@ -450,6 +486,10 @@ class StreamReader:
             return self._queue.get(timeout=timeout)
         except Empty:
             return None
+
+    @property
+    def stream_fps(self):
+        return round(self._read_fps, 1)
 
     @property
     def latest(self):

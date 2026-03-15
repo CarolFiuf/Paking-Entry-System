@@ -201,7 +201,7 @@ class ParkingSystem:
 
         # ── Web state (shared reference với web.py) ──
         self.state = {
-            "mode": "entry", "fps": 0,
+            "mode": "entry", "stream_fps":0, "fps": 0,
             "plate_cam_ok": False, "face_cam_ok": False,
             "deepstream": self.use_deepstream,
         }
@@ -554,6 +554,10 @@ class ParkingSystem:
 
         try:
             while self.running:
+                # ★ Chờ frame mới thay vì spin
+                if not ds.wait_new_frame(timeout=0.5):
+                    continue
+                
                 fp, plate_dets = ds.get_plate_data()
                 ff = ds.get_face_frame()
 
@@ -611,6 +615,7 @@ class ParkingSystem:
                 elapsed = now - t_fps
                 if elapsed >= 1.0:
                     self.state["fps"] = round(n_fps / elapsed, 1)
+                    self.state["stream_fps"] = ds.stream_fps
                     n_fps, t_fps = 0, now
 
                 if show:
@@ -709,6 +714,8 @@ class ParkingSystem:
                 elapsed = now - t_fps
                 if elapsed >= 1.0:
                     self.state["fps"] = round(n_fps / elapsed, 1)
+                    self.state["stream_fps"] = round(
+                        (cam_plate.steam_fps + cam_face.stream_fps) / 2, 1)
                     n_fps, t_fps = 0, now
                     
                 if show:
