@@ -51,3 +51,7 @@ yolo_plate_data/
 yolo_plate_dataset/
 yolo_plate_ocr_dataset/
 models/
+paddle_format/
+benchmark_data/
+yolo_plate_ocr_data
+.codex

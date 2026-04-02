@@ -29,7 +29,15 @@ plate_detector:
   conf: 0.4
   device: 0
 
+# ★ v5: YOLO char detection thay PaddleOCR
 plate_ocr:
+  # YOLO mode (mặc định) — nhanh, chính xác
+  backend: "yolo"                           # "yolo" hoặc "paddle" (fallback)
+  model: "./models/plate_ocr_yolov8n.pt"
+  imgsz: 320
+  conf: 0.3
+  device: 0
+  # PaddleOCR fallback (dùng khi backend: "paddle")
   lang: "en"
   use_gpu: true
 

@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-Smart Parking System
-DeepStream pipeline (hoặc GStreamer fallback) + FastAPI web dashboard.
-
-FIX vs v3:
-  - Annotated frames cho web stream (FIX: không thấy bbox face)
-  - Debug logging trong process_entry/exit (FIX: không biết flow dừng ở đâu)
-  - Throttle web frame update (FIX: CPU waste)
-  - State shared reference (FIX: FPS=0, cam dots đỏ)
-"""
-
 import cv2
 import numpy as np
 import yaml
@@ -21,7 +9,7 @@ import argparse
 from collections import Counter
 from threading import Thread
 
-from engine import PlateDetector, PlateOCR, FaceEngine
+from engine import PlateDetector, PlateOCRYolo, PlateOCR, FaceEngine
 from database import ParkingDB, DIM
 from pipeline import HAS_DEEPSTREAM, DeepStreamPipeline, StreamReader
 
@@ -109,22 +97,6 @@ class PlateVoter:
         self._buf.clear()
 
 
-# class EmbeddingAvg:
-#     def __init__(self, n=3):
-#         self.n = n
-#         self._buf = []
-
-#     def update(self, emb):
-#         self._buf.append(emb)
-#         if len(self._buf) > self.n:
-#             self._buf.pop(0)
-#         avg = np.mean(self._buf, axis=0)
-#         n = np.linalg.norm(avg)
-#         return avg / n if n > 0 else avg
-
-#     def clear(self):
-#         self._buf.clear()
-
 class EmbeddingAvg:
     """
     Weighted average by quality score.
@@ -174,15 +146,30 @@ class ParkingSystem:
             self.plate_det = None
             log.info("PlateDetector skipped (DeepStream nvinfer)")
 
-        self.plate_ocr = PlateOCR(
-            self.cfg["plate_ocr"]["lang"], self.cfg["plate_ocr"]["use_gpu"])
+        # ★ v5: OCR backend selection
+        ocr_cfg = self.cfg["plate_ocr"]
+        ocr_backend = ocr_cfg.get("backend", "yolo")
+
+        if ocr_backend == "yolo":
+            self.plate_ocr = PlateOCRYolo(
+                model_path=ocr_cfg["model"],
+                imgsz=ocr_cfg.get("imgsz", 320),
+                conf=ocr_cfg.get("conf", 0.3),
+                device=ocr_cfg.get("device", 0))
+        else:
+            # Fallback PaddleOCR
+            log.info("Using PaddleOCR fallback (backend='paddle')")
+            self.plate_ocr = PlateOCR(
+                ocr_cfg.get("lang", "en"),
+                ocr_cfg.get("use_gpu", True))
 
         fcfg = self.cfg["face"]
         self.face_eng = FaceEngine(
             fcfg["model_pack"], tuple(fcfg["det_size"]))
 
         log.info(f"Models loaded in {time.time()-t0:.1f}s "
-                 f"(DeepStream={'ON' if self.use_deepstream else 'OFF'})")
+                 f"(DeepStream={'ON' if self.use_deepstream else 'OFF'}, "
+                 f"OCR={ocr_backend})")
 
         # ── Database ──
         dcfg = self.cfg["database"]
@@ -209,12 +196,7 @@ class ParkingSystem:
         # Lưu result gần nhất để annotate frame
         self._last_result = {"ok": False}
 
-        # Face rotation: iPhone RTMP thường gửi frame bị xoay 90°
-        # auto-detect lần đầu, hoặc set trong config
-        # 0=none, 1=90°CW, 2=180°, 3=90°CCW
         self._face_rotate = self.cfg.get("camera", {}).get("face_rotate", -1)
-        # -1 = auto-detect
-        # rotation map dùng chung cho cả web thread và AI thread
         self._rot_map = {
             1: cv2.ROTATE_90_CLOCKWISE,
             2: cv2.ROTATE_180,
@@ -224,6 +206,7 @@ class ParkingSystem:
         self.running = False
 
     # ── ENTRY ──
+    # ★ KHÔNG ĐỔI — plate_ocr(crop) → (text, conf) interface giữ nguyên
     def process_entry(self, frame_plate, plate_dets,
                       frame_face) -> dict:
         result = {"ok": False, "plate": "", "face_conf": 0,
@@ -253,21 +236,16 @@ class ParkingSystem:
 
         # 2) Crop + OCR
         h, w = frame_plate.shape[:2]
-        # m = 5
-        # crop = frame_plate[max(0, y1-m):min(h, y2+m),
-        #                    max(0, x1-m):min(w, x2+m)]
         box_w, box_h = x2 - x1, y2 - y1
         mx = max(10, int(box_w * 0.08))
         my = max(8, int(box_h * 0.12))
         crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
                            max(0, x1 - mx):min(w, x2 + mx)]
 
-        # ★ DEBUG: xem crop có đúng không
         log.info(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
                  f"margin=({mx},{my}) "
                  f"crop={crop.shape if crop.size > 0 else 'EMPTY'}")
 
-        # Save 1 crop mẫu để kiểm tra bằng mắt
         if crop.size > 0 and not hasattr(self, '_crop_saved'):
             cv2.imwrite("/tmp/debug_crop.jpg", crop)
             self._crop_saved = True
@@ -289,7 +267,6 @@ class ParkingSystem:
 
         # 4) Face
         faces = self.face_eng(frame_face)
-        # ★ LOG: face detection kết quả
         log.info(f"ENTRY FACE: {len(faces)} faces detected")
         if not faces:
             return result
@@ -299,14 +276,12 @@ class ParkingSystem:
         log.info(f"ENTRY FACE: best conf={best_f['conf']:.2f} "
                  f"bbox={best_f['bbox']}")
 
-        # qok = FaceEngine.quality_ok(frame_face, best_f["bbox"])
         qok = FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr)
 
         log.info(f"ENTRY FACE: quality_ok={qok}")
         if not qok:
             return result
 
-        # emb = self.face_avg.update(best_f["embedding"])
         quality = FaceEngine.quality_score(frame_face, best_f["bbox"])
         emb = self.face_avg.update(best_f["embedding"], quality)
         log.debug(f"ENTRY FACE: quality_score={quality:.3f}")
@@ -327,6 +302,7 @@ class ParkingSystem:
         return result
 
     # ── EXIT ──
+    # ★ KHÔNG ĐỔI
     def process_exit(self, frame_face, frame_plate,
                      plate_dets=None) -> dict:
         result = {"ok": False, "plate": "", "sim": 0.0,
@@ -338,13 +314,9 @@ class ParkingSystem:
         best_f = max(faces, key=lambda f: f["conf"])
         result["face_bbox"] = best_f["bbox"]
 
-        # if not FaceEngine.quality_ok(frame_face, best_f["bbox"]):
-        #     return result
         if not FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr):
             return result
 
-        # emb = self.face_avg.update(best_f["embedding"])
-        # match = self.db.match_exit(emb, self.face_thr)
         quality = FaceEngine.quality_score(frame_face, best_f["bbox"])
         emb = self.face_avg.update(best_f["embedding"], quality)
         match = self.db.match_exit(emb, self.face_thr)
@@ -360,8 +332,6 @@ class ParkingSystem:
             x1, y1, x2, y2 = best_p["bbox"]
             h, w = frame_plate.shape[:2]
             box_w, box_h = x2 - x1, y2 - y1
-            # crop = frame_plate[max(0, y1-5):min(h, y2+5),
-            #                    max(0, x1-5):min(w, x2+5)]
             mx = max(10, int(box_w * 0.08))
             my = max(8, int(box_h * 0.12))
             crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
@@ -391,19 +361,13 @@ class ParkingSystem:
             pass
         
     def _apply_rotation(self, frame):
-        """Áp dụng rotation đã biết (không auto-detect). Dùng cho web thread."""
         if self._face_rotate > 0 and self._face_rotate in self._rot_map:
             return cv2.rotate(frame, self._rot_map[self._face_rotate])
         return frame
 
     def _rotate_face(self, frame):
-        """
-        Rotate face frame nếu cần.
-        iPhone RTMP thường gửi frame landscape nhưng mặt bị xoay 90°.
-        Auto-detect: thử detect face ở 4 orientation, chọn cái detect được.
-        """
         if self._face_rotate == 0:
-            return frame  # Không rotate
+            return frame
         if self._face_rotate == 1:
             return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         if self._face_rotate == 2:
@@ -411,7 +375,6 @@ class ParkingSystem:
         if self._face_rotate == 3:
             return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-        # Auto-detect (-1): thử các orientation
         orientations = [
             (0, None, "no rotation"),
             (1, cv2.ROTATE_90_CLOCKWISE, "90° CW"),
@@ -426,14 +389,10 @@ class ParkingSystem:
                 log.info(f"★ Face rotation auto-detected: {name} "
                          f"(code={code}, {len(faces)} faces found)")
                 return test
-
-        # Không detect được ở bất kỳ orientation nào
-        # Giữ nguyên, sẽ thử lại frame sau
         return frame
 
     # ── ANNOTATE FRAMES CHO WEB ──
     def _annotate_plate(self, frame, result):
-        """Vẽ plate bbox + text lên frame cho web stream."""
         vis = frame.copy()
         if result.get("plate_bbox"):
             x1, y1, x2, y2 = result["plate_bbox"]
@@ -448,19 +407,16 @@ class ParkingSystem:
         return vis
 
     def _annotate_face(self, frame, result):
-        """Vẽ face bbox + info lên frame cho web stream."""
         vis = frame.copy()
         if result.get("face_bbox"):
             x1, y1, x2, y2 = result["face_bbox"]
             color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
             cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-
             label = ""
             if result.get("ok") and result.get("sim"):
                 label = f"MATCH {result['sim']:.2f}"
             elif result.get("face_conf"):
                 label = f"face {result['face_conf']:.2f}"
-
             if label:
                 cv2.rectangle(vis, (x1, y1-28), (x1+len(label)*12, y1),
                               (0, 0, 0), -1)
@@ -469,25 +425,12 @@ class ParkingSystem:
         return vis
     
     def _web_update_loop(self, cam_plate, cam_face, interval: float = 0.1):
-        """
-        Web frame update chạy độc lập ở ~10fps cố định (interval=0.1s).
- 
-        Đọc từ cam.latest (không pop queue) → encode → push tới dashboard.
-        Hoàn toàn độc lập với AI processing loop → dashboard không giật
-        dù AI đang xử lý frame nặng 300ms.
- 
-        Chỉ áp dụng rotation đã biết (_face_rotate), không auto-detect
-        (auto-detect chạy trong AI thread, gọi face engine 4 lần).
-        """
         from web import update_frame
         log.info("Web update thread started (fallback mode)")
- 
         while self.running:
             t0 = time.time()
- 
             fp = cam_plate.latest
             ff = cam_face.latest
- 
             if fp is not None and ff is not None:
                 ff_rot = self._apply_rotation(ff)
                 try:
@@ -497,26 +440,16 @@ class ParkingSystem:
                                  self._annotate_face(ff_rot, self._last_result))
                 except Exception:
                     pass
- 
             elapsed = time.time() - t0
             time.sleep(max(0.0, interval - elapsed))
  
     def _web_update_loop_ds(self, ds, interval: float = 0.1):
-        """
-        Web frame update cho DeepStream mode.
- 
-        DeepStreamPipeline.get_plate_data() / get_face_frame() trả về
-        latest frame với lock bên trong — an toàn để gọi từ thread riêng.
-        """
         from web import update_frame
         log.info("Web update thread started (DeepStream mode)")
- 
         while self.running:
             t0 = time.time()
- 
             fp, _ = ds.get_plate_data()
             ff = ds.get_face_frame()
- 
             if fp is not None and ff is not None:
                 ff_rot = self._apply_rotation(ff)
                 try:
@@ -526,10 +459,8 @@ class ParkingSystem:
                                  self._annotate_face(ff_rot, self._last_result))
                 except Exception:
                     pass
- 
             elapsed = time.time() - t0
             time.sleep(max(0.0, interval - elapsed))
-
 
     # ── RUN (DEEPSTREAM MODE) ──
     def _run_deepstream(self, mode: str, show: bool):
@@ -554,7 +485,6 @@ class ParkingSystem:
 
         try:
             while self.running:
-                # ★ Chờ frame mới thay vì spin
                 if not ds.wait_new_frame(timeout=0.5):
                     continue
                 
@@ -571,26 +501,11 @@ class ParkingSystem:
                     continue
 
                 frame_idx += 1
-
-                # ★ FIX: Rotate face frame (iPhone RTMP xoay 90°)
                 ff = self._rotate_face(ff)
 
-                # ★ FIX: Update cam status TRƯỚC skip check
                 self.state["plate_cam_ok"] = True
                 self.state["face_cam_ok"] = True
 
-                # ★ FIX: Web frame update — mỗi 3 frame, KHÔNG bị skip_n block
-                # if frame_idx % 3 == 0:
-                #     try:
-                #         from web import update_frame
-                #         update_frame("plate",
-                #                      self._annotate_plate(fp, self._last_result))
-                #         update_frame("face",
-                #                      self._annotate_face(ff, self._last_result))
-                #     except Exception:
-                #         pass
-
-                # AI processing — skip frames
                 if skip_n > 1 and frame_idx % skip_n != 0:
                     continue
 
@@ -603,13 +518,11 @@ class ParkingSystem:
                 else:
                     result = self.process_exit(ff, fp, plate_dets)
 
-                # Lưu result để annotate frame tiếp theo
                 self._last_result = result
 
                 if result.get("ok"):
                     cooldown_until = t0 + 2.0
 
-                # FPS counter
                 n_fps += 1
                 now = time.time()
                 elapsed = now - t_fps
@@ -676,22 +589,8 @@ class ParkingSystem:
                     break
 
                 frame_idx += 1
-
-                # ★ FIX: Rotate face frame
                 ff = self._rotate_face(ff)
 
-                # Web frame update — mỗi 3 frame
-                # if frame_idx % 3 == 0:
-                #     try:
-                #         from web import update_frame
-                #         update_frame("plate",
-                #                      self._annotate_plate(fp, self._last_result))
-                #         update_frame("face",
-                #                      self._annotate_face(ff, self._last_result))
-                #     except Exception:
-                #         pass
-
-                # AI processing — skip frames
                 if skip_n > 1 and frame_idx % skip_n != 0:
                     continue
 
@@ -737,7 +636,6 @@ class ParkingSystem:
             cam_face.release()
 
     def _show_dual(self, fp, ff, result, mode, fps):
-        """Hiển thị 2 cam cạnh nhau (cho --show mode)."""
         stats = self.db.stats()
         h = 360
         p = cv2.resize(fp, (int(fp.shape[1]*h/fp.shape[0]), h))
@@ -795,10 +693,8 @@ class ParkingSystem:
 # Web server launcher
 # ──────────────────────────────────────────────
 def start_web(cfg: dict, db, state: dict):
-    """Chạy FastAPI trên thread riêng."""
     import uvicorn
     from web import app, init
-    # ★ FIX: pass state reference — web.py giờ dùng _state = state
     init(db, state)
     host = cfg["web"]["host"]
     port = cfg["web"]["port"]
@@ -821,7 +717,6 @@ def main():
     parser.add_argument("--no-show", action="store_true")
     parser.add_argument("--no-web", action="store_true")
     parser.add_argument("--frames", type=int, default=200)
-    # ★ Thêm --debug để bật debug log
     parser.add_argument("--debug", action="store_true",
                         help="Bật debug logging chi tiết")
     args = parser.parse_args()
@@ -900,4 +795,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
