@@ -363,6 +363,11 @@ class DeepStreamPipeline:
         with self._lock:
             return self._face_frame
 
+    def get_all(self):
+        """Lấy plate + face frame atomic — tránh mismatch giữa 2 lock."""
+        with self._lock:
+            return self._plate_frame, self._plate_detections, self._face_frame
+
     def stop(self):
         self._stop.set()
         self._pipeline.set_state(Gst.State.NULL)

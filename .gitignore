@@ -55,3 +55,4 @@ paddle_format/
 benchmark_data/
 yolo_plate_ocr_data
 .codex
+CLAUDE.md

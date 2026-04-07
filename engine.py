@@ -116,6 +116,7 @@ class PlateOCRYolo:
                     "cx": (x1 + x2) / 2,
                     "cy": (y1 + y2) / 2,
                     "x1": x1,
+                    "h": y2 - y1,
                 })
 
         if not chars:
@@ -134,29 +135,58 @@ class PlateOCRYolo:
     @staticmethod
     def _sort_chars(chars: list, img_h: int) -> list:
         """
-        Sort ký tự theo vị trí — handle biển 2 dòng.
+        Sort ký tự theo vị trí, bền hơn với biển 1 dòng bị nghiêng.
 
-        Biển xe máy VN 2 dòng: dòng 1 = tỉnh + series (29B1),
-                                dòng 2 = số đăng ký (25739)
-        Detect bằng y_center clustering:
-          - Nếu khoảng cách y giữa ký tự cao/thấp nhất > 30% chiều cao ảnh
-            → 2 dòng, sort mỗi dòng theo x riêng
-          - Ngược lại → 1 dòng, sort theo x
+        Logic cũ chỉ nhìn y_range, nên biển 1 dòng bị tilt/perspective có thể
+        bị hiểu nhầm thành 2 dòng. Ở đây:
+          1. sort trái → phải
+          2. fit một đường xu hướng y(x) để loại bỏ độ nghiêng toàn cục
+          3. chỉ tách 2 dòng nếu residual theo trục y đủ lớn và hai cụm còn
+             chồng nhau theo trục x
         """
-        ys = [c["cy"] for c in chars]
-        y_range = max(ys) - min(ys)
+        ordered = sorted(chars, key=lambda c: c["cx"])
+        if len(ordered) < 4:
+            return ordered
 
-        if y_range > img_h * 0.3 and len(chars) >= 4:
-            # 2 dòng
-            y_mid = (min(ys) + max(ys)) / 2
-            line1 = sorted([c for c in chars if c["cy"] < y_mid],
-                           key=lambda c: c["cx"])
-            line2 = sorted([c for c in chars if c["cy"] >= y_mid],
-                           key=lambda c: c["cx"])
-            return line1 + line2
-        else:
-            # 1 dòng
-            return sorted(chars, key=lambda c: c["cx"])
+        xs = np.array([c["cx"] for c in ordered], dtype=np.float32)
+        ys = np.array([c["cy"] for c in ordered], dtype=np.float32)
+
+        x_mean = float(xs.mean())
+        y_mean = float(ys.mean())
+        x_var = float(np.sum((xs - x_mean) ** 2))
+        if x_var <= 1e-6:
+            return ordered
+
+        slope = float(np.sum((xs - x_mean) * (ys - y_mean)) / x_var)
+        residuals = ys - (y_mean + slope * (xs - x_mean))
+        residual_range = float(residuals.max() - residuals.min())
+
+        heights = sorted(c.get("h", 0.0) for c in ordered if c.get("h", 0.0) > 0)
+        median_h = heights[len(heights) // 2] if heights else img_h * 0.2
+        split_threshold = max(img_h * 0.18, median_h * 0.6)
+        if residual_range <= split_threshold:
+            return ordered
+
+        residual_mid = float((residuals.min() + residuals.max()) / 2)
+        upper = [c for c, r in zip(ordered, residuals) if r < residual_mid]
+        lower = [c for c, r in zip(ordered, residuals) if r >= residual_mid]
+        if len(upper) < 2 or len(lower) < 2:
+            return ordered
+
+        upper_x_min = min(c["cx"] for c in upper)
+        upper_x_max = max(c["cx"] for c in upper)
+        lower_x_min = min(c["cx"] for c in lower)
+        lower_x_max = max(c["cx"] for c in lower)
+        if upper_x_max < lower_x_min or lower_x_max < upper_x_min:
+            return ordered
+
+        upper = sorted(upper, key=lambda c: c["cx"])
+        lower = sorted(lower, key=lambda c: c["cx"])
+        upper_y = sum(c["cy"] for c in upper) / len(upper)
+        lower_y = sum(c["cy"] for c in lower) / len(lower)
+        if upper_y > lower_y:
+            upper, lower = lower, upper
+        return upper + lower
 
 
 class PlateOCR:

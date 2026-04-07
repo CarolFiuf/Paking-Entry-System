@@ -448,8 +448,7 @@ class ParkingSystem:
         log.info("Web update thread started (DeepStream mode)")
         while self.running:
             t0 = time.time()
-            fp, _ = ds.get_plate_data()
-            ff = ds.get_face_frame()
+            fp, _, ff = ds.get_all()
             if fp is not None and ff is not None:
                 ff_rot = self._apply_rotation(ff)
                 try:
@@ -488,8 +487,7 @@ class ParkingSystem:
                 if not ds.wait_new_frame(timeout=0.5):
                     continue
                 
-                fp, plate_dets = ds.get_plate_data()
-                ff = ds.get_face_frame()
+                fp, plate_dets, ff = ds.get_all()
 
                 if fp is None or ff is None:
                     time.sleep(0.01)
@@ -532,7 +530,7 @@ class ParkingSystem:
                     n_fps, t_fps = 0, now
 
                 if show:
-                    self._show_dual(fp, ff, result, mode, fps)
+                    self._show_dual(fp, ff, result, mode)
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
                         break
@@ -614,11 +612,11 @@ class ParkingSystem:
                 if elapsed >= 1.0:
                     self.state["fps"] = round(n_fps / elapsed, 1)
                     self.state["stream_fps"] = round(
-                        (cam_plate.steam_fps + cam_face.stream_fps) / 2, 1)
+                        (cam_plate.stream_fps + cam_face.stream_fps) / 2, 1)
                     n_fps, t_fps = 0, now
                     
                 if show:
-                    self._show_dual(fp, ff, result, mode, fps)
+                    self._show_dual(fp, ff, result, mode)
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
                         break
@@ -635,8 +633,9 @@ class ParkingSystem:
             cam_plate.release()
             cam_face.release()
 
-    def _show_dual(self, fp, ff, result, mode, fps):
+    def _show_dual(self, fp, ff, result, mode):
         stats = self.db.stats()
+        fps = self.state.get("fps", 0.0)
         h = 360
         p = cv2.resize(fp, (int(fp.shape[1]*h/fp.shape[0]), h))
         f = cv2.resize(ff, (int(ff.shape[1]*h/ff.shape[0]), h))
