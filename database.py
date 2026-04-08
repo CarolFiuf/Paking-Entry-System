@@ -175,7 +175,23 @@ class ParkingDB:
                  f"total={self._stats_cache['current']})")
         return rid
 
-    # ── EXIT: face search ──
+    # ── EXIT: plate lookup + face verify ──
+    def find_by_plate(self, plate: str) -> Optional[dict]:
+        """Tìm xe trong bảng active theo biển số, trả về id + embedding."""
+        with self._conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, plate, embedding FROM active WHERE plate = %s",
+                (plate,))
+            row = cur.fetchone()
+
+        if not row:
+            return None
+
+        rid, plate, emb_raw = row
+        embedding = np.array(emb_raw, dtype=np.float32)
+        return {"id": rid, "plate": plate, "embedding": embedding}
+
     def match_exit(self, embedding: np.ndarray,
                    threshold: float = 0.45) -> Optional[dict]:
         """
@@ -236,10 +252,11 @@ class ParkingDB:
             cur.execute("DELETE FROM active WHERE id = %s", (record_id,))
 
         # Cập nhật cache
-        self._stats_cache["current"] = max(0,
-                                            self._stats_cache["current"] - 1)
-        self._stats_cache["pct"] = round(
-            100 * self._stats_cache["current"] / max(self.max_cap, 1), 1)
+        with self._stats_lock:
+            self._stats_cache["current"] = max(0,
+                                                self._stats_cache["current"] - 1)
+            self._stats_cache["pct"] = round(
+                100 * self._stats_cache["current"] / max(self.max_cap, 1), 1)
 
         log.info(f"EXIT: {plate} ({dur}min, "
                  f"remain={self._stats_cache['current']})")

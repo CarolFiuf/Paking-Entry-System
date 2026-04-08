@@ -132,14 +132,14 @@ async def api_stats():
 
 
 @app.get("/api/active")
-async def api_active():
+def api_active():
     if not _db:
         return []
     return _db.active_vehicles()
 
 
 @app.get("/api/history")
-async def api_history():
+def api_history():
     if not _db:
         return []
     return _db.recent_events()

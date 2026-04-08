@@ -10,7 +10,7 @@ from collections import Counter
 from threading import Thread
 
 from engine import PlateDetector, PlateOCRYolo, PlateOCR, FaceEngine
-from database import ParkingDB, DIM
+from database import ParkingDB
 from pipeline import HAS_DEEPSTREAM, DeepStreamPipeline, StreamReader
 
 logging.basicConfig(
@@ -251,6 +251,9 @@ class ParkingSystem:
             self._crop_saved = True
             log.info("★ Saved sample crop → /tmp/debug_crop.jpg")
 
+        if crop.size > 0:
+            result["plate_crop"] = crop.copy()
+
         raw_text, ocr_conf = self.plate_ocr(crop)
         plate = self.validator(raw_text)
         log.info(f"ENTRY OCR: raw='{raw_text}' conf={ocr_conf:.2f} "
@@ -273,6 +276,12 @@ class ParkingSystem:
         best_f = max(faces, key=lambda f: f["conf"])
         result["face_bbox"] = best_f["bbox"]
         result["face_conf"] = best_f["conf"]
+        # Crop face
+        fx1, fy1, fx2, fy2 = best_f["bbox"]
+        fh, fw = frame_face.shape[:2]
+        face_crop = frame_face[max(0,fy1):min(fh,fy2), max(0,fx1):min(fw,fx2)]
+        if face_crop.size > 0:
+            result["face_crop"] = face_crop.copy()
         log.info(f"ENTRY FACE: best conf={best_f['conf']:.2f} "
                  f"bbox={best_f['bbox']}")
 
@@ -293,7 +302,7 @@ class ParkingSystem:
             self.plate_voter.clear()
             self.face_avg.clear()
             log.info(f"✅ ENTRY OK: {stable} (id={code})")
-            self._emit("entry", {"plate": stable})
+            self._emit("entry", {"plate": stable}, result)
         elif code == -1:
             log.warning("❌ BÃI ĐẦY")
         elif code == -2:
@@ -301,60 +310,93 @@ class ParkingSystem:
 
         return result
 
-    # ── EXIT ──
-    # ★ KHÔNG ĐỔI
+    # ── EXIT (plate-first → face verify) ──
     def process_exit(self, frame_face, frame_plate,
                      plate_dets=None) -> dict:
         result = {"ok": False, "plate": "", "sim": 0.0,
                   "face_bbox": None, "plate_bbox": None}
 
+        # ── Bước 1: Đọc biển số ──
+        if plate_dets is None and self.plate_det:
+            plate_dets = self.plate_det(frame_plate)
+        if not plate_dets:
+            return result
+
+        best_p = max(plate_dets, key=lambda p: p["conf"])
+        result["plate_bbox"] = best_p["bbox"]
+        x1, y1, x2, y2 = best_p["bbox"]
+        h, w = frame_plate.shape[:2]
+        box_w, box_h = x2 - x1, y2 - y1
+        mx = max(10, int(box_w * 0.08))
+        my = max(8, int(box_h * 0.12))
+        crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
+                           max(0, x1 - mx):min(w, x2 + mx)]
+        if crop.size == 0:
+            return result
+        result["plate_crop"] = crop.copy()
+
+        raw_text, _ = self.plate_ocr(crop)
+        exit_plate = self.plate_voter.vote(self.validator(raw_text))
+        if not exit_plate:
+            return result
+
+        # ── Bước 2: Tìm record theo biển số ──
+        record = self.db.find_by_plate(exit_plate)
+        if not record:
+            log.debug(f"EXIT: biển {exit_plate} không tìm thấy trong DB")
+            return result
+
+        # ── Bước 3: Detect face + verify embedding ──
         faces = self.face_eng(frame_face)
         if not faces:
             return result
         best_f = max(faces, key=lambda f: f["conf"])
         result["face_bbox"] = best_f["bbox"]
 
+        fx1, fy1, fx2, fy2 = best_f["bbox"]
+        fh, fw = frame_face.shape[:2]
+        face_crop = frame_face[max(0,fy1):min(fh,fy2), max(0,fx1):min(fw,fx2)]
+        if face_crop.size > 0:
+            result["face_crop"] = face_crop.copy()
+
         if not FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr):
             return result
 
         quality = FaceEngine.quality_score(frame_face, best_f["bbox"])
         emb = self.face_avg.update(best_f["embedding"], quality)
-        match = self.db.match_exit(emb, self.face_thr)
-        if not match:
+
+        # Cosine similarity giữa face hiện tại và face lúc entry
+        sim = float(np.dot(emb, record["embedding"])
+                    / (np.linalg.norm(emb) * np.linalg.norm(record["embedding"])
+                       + 1e-8))
+        if sim < self.face_thr:
+            log.debug(f"EXIT: face không khớp cho {exit_plate} "
+                      f"(sim={sim:.3f} < thr={self.face_thr})")
             return result
 
-        # Verify plate
-        if plate_dets is None and self.plate_det:
-            plate_dets = self.plate_det(frame_plate)
-        if plate_dets:
-            best_p = max(plate_dets, key=lambda p: p["conf"])
-            result["plate_bbox"] = best_p["bbox"]
-            x1, y1, x2, y2 = best_p["bbox"]
-            h, w = frame_plate.shape[:2]
-            box_w, box_h = x2 - x1, y2 - y1
-            mx = max(10, int(box_w * 0.08))
-            my = max(8, int(box_h * 0.12))
-            crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
-                               max(0, x1 - mx):min(w, x2 + mx)]
-            raw_text, _ = self.plate_ocr(crop)
-            exit_plate = self.validator(raw_text)
-            if exit_plate and exit_plate != match["plate"]:
-                log.warning(
-                    f"Face→{match['plate']} but camera→{exit_plate}")
-
-        self.db.exit(match["id"], match["sim"])
+        # ── Bước 4: Xác nhận xe ra ──
+        self.db.exit(record["id"], sim)
         result["ok"] = True
-        result["plate"] = match["plate"]
-        result["sim"] = match["sim"]
+        result["plate"] = record["plate"]
+        result["sim"] = sim
+        self.plate_voter.clear()
         self.face_avg.clear()
-        log.info(f"✅ EXIT: {match['plate']} (sim={match['sim']:.3f})")
-        self._emit("exit", {"plate": match["plate"],
-                            "sim": match["sim"]})
+        log.info(f"✅ EXIT: {record['plate']} (sim={sim:.3f})")
+        self._emit("exit", {"plate": record["plate"],
+                            "sim": sim}, result)
         return result
 
-    def _emit(self, event_type: str, data: dict):
+    def _emit(self, event_type: str, data: dict, result: dict = None):
         """Push event ra web dashboard."""
+        import base64
         try:
+            if result:
+                for key in ("plate_crop", "face_crop"):
+                    img = result.get(key)
+                    if img is not None:
+                        _, jpg = cv2.imencode(".jpg", img,
+                                              [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        data[key] = base64.b64encode(jpg).decode("ascii")
             from web import notify_sync
             notify_sync({"type": event_type, "data": data})
         except Exception:
@@ -442,7 +484,7 @@ class ParkingSystem:
                     pass
             elapsed = time.time() - t0
             time.sleep(max(0.0, interval - elapsed))
- 
+
     def _web_update_loop_ds(self, ds, interval: float = 0.1):
         from web import update_frame
         log.info("Web update thread started (DeepStream mode)")
@@ -743,8 +785,6 @@ def main():
                               hw_decode=system.cfg["camera"]["hw_decode"])
         times = {"plate_det": [], "ocr": [], "face": [],
                  "db": [], "total": []}
-        dummy_emb = np.random.randn(DIM).astype(np.float32)
-        dummy_emb /= np.linalg.norm(dummy_emb)
         count = 0
 
         while count < args.frames:
@@ -769,7 +809,7 @@ def main():
             times["face"].append(time.time() - t0)
 
             t0 = time.time()
-            system.db.match_exit(dummy_emb, system.face_thr)
+            system.db.find_by_plate("00A00000")
             times["db"].append(time.time() - t0)
 
             times["total"].append(time.time() - tt)

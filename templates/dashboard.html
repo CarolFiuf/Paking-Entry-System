@@ -106,6 +106,33 @@ tr:hover td{background:#15151a}
   </div>
 </div>
 
+<div style="display:flex;gap:10px;margin-bottom:16px">
+  <div style="flex:1;background:var(--card);border:1px solid var(--border);
+    border-radius:8px;overflow:hidden">
+    <div style="padding:8px 14px;font-size:10px;font-weight:700;
+      color:var(--dim);letter-spacing:1.5px;border-bottom:1px solid var(--border)">
+      BIỂN SỐ GẦN NHẤT</div>
+    <div style="display:flex;justify-content:center;align-items:center;
+      min-height:100px;background:#000;padding:8px">
+      <img id="crop-plate" style="max-width:100%;max-height:140px;
+        display:none;image-rendering:pixelated" alt="plate crop">
+      <span id="crop-plate-empty" style="color:var(--dim);font-size:11px">Chưa có</span>
+    </div>
+  </div>
+  <div style="flex:1;background:var(--card);border:1px solid var(--border);
+    border-radius:8px;overflow:hidden">
+    <div style="padding:8px 14px;font-size:10px;font-weight:700;
+      color:var(--dim);letter-spacing:1.5px;border-bottom:1px solid var(--border)">
+      MẶT GẦN NHẤT</div>
+    <div style="display:flex;justify-content:center;align-items:center;
+      min-height:100px;background:#000;padding:8px">
+      <img id="crop-face" style="max-width:100%;max-height:140px;
+        display:none" alt="face crop">
+      <span id="crop-face-empty" style="color:var(--dim);font-size:11px">Chưa có</span>
+    </div>
+  </div>
+</div>
+
 <div class="stats">
   <div class="stat">
     <div class="label">XE TRONG BÃI</div>
@@ -284,6 +311,20 @@ function addEvent(msg) {
 
   eventCount++;
   $('#event-count').textContent = eventCount;
+
+  // Hiển thị ảnh crop khi có
+  if (msg.data?.plate_crop) {
+    const img = $('#crop-plate');
+    img.src = 'data:image/jpeg;base64,' + msg.data.plate_crop;
+    img.style.display = 'block';
+    $('#crop-plate-empty').style.display = 'none';
+  }
+  if (msg.data?.face_crop) {
+    const img = $('#crop-face');
+    img.src = 'data:image/jpeg;base64,' + msg.data.face_crop;
+    img.style.display = 'block';
+    $('#crop-face-empty').style.display = 'none';
+  }
 }
 
 // ── Snapshot polling (FIX: thay MJPEG — không bị treo sau refresh) ──
