@@ -103,8 +103,9 @@ async def broadcast(event: dict):
 
 def notify_sync(event: dict):
     if _loop and _loop.is_running():
-        _loop.call_soon_threadsafe(
-            asyncio.ensure_future, broadcast(event))
+        # _loop.call_soon_threadsafe(
+        #     asyncio.ensure_future, broadcast(event))
+        asyncio.run_coroutine_threadsafe(broadcast(event), _loop)
 
 
 

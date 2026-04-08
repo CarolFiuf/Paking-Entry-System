@@ -7,7 +7,6 @@ import signal
 import logging
 import argparse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 
 from engine import PlateDetector, PlateOCRYolo, PlateOCR, FaceEngine
@@ -204,10 +203,6 @@ class ParkingSystem:
         # Lưu result gần nhất để annotate frame
         self._last_result = {"ok": False}
 
-        # ── Thread pool cho parallel OCR + face inference ──
-        self._executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="infer")
-
         self._face_rotate = self.cfg.get("camera", {}).get("face_rotate", -1)
         self._rot_map = {
             1: cv2.ROTATE_90_CLOCKWISE,
@@ -217,34 +212,8 @@ class ParkingSystem:
 
         self.running = False
 
-    # ── Parallel inference helpers ──
-    def _run_ocr(self, crop):
-        """OCR + validate. Thread-safe (GPU releases GIL)."""
-        t0 = time.time()
-        raw_text, ocr_conf = self.plate_ocr(crop)
-        plate = self.validator(raw_text)
-        dt = (time.time() - t0) * 1000
-        return raw_text, ocr_conf, plate, dt
-
-    def _run_face(self, frame_face):
-        """Face detect + quality. Returns (best_face, quality, face_crop, dt_ms) or None."""
-        t0 = time.time()
-        faces = self.face_eng(frame_face)
-        if not faces:
-            return None
-        best_f = max(faces, key=lambda f: f["conf"])
-        fx1, fy1, fx2, fy2 = best_f["bbox"]
-        fh, fw = frame_face.shape[:2]
-        face_crop = frame_face[max(0, fy1):min(fh, fy2),
-                               max(0, fx1):min(fw, fx2)]
-        fc = face_crop.copy() if face_crop.size > 0 else None
-        qok = FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr)
-        quality = (FaceEngine.quality_score(frame_face, best_f["bbox"])
-                   if qok else None)
-        dt = (time.time() - t0) * 1000
-        return best_f, quality, fc, dt
-
     # ── ENTRY ──
+    # ★ KHÔNG ĐỔI — plate_ocr(crop) → (text, conf) interface giữ nguyên
     def process_entry(self, frame_plate, plate_dets,
                       frame_face) -> dict:
         result = {"ok": False, "plate": "", "face_conf": 0,
@@ -272,7 +241,7 @@ class ParkingSystem:
         log.info(f"ENTRY: plate det bbox=({x1},{y1},{x2},{y2}) "
                  f"conf={best_p['conf']:.2f}")
 
-        # 2) Crop
+        # 2) Crop + OCR
         h, w = frame_plate.shape[:2]
         box_w, box_h = x2 - x1, y2 - y1
         mx = max(10, int(box_w * 0.08))
@@ -280,9 +249,9 @@ class ParkingSystem:
         crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
                            max(0, x1 - mx):min(w, x2 + mx)]
 
-        log.debug(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
-                  f"margin=({mx},{my}) "
-                  f"crop={crop.shape if crop.size > 0 else 'EMPTY'}")
+        log.info(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
+                 f"margin=({mx},{my}) "
+                 f"crop={crop.shape if crop.size > 0 else 'EMPTY'}")
 
         if crop.size > 0 and not hasattr(self, '_crop_saved'):
             cv2.imwrite("/tmp/debug_crop.jpg", crop)
@@ -292,42 +261,38 @@ class ParkingSystem:
         if crop.size > 0:
             result["plate_crop"] = crop.copy()
 
-        # 3) OCR + Face song song (GPU releases GIL → true overlap)
-        t_parallel = time.time()
-        fut_ocr = self._executor.submit(self._run_ocr, crop)
-        fut_face = self._executor.submit(self._run_face, frame_face)
+        t_ocr = time.time()
+        raw_text, ocr_conf = self.plate_ocr(crop)
+        plate = self.validator(raw_text)
+        dt_ocr = (time.time() - t_ocr) * 1000
+        log.info(f"ENTRY OCR: raw='{raw_text}' conf={ocr_conf:.2f} "
+                 f"→ valid='{plate}'")
 
-        raw_text, ocr_conf, plate, dt_ocr = fut_ocr.result()
-        face_data = fut_face.result()
-        dt_parallel = (time.time() - t_parallel) * 1000
-
-        dt_face = 0.0
-        log.debug(f"ENTRY OCR: raw='{raw_text}' conf={ocr_conf:.2f} "
-                  f"→ valid='{plate}'")
-
-        # 4) Process face result — tích lũy embedding sớm
-        if face_data:
-            best_f, quality, face_crop, dt_face = face_data
+        # 3) Face — tích lũy embedding sớm, không chờ vote
+        t_face = time.time()
+        faces = self.face_eng(frame_face)
+        dt_face = (time.time() - t_face) * 1000
+        if faces:
+            best_f = max(faces, key=lambda f: f["conf"])
             result["face_bbox"] = best_f["bbox"]
             result["face_conf"] = best_f["conf"]
-            if face_crop is not None:
-                result["face_crop"] = face_crop
-            if quality is not None:
+            fx1, fy1, fx2, fy2 = best_f["bbox"]
+            fh, fw = frame_face.shape[:2]
+            face_crop = frame_face[max(0,fy1):min(fh,fy2),
+                                   max(0,fx1):min(fw,fx2)]
+            if face_crop.size > 0:
+                result["face_crop"] = face_crop.copy()
+            log.info(f"ENTRY FACE: conf={best_f['conf']:.2f} "
+                     f"bbox={best_f['bbox']}")
+            if FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr):
+                quality = FaceEngine.quality_score(frame_face, best_f["bbox"])
                 self.face_avg.update(best_f["embedding"], quality)
+                log.debug(f"ENTRY FACE: quality={quality:.3f}")
 
-        # Timing: nếu parallel hoạt động → total ≈ max(ocr, face)
-        saved = dt_ocr + dt_face - dt_parallel
         log.info(f"⏱ ENTRY ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
-                 f"parallel={dt_parallel:.0f}ms "
-                 f"(saved {saved:.0f}ms)")
-        self.state["timing"] = {
-            "ocr_ms": round(dt_ocr, 1),
-            "face_ms": round(dt_face, 1),
-            "parallel_ms": round(dt_parallel, 1),
-            "saved_ms": round(saved, 1),
-        }
+                 f"total={dt_ocr+dt_face:.0f}ms")
 
-        # 5) Vote
+        # 4) Vote
         stable = self.plate_voter.vote(plate)
         if not stable:
             result["plate"] = plate
@@ -336,7 +301,7 @@ class ParkingSystem:
         result["plate"] = stable
         log.info(f"ENTRY: plate voted → '{stable}'")
 
-        # 6) Register — dùng embedding đã tích lũy từ các frame trước
+        # 5) Register — dùng embedding đã tích lũy từ các frame trước
         if not self.face_avg.ready:
             log.debug("ENTRY: plate ready nhưng chưa có face embedding")
             return result
@@ -363,7 +328,7 @@ class ParkingSystem:
         result = {"ok": False, "plate": "", "sim": 0.0,
                   "face_bbox": None, "plate_bbox": None}
 
-        # ── Bước 1: Plate detection + crop ──
+        # ── Bước 1: Đọc biển số ──
         if plate_dets is None and self.plate_det:
             plate_dets = self.plate_det(frame_plate)
         if not plate_dets:
@@ -382,35 +347,30 @@ class ParkingSystem:
             return result
         result["plate_crop"] = crop.copy()
 
-        # ── Bước 2: OCR + Face song song ──
-        t_parallel = time.time()
-        fut_ocr = self._executor.submit(self._run_ocr, crop)
-        fut_face = self._executor.submit(self._run_face, frame_face)
+        t_ocr = time.time()
+        raw_text, _ = self.plate_ocr(crop)
+        plate = self.validator(raw_text)
+        dt_ocr = (time.time() - t_ocr) * 1000
 
-        raw_text, _, plate, dt_ocr = fut_ocr.result()
-        face_data = fut_face.result()
-        dt_parallel = (time.time() - t_parallel) * 1000
-
-        dt_face = 0.0
-        # Process face — tích lũy embedding sớm
-        if face_data:
-            best_f, quality, face_crop, dt_face = face_data
+        # ── Bước 2: Face — tích lũy embedding sớm ──
+        t_face = time.time()
+        faces = self.face_eng(frame_face)
+        dt_face = (time.time() - t_face) * 1000
+        if faces:
+            best_f = max(faces, key=lambda f: f["conf"])
             result["face_bbox"] = best_f["bbox"]
-            if face_crop is not None:
-                result["face_crop"] = face_crop
-            if quality is not None:
+            fx1, fy1, fx2, fy2 = best_f["bbox"]
+            fh, fw = frame_face.shape[:2]
+            face_crop = frame_face[max(0,fy1):min(fh,fy2),
+                                   max(0,fx1):min(fw,fx2)]
+            if face_crop.size > 0:
+                result["face_crop"] = face_crop.copy()
+            if FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr):
+                quality = FaceEngine.quality_score(frame_face, best_f["bbox"])
                 self.face_avg.update(best_f["embedding"], quality)
 
-        saved = dt_ocr + dt_face - dt_parallel
         log.info(f"⏱ EXIT ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
-                 f"parallel={dt_parallel:.0f}ms "
-                 f"(saved {saved:.0f}ms)")
-        self.state["timing"] = {
-            "ocr_ms": round(dt_ocr, 1),
-            "face_ms": round(dt_face, 1),
-            "parallel_ms": round(dt_parallel, 1),
-            "saved_ms": round(saved, 1),
-        }
+                 f"total={dt_ocr+dt_face:.0f}ms")
 
         # ── Bước 3: Vote + tìm record ──
         exit_plate = self.plate_voter.vote(plate)
@@ -786,7 +746,6 @@ class ParkingSystem:
                 self._run_fallback(mode, show)
         finally:
             self.running = False
-            self._executor.shutdown(wait=False)
             self.db.close()
             cv2.destroyAllWindows()
             log.info(f"Done. {self.db.stats()}")
