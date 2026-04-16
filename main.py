@@ -33,6 +33,8 @@ class PlateValidator:
       Mới: 99B1-257.39  → {2số}{chữ}{1số}-{3số}.{2số}   (có dot)
       Cũ:  29B-12345    → {2số}{chữ}-{5số}               (không dot, không series)
       Mới: 51G1-23456   → {2số}{chữ}{1số}-{5số}          (không dot, có series)
+      Mới: 30AB-12345   → {2số}{2chữ}-{5số}              (không dot, 2 chữ)
+      NG:  80-123-NG-001 → {2số}-{3số}-{NN|NG}-{3số}     (biển người nước ngoài)
     """
     def __init__(self, regex_str: str = None):
         self._fix = str.maketrans("OI", "01")
@@ -60,6 +62,14 @@ class PlateValidator:
         # ── Không dot → thử nhiều format ──
         nodot = clean
 
+        # Format nước ngoài: XX-NNN-NN/NG-NNN
+        m = re.match(r"^(\d{2})(\d{3})(NN|NG)(\d{3})$", nodot)
+        if m:
+            n4 = int(m.group(4))
+            if 1 <= n4 <= 999:
+                return f"{m.group(1)}-{m.group(2)}-{m.group(3)}-{m.group(4)}"
+            return ""
+
         # Format cũ: XXY-NNNNN (không series, 5 số)
         m = re.match(r"^(\d{2})([A-Z])(\d{5})$", nodot)
         if m:
@@ -70,10 +80,10 @@ class PlateValidator:
         if m:
             return f"{m.group(1)}{m.group(2)}{m.group(3)}-{m.group(4)}"
 
-        # Format mới: XXYNN-NNNN (2 series + 3-4 số, hiếm)
-        m = re.match(r"^(\d{2})([A-Z])(\d{2})(\d{3,4})$", nodot)
+        # Format mới: XXYY-NNNNN (2 chữ cái, 5 số)
+        m = re.match(r"^(\d{2})([A-Z]{2})(\d{5})$", nodot)
         if m:
-            return f"{m.group(1)}{m.group(2)}{m.group(3)}-{m.group(4)}"
+            return f"{m.group(1)}{m.group(2)}-{m.group(3)}"
 
         return ""
 
@@ -208,6 +218,7 @@ class ParkingSystem:
         self._executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="infer")
 
+        self._cached_stats = self.db.stats()
         self._face_rotate = self.cfg.get("camera", {}).get("face_rotate", -1)
         self._rot_map = {
             1: cv2.ROTATE_90_CLOCKWISE,
@@ -261,16 +272,8 @@ class ParkingSystem:
         x1, y1, x2, y2 = best_p["bbox"]
         result["plate_bbox"] = best_p["bbox"]
 
-        # ★ DEBUG: save frame gốc 1 lần
-        if not hasattr(self, '_frame_saved'):
-            cv2.imwrite("/tmp/debug_plate_frame.jpg", frame_plate)
-            cv2.imwrite("/tmp/debug_face_frame.jpg", frame_face)
-            self._frame_saved = True
-            log.info(f"★ Saved debug frames → /tmp/debug_*.jpg "
-                     f"plate={frame_plate.shape} face={frame_face.shape}")
-
-        log.info(f"ENTRY: plate det bbox=({x1},{y1},{x2},{y2}) "
-                 f"conf={best_p['conf']:.2f}")
+        log.debug(f"ENTRY: plate det bbox=({x1},{y1},{x2},{y2}) "
+                  f"conf={best_p['conf']:.2f}")
 
         # 2) Crop
         h, w = frame_plate.shape[:2]
@@ -283,11 +286,6 @@ class ParkingSystem:
         log.debug(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
                   f"margin=({mx},{my}) "
                   f"crop={crop.shape if crop.size > 0 else 'EMPTY'}")
-
-        if crop.size > 0 and not hasattr(self, '_crop_saved'):
-            cv2.imwrite("/tmp/debug_crop.jpg", crop)
-            self._crop_saved = True
-            log.info("★ Saved sample crop → /tmp/debug_crop.jpg")
 
         if crop.size > 0:
             result["plate_crop"] = crop.copy()
@@ -317,9 +315,9 @@ class ParkingSystem:
 
         # Timing: nếu parallel hoạt động → total ≈ max(ocr, face)
         saved = dt_ocr + dt_face - dt_parallel
-        log.info(f"⏱ ENTRY ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
-                 f"parallel={dt_parallel:.0f}ms "
-                 f"(saved {saved:.0f}ms)")
+        log.debug(f"⏱ ENTRY ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
+                  f"parallel={dt_parallel:.0f}ms "
+                  f"(saved {saved:.0f}ms)")
         self.state["timing"] = {
             "ocr_ms": round(dt_ocr, 1),
             "face_ms": round(dt_face, 1),
@@ -402,9 +400,9 @@ class ParkingSystem:
                 self.face_avg.update(best_f["embedding"], quality)
 
         saved = dt_ocr + dt_face - dt_parallel
-        log.info(f"⏱ EXIT ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
-                 f"parallel={dt_parallel:.0f}ms "
-                 f"(saved {saved:.0f}ms)")
+        log.debug(f"⏱ EXIT ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
+                  f"parallel={dt_parallel:.0f}ms "
+                  f"(saved {saved:.0f}ms)")
         self.state["timing"] = {
             "ocr_ms": round(dt_ocr, 1),
             "face_ms": round(dt_face, 1),
@@ -460,37 +458,30 @@ class ParkingSystem:
                         data[key] = base64.b64encode(jpg).decode("ascii")
             from web import notify_sync
             notify_sync({"type": event_type, "data": data})
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"Web notify failed: {e}")
         
     def _apply_rotation(self, frame):
-        if self._face_rotate > 0 and self._face_rotate in self._rot_map:
-            return cv2.rotate(frame, self._rot_map[self._face_rotate])
-        return frame
+        """Apply cached rotation. Dùng cho web thread — không auto-detect."""
+        rot = self._rot_map.get(self._face_rotate)
+        return cv2.rotate(frame, rot) if rot else frame
 
     def _rotate_face(self, frame):
-        if self._face_rotate == 0:
-            return frame
-        if self._face_rotate == 1:
-            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-        if self._face_rotate == 2:
-            return cv2.rotate(frame, cv2.ROTATE_180)
-        if self._face_rotate == 3:
-            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        """Rotate face frame. Auto-detect orientation nếu chưa biết."""
+        if self._face_rotate >= 0:
+            return self._apply_rotation(frame)
 
-        orientations = [
+        # Auto-detect (chạy 1 lần duy nhất khi _face_rotate == -1)
+        for code, rot, name in [
             (0, None, "no rotation"),
             (1, cv2.ROTATE_90_CLOCKWISE, "90° CW"),
             (3, cv2.ROTATE_90_COUNTERCLOCKWISE, "90° CCW"),
             (2, cv2.ROTATE_180, "180°"),
-        ]
-        for code, rot, name in orientations:
+        ]:
             test = frame if rot is None else cv2.rotate(frame, rot)
-            faces = self.face_eng(test)
-            if faces:
+            if self.face_eng(test):
                 self._face_rotate = code
-                log.info(f"★ Face rotation auto-detected: {name} "
-                         f"(code={code}, {len(faces)} faces found)")
+                log.info(f"Face rotation auto-detected: {name} (code={code})")
                 return test
         return frame
 
@@ -630,6 +621,7 @@ class ParkingSystem:
                 if elapsed >= 1.0:
                     self.state["fps"] = round(n_fps / elapsed, 1)
                     self.state["stream_fps"] = ds.stream_fps
+                    self._cached_stats = self.db.stats()
                     n_fps, t_fps = 0, now
 
                 if show:
@@ -716,6 +708,7 @@ class ParkingSystem:
                     self.state["fps"] = round(n_fps / elapsed, 1)
                     self.state["stream_fps"] = round(
                         (cam_plate.stream_fps + cam_face.stream_fps) / 2, 1)
+                    self._cached_stats = self.db.stats()
                     n_fps, t_fps = 0, now
                     
                 if show:
@@ -737,7 +730,7 @@ class ParkingSystem:
             cam_face.release()
 
     def _show_dual(self, fp, ff, result, mode):
-        stats = self.db.stats()
+        stats = self._cached_stats
         fps = self.state.get("fps", 0.0)
         h = 360
         p = cv2.resize(fp, (int(fp.shape[1]*h/fp.shape[0]), h))
