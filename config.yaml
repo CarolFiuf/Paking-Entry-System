@@ -26,7 +26,7 @@ plate_detector:
   model: "./models/plate_yolov8n.pt"
   engine: "./models/plate_yolov8n.engine"
   imgsz: 640
-  conf: 0.6
+  conf: 0.5
   device: 0
 
 # ★ v5: YOLO char detection thay PaddleOCR
@@ -35,7 +35,7 @@ plate_ocr:
   backend: "yolo"                           # "yolo" hoặc "paddle" (fallback)
   model: "./models/plate_ocr_yolov8n.pt"
   imgsz: 320
-  conf: 0.6
+  conf: 0.4
   device: 0
   # PaddleOCR fallback (dùng khi backend: "paddle")
   lang: "en"
@@ -47,7 +47,7 @@ face:
   blur_threshold: 10.0   
 
 recognition:
-  face_threshold: 0.6
+  face_threshold: 0.3
   plate_vote_frames: 5
   face_avg_frames: 3
   plate_regex: "^\\d{2}[A-Z]\\d?-?\\d{3,5}\\.?\\d{0,2}$"

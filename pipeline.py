@@ -250,11 +250,10 @@ class DeepStreamPipeline:
 
             source_id = frame_meta.source_id
 
-            # Extract frame as numpy (RGBA → BGR)
+            # Extract frame as numpy (RGBA). cvtColor làm sau, ngoài lock.
             surface = pyds.get_nvds_buf_surface(hash(buf),
                                                 frame_meta.batch_id)
-            frame = np.array(surface, copy=True, order='C')
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+            frame_rgba = np.array(surface, copy=True, order='C')
 
             # Extract detections (source 0 = plate cam có nvinfer)
             detections = []
@@ -273,20 +272,15 @@ class DeepStreamPipeline:
                 except StopIteration:
                     break
 
+            # cvtColor ngoài lock — giảm thời gian block GStreamer thread
+            frame = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
+
             with self._lock:
                 if source_id == 0:
                     self._plate_frame = frame
                     self._plate_detections = detections
-                    self._frame_seq += 1        # ← tăng counter
-                    self._frame_event.set()     # ← signal frame mới
-                    # ★ DEBUG: save 1 frame từ probe để verify
-                    if not hasattr(self, '_probe_saved'):
-                        cv2.imwrite("/tmp/debug_probe_plate.jpg", frame)
-                        self._probe_saved = True
-                        log.info(f"★ Probe plate: shape={frame.shape} "
-                                 f"mean={frame.mean():.0f} "
-                                 f"dets={len(detections)} "
-                                 f"det_details={detections[:3]}")
+                    self._frame_seq += 1
+                    self._frame_event.set()
                 elif source_id == 1:
                     self._face_frame = frame
 

@@ -10,6 +10,38 @@ log = logging.getLogger("engine")
 CHAR_CLASSES = [str(i) for i in range(10)] + \
                [chr(c) for c in range(ord('A'), ord('Z') + 1)]
 
+MAX_PLATE_CHARS = 9  # 2 số + 2 chữ + 5 số = 9 (format dài nhất: 30AB-12345)
+
+# Confusion map cho OCR: digit ↔ letter visually similar.
+# Dùng để fix vị trí kỳ vọng (pos 0,1 = digit; pos 2 = letter).
+_LETTER_TO_DIGIT = {
+    'D': '0', 'O': '0', 'Q': '0',
+    'I': '1', 'L': '1', 'T': '1',
+    'Z': '2', 'A': '4', 'S': '5',
+    'G': '6', 'B': '8',
+}
+_DIGIT_TO_LETTER = {
+    '0': 'D', '1': 'I', '2': 'Z', '4': 'A',
+    '5': 'S', '6': 'G', '7': 'T', '8': 'B', '9': 'G',
+}
+
+
+def enforce_plate_format(text: str) -> str:
+    """
+    Ép format VN: pos 0,1 phải là số; pos 2 phải là chữ.
+    Nếu sai → map qua confusion table (8↔B, 0↔D, …).
+    Char không có trong map → giữ nguyên (validator sẽ reject sau).
+    """
+    if len(text) < 3:
+        return text
+    chars = list(text)
+    for i in (0, 1):
+        if not chars[i].isdigit():
+            chars[i] = _LETTER_TO_DIGIT.get(chars[i], chars[i])
+    if not chars[2].isalpha():
+        chars[2] = _DIGIT_TO_LETTER.get(chars[2], chars[2])
+    return ''.join(chars)
+
 
 class PlateDetector:
     """YOLOv8n — chỉ dùng trong fallback mode (không có DeepStream)."""
@@ -122,10 +154,17 @@ class PlateOCRYolo:
         if not chars:
             return ("", 0.0)
 
+        # Biển số VN tối đa 9 ký tự (vd: 99B1-25739 / 30AB-12345).
+        # Nếu YOLO detect dư → drop các char conf thấp nhất cho đủ 9.
+        if len(chars) > MAX_PLATE_CHARS:
+            chars.sort(key=lambda c: c["conf"], reverse=True)
+            chars = chars[:MAX_PLATE_CHARS]
+
         # ── Sort: handle biển 2 dòng ──
         sorted_chars = self._sort_chars(chars, plate_crop.shape[0])
 
         text = "".join(c["char"] for c in sorted_chars)
+        text = enforce_plate_format(text)
         avg_conf = sum(c["conf"] for c in sorted_chars) / len(sorted_chars)
 
         log.debug(f"OCR YOLO: {len(sorted_chars)} chars → '{text}' "
@@ -135,14 +174,14 @@ class PlateOCRYolo:
     @staticmethod
     def _sort_chars(chars: list, img_h: int) -> list:
         """
-        Sort ký tự theo vị trí, bền hơn với biển 1 dòng bị nghiêng.
+        Sort ký tự theo vị trí, xử lý biển 1 dòng (kể cả nghiêng) và 2 dòng.
 
-        Logic cũ chỉ nhìn y_range, nên biển 1 dòng bị tilt/perspective có thể
-        bị hiểu nhầm thành 2 dòng. Ở đây:
-          1. sort trái → phải
-          2. fit một đường xu hướng y(x) để loại bỏ độ nghiêng toàn cục
-          3. chỉ tách 2 dòng nếu residual theo trục y đủ lớn và hai cụm còn
-             chồng nhau theo trục x
+        Pipeline:
+          1. fit trendline y(x) bằng least-squares để khử tilt toàn cục
+          2. tính residuals, sort, tìm gap lớn nhất giữa các giá trị liền kề
+          3. bimodality gate: chỉ chia 2 dòng nếu max_gap >= 0.6 * median_h
+             (ngưỡng chuẩn hoá theo chiều cao ký tự, không phụ thuộc crop size)
+          4. split tại max gap; sanity: mỗi cụm >= 2 char và overlap theo x
         """
         ordered = sorted(chars, key=lambda c: c["cx"])
         if len(ordered) < 4:
@@ -151,25 +190,29 @@ class PlateOCRYolo:
         xs = np.array([c["cx"] for c in ordered], dtype=np.float32)
         ys = np.array([c["cy"] for c in ordered], dtype=np.float32)
 
-        x_mean = float(xs.mean())
-        y_mean = float(ys.mean())
-        x_var = float(np.sum((xs - x_mean) ** 2))
-        if x_var <= 1e-6:
+        x_var = float(((xs - xs.mean()) ** 2).sum())
+        if x_var > 1e-6:
+            slope, intercept = np.polyfit(xs, ys, 1)
+            residuals = ys - (slope * xs + intercept)
+        else:
+            residuals = ys - ys.mean()
+
+        heights = [c.get("h", 0.0) for c in ordered if c.get("h", 0.0) > 0]
+        median_h = float(np.median(heights)) if heights else img_h * 0.2
+
+        # Max-gap split: tìm gap lớn nhất trong residuals đã sort
+        order = np.argsort(residuals)
+        sorted_r = residuals[order]
+        gaps = np.diff(sorted_r)
+        k = int(np.argmax(gaps))
+        max_gap = float(gaps[k])
+
+        # Bimodality gate — 1 dòng (kể cả nghiêng) nếu gap quá nhỏ
+        if max_gap < 0.6 * median_h:
             return ordered
 
-        slope = float(np.sum((xs - x_mean) * (ys - y_mean)) / x_var)
-        residuals = ys - (y_mean + slope * (xs - x_mean))
-        residual_range = float(residuals.max() - residuals.min())
-
-        heights = sorted(c.get("h", 0.0) for c in ordered if c.get("h", 0.0) > 0)
-        median_h = heights[len(heights) // 2] if heights else img_h * 0.2
-        split_threshold = max(img_h * 0.18, median_h * 0.6)
-        if residual_range <= split_threshold:
-            return ordered
-
-        residual_mid = float((residuals.min() + residuals.max()) / 2)
-        upper = [c for c, r in zip(ordered, residuals) if r < residual_mid]
-        lower = [c for c, r in zip(ordered, residuals) if r >= residual_mid]
+        upper = [ordered[i] for i in order[:k + 1]]
+        lower = [ordered[i] for i in order[k + 1:]]
         if len(upper) < 2 or len(lower) < 2:
             return ordered
 
@@ -180,8 +223,8 @@ class PlateOCRYolo:
         if upper_x_max < lower_x_min or lower_x_max < upper_x_min:
             return ordered
 
-        upper = sorted(upper, key=lambda c: c["cx"])
-        lower = sorted(lower, key=lambda c: c["cx"])
+        upper.sort(key=lambda c: c["cx"])
+        lower.sort(key=lambda c: c["cx"])
         upper_y = sum(c["cy"] for c in upper) / len(upper)
         lower_y = sum(c["cy"] for c in lower) / len(lower)
         if upper_y > lower_y:

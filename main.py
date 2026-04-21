@@ -34,7 +34,7 @@ class PlateValidator:
       Cũ:  29B-12345    → {2số}{chữ}-{5số}               (không dot, không series)
       Mới: 51G1-23456   → {2số}{chữ}{1số}-{5số}          (không dot, có series)
       Mới: 30AB-12345   → {2số}{2chữ}-{5số}              (không dot, 2 chữ)
-      NG:  80-123-NG-001 → {2số}-{3số}-{NN|NG}-{3số}     (biển người nước ngoài)
+      NG:  80-123-NG-001 → {2số}-{3số}-{NN|NG|QT|CV}-{3số}     (biển người nước ngoài)
     """
     def __init__(self, regex_str: str = None):
         self._fix = str.maketrans("OI", "01")
@@ -49,21 +49,39 @@ class PlateValidator:
         if len(clean) < 7 or len(clean) > 13:
             return ""
 
-        # ── Có dot → format mới, parse chính xác ──
+        # ── Có dot → thử nhiều format (biển nước ngoài luôn không dot → skip) ──
         if "." in clean:
+            # Format mới có series: XXYN-NNN.NN  (vd: 99B1-257.39)
             m = re.match(
-                r"^(\d{2})([A-Z])(\d{1,2})(\d{3,5})\.(\d{1,2})$",
+                r"^(\d{2})([A-Z])(\d{1})(\d{3})\.(\d{2})$",
                 clean)
             if m:
                 return (f"{m.group(1)}{m.group(2)}{m.group(3)}"
                         f"-{m.group(4)}.{m.group(5)}")
+
+            # Format cũ: XXY-NNN.NN  (1 chữ, không series)
+            m = re.match(
+                r"^(\d{2})([A-Z])(\d{3})\.(\d{2})$",
+                clean)
+            if m:
+                return (f"{m.group(1)}{m.group(2)}"
+                        f"-{m.group(3)}.{m.group(4)}")
+
+            # Format 2 chữ: XXYY-NNN.NN
+            m = re.match(
+                r"^(\d{2})([A-Z]{2})(\d{3})\.(\d{2})$",
+                clean)
+            if m:
+                return (f"{m.group(1)}{m.group(2)}"
+                        f"-{m.group(3)}.{m.group(4)}")
+
             return ""
 
         # ── Không dot → thử nhiều format ──
         nodot = clean
 
         # Format nước ngoài: XX-NNN-NN/NG-NNN
-        m = re.match(r"^(\d{2})(\d{3})(NN|NG)(\d{3})$", nodot)
+        m = re.match(r"^(\d{2})(\d{3})(NN|NG|QT|CV)(\d{3})$", nodot)
         if m:
             n4 = int(m.group(4))
             if 1 <= n4 <= 999:
@@ -71,7 +89,7 @@ class PlateValidator:
             return ""
 
         # Format cũ: XXY-NNNNN (không series, 5 số)
-        m = re.match(r"^(\d{2})([A-Z])(\d{5})$", nodot)
+        m = re.match(r"^(\d{2})([A-Z])(\d{4,5})$", nodot)
         if m:
             return f"{m.group(1)}{m.group(2)}-{m.group(3)}"
 
@@ -81,7 +99,7 @@ class PlateValidator:
             return f"{m.group(1)}{m.group(2)}{m.group(3)}-{m.group(4)}"
 
         # Format mới: XXYY-NNNNN (2 chữ cái, 5 số)
-        m = re.match(r"^(\d{2})([A-Z]{2})(\d{5})$", nodot)
+        m = re.match(r"^(\d{2})([A-Z]{2})(\d{4,5})$", nodot)
         if m:
             return f"{m.group(1)}{m.group(2)}-{m.group(3)}"
 
@@ -593,13 +611,14 @@ class ParkingSystem:
                     continue
 
                 frame_idx += 1
-                ff = self._rotate_face(ff)
 
                 self.state["plate_cam_ok"] = True
                 self.state["face_cam_ok"] = True
 
                 if skip_n > 1 and frame_idx % skip_n != 0:
                     continue
+
+                ff = self._rotate_face(ff)
 
                 t0 = time.time()
 
@@ -613,7 +632,7 @@ class ParkingSystem:
                 self._last_result = result
 
                 if result.get("ok"):
-                    cooldown_until = t0 + 2.0
+                    cooldown_until = t0 + 0.5
 
                 n_fps += 1
                 now = time.time()
@@ -682,10 +701,11 @@ class ParkingSystem:
                     break
 
                 frame_idx += 1
-                ff = self._rotate_face(ff)
 
                 if skip_n > 1 and frame_idx % skip_n != 0:
                     continue
+
+                ff = self._rotate_face(ff)
 
                 t0 = time.time()
 
@@ -699,7 +719,7 @@ class ParkingSystem:
                 self._last_result = result
 
                 if result.get("ok"):
-                    cooldown_until = t0 + 2.0
+                    cooldown_until = t0 + 0.5
 
                 n_fps += 1
                 now = time.time()
