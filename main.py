@@ -505,35 +505,37 @@ class ParkingSystem:
 
     # ── ANNOTATE FRAMES CHO WEB ──
     def _annotate_plate(self, frame, result):
+        if not result.get("plate_bbox"):
+            return frame
         vis = frame.copy()
-        if result.get("plate_bbox"):
-            x1, y1, x2, y2 = result["plate_bbox"]
-            color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            plate = result.get("plate", "")
-            if plate:
-                cv2.rectangle(vis, (x1, y1-28), (x1+len(plate)*16, y1),
-                              (0, 0, 0), -1)
-                cv2.putText(vis, plate, (x1+4, y1-8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        x1, y1, x2, y2 = result["plate_bbox"]
+        color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        plate = result.get("plate", "")
+        if plate:
+            cv2.rectangle(vis, (x1, y1-28), (x1+len(plate)*16, y1),
+                          (0, 0, 0), -1)
+            cv2.putText(vis, plate, (x1+4, y1-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         return vis
 
     def _annotate_face(self, frame, result):
+        if not result.get("face_bbox"):
+            return frame
         vis = frame.copy()
-        if result.get("face_bbox"):
-            x1, y1, x2, y2 = result["face_bbox"]
-            color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            label = ""
-            if result.get("ok") and result.get("sim"):
-                label = f"MATCH {result['sim']:.2f}"
-            elif result.get("face_conf"):
-                label = f"face {result['face_conf']:.2f}"
-            if label:
-                cv2.rectangle(vis, (x1, y1-28), (x1+len(label)*12, y1),
-                              (0, 0, 0), -1)
-                cv2.putText(vis, label, (x1+4, y1-8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        x1, y1, x2, y2 = result["face_bbox"]
+        color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        label = ""
+        if result.get("ok") and result.get("sim"):
+            label = f"MATCH {result['sim']:.2f}"
+        elif result.get("face_conf"):
+            label = f"face {result['face_conf']:.2f}"
+        if label:
+            cv2.rectangle(vis, (x1, y1-28), (x1+len(label)*12, y1),
+                          (0, 0, 0), -1)
+            cv2.putText(vis, label, (x1+4, y1-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         return vis
     
     def _web_update_loop(self, cam_plate, cam_face, interval: float = 0.1):

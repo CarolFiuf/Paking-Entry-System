@@ -44,24 +44,22 @@ _state = {}
 _clients: list[WebSocket] = []
 
 
-# Frame buffers cho MJPEG stream (latest frame only)
-_frames: dict[str, bytes] = {}  # {"plate": jpeg_bytes, "face": jpeg_bytes}
-# _frame_lock = __import__("threading").Lock()
-_loop = None # lưu reference tới uvicorn event loop
-# _encode_executor = ThreadPoolExecutor(max_workers=1)
+# Frame buffers — lưu numpy array thô, encode JPEG khi /stream request (lazy)
+_frames: dict = {}  # {"plate": np.ndarray, "face": np.ndarray}
+_encode_cache: dict = {}  # {name: (frame_ref, jpeg_bytes)} — skip re-encode cùng frame
+_loop = None  # lưu reference tới uvicorn event loop
+
+# Max width khi encode JPEG cho dashboard. Downscale giảm ~50% encode time
+# so với full 1080p mà vẫn đủ sắc trên màn hình desktop thường.
+_STREAM_MAX_W = 1280
+_STREAM_JPEG_QUALITY = 70
+
 
 def update_frame(name: str, frame):
-    """Gọi từ pipeline thread — encode + lưu JPEG."""
+    """Gọi từ pipeline thread — lưu reference. Encode xảy ra on-demand."""
     if frame is None:
         return
-    _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-    _frames[name] = jpg.tobytes()  # atomic reference assignment in CPython
-# def update_frame(name: str, frame):
-#     if frame is None: return
-#     def _encode():
-#         _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
-#         _frames[name] = jpg.tobytes()
-#     _encode_executor.submit(_encode)
+    _frames[name] = frame  # atomic reference assignment in CPython
 
 
 def init(db, state: dict = None):
@@ -147,19 +145,34 @@ def api_history():
 
 
 @app.get("/stream/{name}")
-async def snapshot(name: str):
+def snapshot(name: str):
+    """Sync def → Starlette chạy trong threadpool, không block event loop."""
     if name not in ("plate", "face"):
         return Response(status_code=404)
 
-    jpg = _frames.get(name)
-    if not jpg:
-        # 1x1 transparent pixel để tránh broken image
+    frame = _frames.get(name)
+    if frame is None:
         return Response(
             content=b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01'
                     b'\x00\x00\x01\x00\x01\x00\x00\xff\xd9',
             media_type="image/jpeg",
             headers={"Cache-Control": "no-cache"}
         )
+
+    cached = _encode_cache.get(name)
+    if cached is not None and cached[0] is frame:
+        jpg = cached[1]
+    else:
+        h, w = frame.shape[:2]
+        if w > _STREAM_MAX_W:
+            scale = _STREAM_MAX_W / w
+            frame_small = cv2.resize(frame, (_STREAM_MAX_W, int(h * scale)))
+        else:
+            frame_small = frame
+        _, buf = cv2.imencode(
+            ".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, _STREAM_JPEG_QUALITY])
+        jpg = buf.tobytes()
+        _encode_cache[name] = (frame, jpg)
 
     return Response(
         content=jpg,
