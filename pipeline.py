@@ -74,6 +74,11 @@ class DeepStreamPipeline:
         self._frame_seq = 0          # ← thêm counter
         self._frame_event = Event()  # ← thêm event
 
+        # Early-skip batch ngay trong probe, trước get_nvds_buf_surface
+        self._skip_n = max(
+            1, int(cfg.get("camera", {}).get("process_every_n", 1)))
+        self._probe_counter = 0
+
         self._probe_count = 0
         self._probe_fps = 0.0
         self._probe_t0 = time.time()
@@ -239,6 +244,19 @@ class DeepStreamPipeline:
         if not buf:
             return Gst.PadProbeReturn.OK
 
+        # FPS đo stream thật (mọi batch, kể cả batch sẽ bị skip)
+        self._probe_count += 1
+        now = time.time()
+        if now - self._probe_t0 >= 1.0:
+            self._probe_fps = self._probe_count / (now - self._probe_t0)
+            self._probe_count = 0
+            self._probe_t0 = now
+
+        # Early-skip: bỏ batch trước khi copy + cvtColor (Lỗi #1)
+        self._probe_counter += 1
+        if self._skip_n > 1 and self._probe_counter % self._skip_n != 0:
+            return Gst.PadProbeReturn.OK
+
         batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
         l_frame = batch_meta.frame_meta_list
 
@@ -288,13 +306,6 @@ class DeepStreamPipeline:
                 l_frame = l_frame.next
             except StopIteration:
                 break
-            
-        self._probe_count += 1
-        now = time.time()
-        if now - self._probe_t0 >= 1.0:
-            self._probe_fps = self._probe_count / (now - self._probe_t0)
-            self._probe_count = 0
-            self._probe_t0 = now
 
         return Gst.PadProbeReturn.OK
     

@@ -587,7 +587,6 @@ class ParkingSystem:
         )
         web_thread.start()
 
-        skip_n = ccfg["process_every_n"]
         frame_idx = 0
         fps, t_fps, n_fps = 0.0, time.time(), 0
         cooldown_until = 0.0
@@ -598,7 +597,7 @@ class ParkingSystem:
             while self.running:
                 if not ds.wait_new_frame(timeout=0.5):
                     continue
-                
+
                 fp, plate_dets, ff = ds.get_all()
 
                 if fp is None or ff is None:
@@ -615,9 +614,7 @@ class ParkingSystem:
                 self.state["plate_cam_ok"] = True
                 self.state["face_cam_ok"] = True
 
-                if skip_n > 1 and frame_idx % skip_n != 0:
-                    continue
-
+                # Skip đã được xử lý trong DeepStream probe (Lỗi #1)
                 ff = self._rotate_face(ff)
 
                 t0 = time.time()
