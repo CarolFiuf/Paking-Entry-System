@@ -95,7 +95,7 @@ Pipeline tối ưu GPU bằng **DeepStream** (zero-copy decode → nvinfer YOLO 
 
 ---
 
-## Các tối ưu đã áp dụng
+<!-- ## Các tối ưu đã áp dụng
 
 - **DeepStream zero-copy**: plate detection chạy trên GPU qua `nvinfer`, không copy frame ra CPU cho đến probe.
 - **Early-skip trong probe** (`process_every_n`): bỏ batch trước `get_nvds_buf_surface` để tránh tốn cvtColor.
@@ -105,7 +105,7 @@ Pipeline tối ưu GPU bằng **DeepStream** (zero-copy decode → nvinfer YOLO 
 - **PostgreSQL connection pool** + **cached stats** — không query count mỗi frame.
 - **pgvector IVFFlat** (`lists=22`) cho cosine search — tự fallback sequential khi < 100 records.
 - **Streaming JPEG**: downscale 1280px + quality 70, cache theo frame reference để không re-encode cùng frame.
-- **Frame copy chỉ trong bbox** + JPEG encode quality giảm để đẩy web thread nhẹ hơn.
+- **Frame copy chỉ trong bbox** + JPEG encode quality giảm để đẩy web thread nhẹ hơn. -->
 
 ---
 
@@ -153,7 +153,7 @@ Dashboard: **http://jetson-ip:8080**
 - `M` — chuyển Entry ↔ Exit
 - `S` — in stats
 
----
+<!-- ---
 
 ## Config chính ([config.yaml](config.yaml))
 
@@ -190,7 +190,7 @@ database:
   max_capacity: 500
 ```
 
----
+--- -->
 
 ## Schema DB
 
@@ -201,7 +201,7 @@ parking_log(id, plate, entry_time, exit_time, duration_min, match_conf)
 
 Indexes: `idx_active_plate` (btree), `idx_active_embedding` (ivfflat, cosine).
 
----
+<!-- ---
 
 ## Format biển số VN hỗ trợ
 
@@ -217,7 +217,7 @@ Indexes: `idx_active_plate` (btree), `idx_active_embedding` (ivfflat, cosine).
 
 Logic trong [main.py](main.py#L28) (`PlateValidator`) + [engine.py](engine.py#L29) (`enforce_plate_format`).
 
----
+--- -->
 
 ## Endpoints web
 
