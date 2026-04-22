@@ -284,8 +284,8 @@ class ParkingSystem:
                 result["face_crop"] = face_crop.copy()
             log.info(f"ENTRY FACE: conf={best_f['conf']:.2f} "
                      f"bbox={best_f['bbox']}")
-            if FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr):
-                quality = FaceEngine.quality_score(frame_face, best_f["bbox"])
+            ok, quality = FaceEngine.quality(frame_face, best_f["bbox"], self.blur_thr)
+            if ok:
                 self.face_avg.update(best_f["embedding"], quality)
                 log.debug(f"ENTRY FACE: quality={quality:.3f}")
 
@@ -365,8 +365,8 @@ class ParkingSystem:
                                    max(0,fx1):min(fw,fx2)]
             if face_crop.size > 0:
                 result["face_crop"] = face_crop.copy()
-            if FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr):
-                quality = FaceEngine.quality_score(frame_face, best_f["bbox"])
+            ok, quality = FaceEngine.quality(frame_face, best_f["bbox"], self.blur_thr)
+            if ok:
                 self.face_avg.update(best_f["embedding"], quality)
 
         log.info(f"⏱ EXIT ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "

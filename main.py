@@ -267,9 +267,7 @@ class ParkingSystem:
         face_crop = frame_face[max(0, fy1):min(fh, fy2),
                                max(0, fx1):min(fw, fx2)]
         fc = face_crop.copy() if face_crop.size > 0 else None
-        qok = FaceEngine.quality_ok(frame_face, best_f["bbox"], self.blur_thr)
-        quality = (FaceEngine.quality_score(frame_face, best_f["bbox"])
-                   if qok else None)
+        _, quality = FaceEngine.quality(frame_face, best_f["bbox"], self.blur_thr)
         dt = (time.time() - t0) * 1000
         return best_f, quality, fc, dt
 

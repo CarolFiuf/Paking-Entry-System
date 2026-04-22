@@ -367,37 +367,36 @@ class FaceEngine:
         } for f in faces]
 
     @staticmethod
-    def quality_ok(frame, bbox, blur_thr=35.0):
+    def quality(frame, bbox, blur_thr=35.0):
+        """
+        Gộp gate + score: 1 crop, 1 cvtColor, 1 Laplacian, 1 mean.
+        Returns: (ok, score)
+          - ok=False → score=None (không dùng để weight embedding)
+          - ok=True  → score ∈ [0, 1]
+        """
         x1, y1, x2, y2 = bbox
         crop = frame[max(0, y1):y2, max(0, x1):x2]
         if crop.size == 0:
             log.debug("FACE QUALITY: crop empty")
-            return False
+            return False, None
+
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        blur_val = cv2.Laplacian(gray, cv2.CV_64F).var()
-        mean_val = gray.mean()
-        ok = blur_val >= blur_thr and 30 < mean_val < 230
-        log.info(f"FACE QUALITY: blur={blur_val:.1f} (thr={blur_thr}) "
-                 f"brightness={mean_val:.1f} size={crop.shape[1]}x{crop.shape[0]} "
+        blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        brightness = float(gray.mean())
+        ok = blur >= blur_thr and 30 < brightness < 230
+
+        log.info(f"FACE QUALITY: blur={blur:.1f} (thr={blur_thr}) "
+                 f"brightness={brightness:.1f} size={crop.shape[1]}x{crop.shape[0]} "
                  f"→ {'OK' if ok else 'FAIL'}"
-                 f"{' [TOO_BLURRY]' if blur_val < blur_thr else ''}"
-                 f"{' [TOO_DARK]' if mean_val <= 30 else ''}"
-                 f"{' [TOO_BRIGHT]' if mean_val >= 230 else ''}")
-        return ok
- 
-    @staticmethod
-    def quality_score(frame, bbox, blur_thr=80.0):
-        x1, y1, x2, y2 = bbox
-        crop = frame[max(0, y1):y2, max(0, x1):x2]
-        if crop.size == 0:
-            return 0.0
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        blur = cv2.Laplacian(gray, cv2.CV_64F).var()
+                 f"{' [TOO_BLURRY]' if blur < blur_thr else ''}"
+                 f"{' [TOO_DARK]' if brightness <= 30 else ''}"
+                 f"{' [TOO_BRIGHT]' if brightness >= 230 else ''}")
+
+        if not ok:
+            return False, None
+
         blur_score = min(blur / 500.0, 1.0)
-        brightness = gray.mean()
-        if brightness < 30 or brightness > 230:
-            return 0.0
         bright_score = 1.0 - abs(brightness - 128) / 128.0
-        face_area = (x2 - x1) * (y2 - y1)
-        size_score = min(face_area / 20000.0, 1.0)
-        return blur_score * 0.5 + bright_score * 0.2 + size_score * 0.3
+        size_score = min((x2 - x1) * (y2 - y1) / 20000.0, 1.0)
+        score = blur_score * 0.5 + bright_score * 0.2 + size_score * 0.3
+        return True, score
