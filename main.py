@@ -6,9 +6,12 @@ import re
 import signal
 import logging
 import argparse
+import csv
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
+from datetime import datetime
+from pathlib import Path
 
 from engine import PlateDetector, PlateOCRYolo, PlateOCR, FaceEngine
 from database import ParkingDB
@@ -159,6 +162,175 @@ class EmbeddingAvg:
         self._latest = None
 
 
+class RuntimeProfiler:
+    """Collect latency samples từ luồng chạy thật của hệ thống."""
+
+    def __init__(self):
+        self._buckets = {}
+        self._rows = []
+
+    def add(self, mode: str, ok: bool, timings: dict):
+        bucket = self._buckets.setdefault(mode, {
+            "frames": 0,
+            "ok": 0,
+            "metrics": {},
+        })
+        bucket["frames"] += 1
+        if ok:
+            bucket["ok"] += 1
+
+        row = {
+            "ts_unix": round(time.time(), 3),
+            "mode": mode,
+            "sample_idx": bucket["frames"],
+            "ok": int(bool(ok)),
+        }
+
+        for key, value in timings.items():
+            if isinstance(value, (int, float)):
+                bucket["metrics"].setdefault(key, []).append(float(value))
+                row[key] = round(float(value), 3)
+            elif isinstance(value, (str, bool)):
+                row[key] = value
+
+        self._rows.append(row)
+
+    def snapshot(self, mode: str = None):
+        if mode is not None:
+            bucket = self._buckets.get(mode)
+            return self._snapshot_one(bucket) if bucket else None
+        return {
+            name: self._snapshot_one(bucket)
+            for name, bucket in self._buckets.items()
+            if bucket["frames"] > 0
+        }
+
+    def _snapshot_one(self, bucket: dict):
+        out = {
+            "frames": bucket["frames"],
+            "ok": bucket["ok"],
+            "ok_rate": round(100.0 * bucket["ok"] / max(bucket["frames"], 1), 1),
+            "metrics": {},
+        }
+        for key, values in bucket["metrics"].items():
+            arr = np.array(values, dtype=float)
+            out["metrics"][key] = {
+                "avg": round(float(arr.mean()), 1),
+                "p95": round(float(np.percentile(arr, 95)), 1),
+            }
+        return out
+
+    def format_lines(self, mode: str = None):
+        snapshots = self.snapshot(mode)
+        if snapshots is None:
+            return []
+        if mode is not None:
+            snapshots = {mode: snapshots}
+
+        metric_order = [
+            "loop_ms",
+            "plate_det_ms",
+            "ocr_ms",
+            "face_ms",
+            "parallel_ms",
+            "saved_ms",
+            "probe_to_app_ms",
+        ]
+
+        lines = []
+        for name, snap in snapshots.items():
+            lines.append(
+                f"PIPELINE PROFILE [{name.upper()}] "
+                f"frames={snap['frames']} ok={snap['ok']}/{snap['frames']} "
+                f"({snap['ok_rate']:.1f}%)"
+            )
+            metrics = snap["metrics"]
+            for key in metric_order:
+                if key in metrics:
+                    stat = metrics[key]
+                    lines.append(
+                        f"  {key:15s} avg={stat['avg']:6.1f}ms "
+                        f"p95={stat['p95']:6.1f}ms"
+                    )
+        return lines
+
+    @property
+    def has_data(self):
+        return bool(self._rows)
+
+    def export_csv(self, prefix: str):
+        prefix_path = Path(prefix)
+        prefix_path.parent.mkdir(parents=True, exist_ok=True)
+
+        samples_path = prefix_path.with_name(prefix_path.name + "_samples.csv")
+        summary_path = prefix_path.with_name(prefix_path.name + "_summary.csv")
+
+        self._export_samples_csv(samples_path)
+        self._export_summary_csv(summary_path)
+        return samples_path, summary_path
+
+    def _export_samples_csv(self, path: Path):
+        keys = {"ts_unix", "mode", "sample_idx", "ok"}
+        for row in self._rows:
+            keys.update(row.keys())
+
+        preferred = [
+            "ts_unix",
+            "mode",
+            "sample_idx",
+            "ok",
+            "plate_det_source",
+            "loop_ms",
+            "plate_det_ms",
+            "ocr_ms",
+            "face_ms",
+            "parallel_ms",
+            "saved_ms",
+            "probe_to_app_ms",
+        ]
+        fieldnames = preferred + sorted(k for k in keys if k not in preferred)
+
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in self._rows:
+                writer.writerow(row)
+
+    def _export_summary_csv(self, path: Path):
+        snapshots = self.snapshot()
+        metric_order = [
+            "loop_ms",
+            "plate_det_ms",
+            "ocr_ms",
+            "face_ms",
+            "parallel_ms",
+            "saved_ms",
+            "probe_to_app_ms",
+        ]
+
+        fieldnames = ["mode", "frames", "ok", "ok_rate"]
+        for metric in metric_order:
+            fieldnames.extend([f"{metric}_avg", f"{metric}_p95"])
+
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for mode, snap in snapshots.items():
+                row = {
+                    "mode": mode,
+                    "frames": snap["frames"],
+                    "ok": snap["ok"],
+                    "ok_rate": snap["ok_rate"],
+                }
+                for metric in metric_order:
+                    stat = snap["metrics"].get(metric)
+                    if stat:
+                        row[f"{metric}_avg"] = stat["avg"]
+                        row[f"{metric}_p95"] = stat["p95"]
+                writer.writerow(row)
+
+
 # ──────────────────────────────────────────────
 # Parking System
 # ──────────────────────────────────────────────
@@ -237,6 +409,8 @@ class ParkingSystem:
             max_workers=2, thread_name_prefix="infer")
 
         self._cached_stats = self.db.stats()
+        self._runtime_prof = RuntimeProfiler()
+        self.profile_csv_prefix = None
         self._face_rotate = self.cfg.get("camera", {}).get("face_rotate", -1)
         self._rot_map = {
             1: cv2.ROTATE_90_CLOCKWISE,
@@ -271,18 +445,56 @@ class ParkingSystem:
         dt = (time.time() - t0) * 1000
         return best_f, quality, fc, dt
 
+    def _record_runtime_sample(self, mode: str, result: dict,
+                               loop_ms: float, extra: dict = None):
+        timing = dict(self.state.get("timing", {}))
+        timing["loop_ms"] = round(loop_ms, 1)
+
+        if extra:
+            for key, value in extra.items():
+                if value is None:
+                    continue
+                timing[key] = round(value, 1) if isinstance(
+                    value, (int, float)) else value
+
+        self.state["timing"] = timing
+        self._runtime_prof.add(mode, bool(result.get("ok")), timing)
+        self.state["runtime_profile"] = self._runtime_prof.snapshot(mode)
+
+        snap = self.state["runtime_profile"]
+        if snap and snap["frames"] % 100 == 0:
+            self._log_runtime_profile(mode)
+
+    def _log_runtime_profile(self, mode: str = None):
+        for line in self._runtime_prof.format_lines(mode):
+            log.info(line)
+
+    def _export_runtime_profile(self):
+        if not self.profile_csv_prefix or not self._runtime_prof.has_data:
+            return
+        samples_path, summary_path = self._runtime_prof.export_csv(
+            self.profile_csv_prefix)
+        log.info(f"Runtime profile samples CSV → {samples_path}")
+        log.info(f"Runtime profile summary CSV → {summary_path}")
+
     # ── ENTRY ──
     def process_entry(self, frame_plate, plate_dets,
                       frame_face) -> dict:
         result = {"ok": False, "plate": "", "face_conf": 0,
                   "plate_bbox": None, "face_bbox": None}
+        timing = {"plate_det_source": "deepstream" if plate_dets is not None
+                  else "python"}
 
         # 1) Plate detection
         if plate_dets is None:
+            t_det = time.time()
             plate_dets = self.plate_det(frame_plate) if self.plate_det else []
+            timing["plate_det_ms"] = round((time.time() - t_det) * 1000, 1)
+        self.state["timing"] = timing
 
         if not plate_dets:
             log.debug("ENTRY: no plate detected")
+            result["timing"] = timing.copy()
             return result
         best_p = max(plate_dets, key=lambda p: p["conf"])
         x1, y1, x2, y2 = best_p["bbox"]
@@ -334,18 +546,20 @@ class ParkingSystem:
         log.debug(f"⏱ ENTRY ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
                   f"parallel={dt_parallel:.0f}ms "
                   f"(saved {saved:.0f}ms)")
-        self.state["timing"] = {
+        timing.update({
             "ocr_ms": round(dt_ocr, 1),
             "face_ms": round(dt_face, 1),
             "parallel_ms": round(dt_parallel, 1),
             "saved_ms": round(saved, 1),
-        }
+        })
+        self.state["timing"] = timing
 
         # 5) Vote
         stable = self.plate_voter.vote(plate)
         if not stable:
             result["plate"] = plate
             log.debug(f"ENTRY: voting... buf={self.plate_voter._buf}")
+            result["timing"] = timing.copy()
             return result
         result["plate"] = stable
         log.info(f"ENTRY: plate voted → '{stable}'")
@@ -369,6 +583,7 @@ class ParkingSystem:
         elif code == -2:
             log.warning(f"❌ TRÙNG BIỂN SỐ: {stable}")
 
+        result["timing"] = timing.copy()
         return result
 
     # ── EXIT (plate-first → face verify) ──
@@ -376,11 +591,17 @@ class ParkingSystem:
                      plate_dets=None) -> dict:
         result = {"ok": False, "plate": "", "sim": 0.0,
                   "face_bbox": None, "plate_bbox": None}
+        timing = {"plate_det_source": "deepstream" if plate_dets is not None
+                  else "python"}
 
         # ── Bước 1: Plate detection + crop ──
         if plate_dets is None and self.plate_det:
+            t_det = time.time()
             plate_dets = self.plate_det(frame_plate)
+            timing["plate_det_ms"] = round((time.time() - t_det) * 1000, 1)
+        self.state["timing"] = timing
         if not plate_dets:
+            result["timing"] = timing.copy()
             return result
 
         best_p = max(plate_dets, key=lambda p: p["conf"])
@@ -393,6 +614,7 @@ class ParkingSystem:
         crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
                            max(0, x1 - mx):min(w, x2 + mx)]
         if crop.size == 0:
+            result["timing"] = timing.copy()
             return result
         result["plate_crop"] = crop.copy()
 
@@ -419,25 +641,29 @@ class ParkingSystem:
         log.debug(f"⏱ EXIT ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
                   f"parallel={dt_parallel:.0f}ms "
                   f"(saved {saved:.0f}ms)")
-        self.state["timing"] = {
+        timing.update({
             "ocr_ms": round(dt_ocr, 1),
             "face_ms": round(dt_face, 1),
             "parallel_ms": round(dt_parallel, 1),
             "saved_ms": round(saved, 1),
-        }
+        })
+        self.state["timing"] = timing
 
         # ── Bước 3: Vote + tìm record ──
         exit_plate = self.plate_voter.vote(plate)
         if not exit_plate:
+            result["timing"] = timing.copy()
             return result
 
         record = self.db.find_by_plate(exit_plate)
         if not record:
             log.debug(f"EXIT: biển {exit_plate} không tìm thấy trong DB")
+            result["timing"] = timing.copy()
             return result
 
         # ── Bước 4: Verify face embedding ──
         if not self.face_avg.ready:
+            result["timing"] = timing.copy()
             return result
 
         emb = self.face_avg._latest
@@ -447,6 +673,7 @@ class ParkingSystem:
         if sim < self.face_thr:
             log.debug(f"EXIT: face không khớp cho {exit_plate} "
                       f"(sim={sim:.3f} < thr={self.face_thr})")
+            result["timing"] = timing.copy()
             return result
 
         # ── Bước 5: Xác nhận xe ra ──
@@ -459,6 +686,7 @@ class ParkingSystem:
         log.info(f"✅ EXIT: {record['plate']} (sim={sim:.3f})")
         self._emit("exit", {"plate": record["plate"],
                             "sim": sim}, result)
+        result["timing"] = timing.copy()
         return result
 
     def _emit(self, event_type: str, data: dict, result: dict = None):
@@ -617,14 +845,28 @@ class ParkingSystem:
                 # Skip đã được xử lý trong DeepStream probe (Lỗi #1)
                 ff = self._rotate_face(ff)
 
+                probe_to_app_ms = None
+                if ds.last_plate_frame_ts > 0:
+                    probe_to_app_ms = (
+                        time.time() - ds.last_plate_frame_ts) * 1000
+
                 t0 = time.time()
+                processed = False
 
                 if t0 < cooldown_until:
                     result = {"ok": False}
                 elif mode == "entry":
+                    processed = True
                     result = self.process_entry(fp, plate_dets, ff)
                 else:
+                    processed = True
                     result = self.process_exit(ff, fp, plate_dets)
+
+                if processed:
+                    loop_ms = (time.time() - t0) * 1000
+                    self._record_runtime_sample(
+                        mode, result, loop_ms,
+                        {"probe_to_app_ms": probe_to_app_ms})
 
                 self._last_result = result
 
@@ -705,13 +947,20 @@ class ParkingSystem:
                 ff = self._rotate_face(ff)
 
                 t0 = time.time()
+                processed = False
 
                 if t0 < cooldown_until:
                     result = {"ok": False}
                 elif mode == "entry":
+                    processed = True
                     result = self.process_entry(fp, None, ff)
                 else:
+                    processed = True
                     result = self.process_exit(ff, fp)
+
+                if processed:
+                    loop_ms = (time.time() - t0) * 1000
+                    self._record_runtime_sample(mode, result, loop_ms)
 
                 self._last_result = result
 
@@ -796,6 +1045,8 @@ class ParkingSystem:
                 self._run_fallback(mode, show)
         finally:
             self.running = False
+            self._log_runtime_profile()
+            self._export_runtime_profile()
             self._executor.shutdown(wait=False)
             self.db.close()
             cv2.destroyAllWindows()
@@ -820,6 +1071,22 @@ def start_web(cfg: dict, db, state: dict):
 # CLI
 # ──────────────────────────────────────────────
 def main():
+    def build_profile_prefix(arg_value: str | None):
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if arg_value is None:
+            return None
+        if arg_value == "":
+            return str(Path("runs") / f"runtime_profile_{stamp}")
+
+        p = Path(arg_value)
+        if p.exists() and p.is_dir():
+            return str(p / f"runtime_profile_{stamp}")
+        if arg_value.endswith(("/", "\\")):
+            return str(p / f"runtime_profile_{stamp}")
+        if p.suffix.lower() == ".csv":
+            p = p.with_suffix("")
+        return str(p)
+
     parser = argparse.ArgumentParser(
         description="Smart Parking System")
     parser.add_argument("--config", default="config.yaml")
@@ -830,6 +1097,13 @@ def main():
     parser.add_argument("--no-show", action="store_true")
     parser.add_argument("--no-web", action="store_true")
     parser.add_argument("--frames", type=int, default=200)
+    parser.add_argument(
+        "--profile-csv",
+        nargs="?",
+        const="",
+        default=None,
+        help=("Export runtime profiler CSV. "
+              "Use no value for auto path under runs/."))
     parser.add_argument("--debug", action="store_true",
                         help="Bật debug logging chi tiết")
     args = parser.parse_args()
@@ -838,6 +1112,7 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     system = ParkingSystem(args.config)
+    system.profile_csv_prefix = build_profile_prefix(args.profile_csv)
 
     def sig_handler(s, f):
         system.running = False

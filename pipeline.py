@@ -70,6 +70,7 @@ class DeepStreamPipeline:
         self._plate_frame = None
         self._plate_detections = []
         self._face_frame = None
+        self._last_plate_frame_ts = 0.0
         
         self._frame_seq = 0          # ← thêm counter
         self._frame_event = Event()  # ← thêm event
@@ -297,6 +298,7 @@ class DeepStreamPipeline:
                 if source_id == 0:
                     self._plate_frame = frame
                     self._plate_detections = detections
+                    self._last_plate_frame_ts = time.time()
                     self._frame_seq += 1
                     self._frame_event.set()
                 elif source_id == 1:
@@ -312,6 +314,10 @@ class DeepStreamPipeline:
     @property
     def stream_fps(self):
         return round(self._probe_fps, 1)
+
+    @property
+    def last_plate_frame_ts(self):
+        return self._last_plate_frame_ts
     
     def wait_new_frame(self, timeout=0.5) -> bool:
         """Block cho tới khi có frame mới từ probe."""
