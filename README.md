@@ -93,7 +93,7 @@ Pipeline tối ưu GPU bằng **DeepStream** (zero-copy decode → nvinfer YOLO 
 3. So sánh cosine similarity với embedding live → nếu ≥ `face_threshold` (0.3) → `db.exit()`.
 4. Log xuống bảng `parking_log` với duration + match_conf.
 
----
+<!-- --- -->
 
 <!-- ## Các tối ưu đã áp dụng
 
@@ -107,7 +107,7 @@ Pipeline tối ưu GPU bằng **DeepStream** (zero-copy decode → nvinfer YOLO 
 - **Streaming JPEG**: downscale 1280px + quality 70, cache theo frame reference để không re-encode cùng frame.
 - **Frame copy chỉ trong bbox** + JPEG encode quality giảm để đẩy web thread nhẹ hơn. -->
 
----
+<!-- --- -->
 
 ## Cài đặt
 

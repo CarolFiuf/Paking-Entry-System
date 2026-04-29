@@ -28,7 +28,7 @@ _DIGIT_TO_LETTER = {
 
 def enforce_plate_format(text: str) -> str:
     """
-    Ép format VN: pos 0,1 phải là số; pos 2 phải là chữ.
+    Ép format VN: pos 0,1 = số; pos 2 = chữ; 4 char cuối = số.
     Nếu sai → map qua confusion table (8↔B, 0↔D, …).
     Char không có trong map → giữ nguyên (validator sẽ reject sau).
     """
@@ -40,6 +40,15 @@ def enforce_plate_format(text: str) -> str:
             chars[i] = _LETTER_TO_DIGIT.get(chars[i], chars[i])
     if not chars[2].isalpha():
         chars[2] = _DIGIT_TO_LETTER.get(chars[2], chars[2])
+    # 4 char cuối luôn là số trong mọi format biển VN
+    if len(chars) >= 4:
+        for i in range(len(chars) - 4, len(chars)):
+            if not chars[i].isdigit():
+                chars[i] = _LETTER_TO_DIGIT.get(chars[i], chars[i])
+    # Tối đa 6 số liên tiếp tính từ cuối (format dài nhất: XXYN-NNNNN = 6 số đuôi).
+    # Nếu char thứ 7 từ cuối lên vẫn là digit → ép thành letter (vị trí kỳ vọng là chữ).
+    if len(chars) >= 7 and chars[-7].isdigit():
+        chars[-7] = _DIGIT_TO_LETTER.get(chars[-7], chars[-7])
     return ''.join(chars)
 
 

@@ -138,6 +138,29 @@ class ParkingDB:
                 WITH (lists = 22)
             """)
 
+    @staticmethod
+    def _parse_embedding(raw) -> np.ndarray:
+        """
+        pgvector thường trả về ndarray sau register_vector(), nhưng một số
+        connection vẫn có thể trả về chuỗi dạng "[0.1,...]". Chuẩn hóa tại đây
+        để logic exit không phụ thuộc vào typecaster của từng connection.
+        """
+        if isinstance(raw, np.ndarray):
+            emb = raw.astype(np.float32, copy=False)
+        elif isinstance(raw, str):
+            text = raw.strip()
+            if text.startswith("[") and text.endswith("]"):
+                text = text[1:-1]
+            sep = "," if "," in text else " "
+            emb = np.fromstring(text, sep=sep, dtype=np.float32)
+        else:
+            emb = np.asarray(raw, dtype=np.float32)
+
+        emb = emb.reshape(-1)
+        if emb.size != DIM:
+            raise ValueError(f"Invalid embedding dimension: {emb.size} != {DIM}")
+        return emb
+
     # ── ENTRY ──
     def entry(self, plate: str, embedding: np.ndarray,
               conf_plate: float = 0, conf_face: float = 0) -> int:
@@ -189,7 +212,7 @@ class ParkingDB:
             return None
 
         rid, plate, emb_raw = row
-        embedding = np.array(emb_raw, dtype=np.float32)
+        embedding = self._parse_embedding(emb_raw)
         return {"id": rid, "plate": plate, "embedding": embedding}
 
     def match_exit(self, embedding: np.ndarray,
