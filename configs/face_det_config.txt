@@ -1,0 +1,60 @@
+# nvinfer config — SCRFD-2.5GF Face Detection (PGIE secondary)
+# Model: det_2.5g.onnx từ InsightFace buffalo_m pack
+# Input: 640x640 RGB, normalize (x-127.5)/128 ≈ scale 1/128, mean 127.5
+# Output: 9 tensors (3 strides × {score, bbox, kps}) — bbox parser handle 6,
+#         landmarks (3) đọc bởi Probe A trong Python qua output-tensor-meta=1.
+
+[property]
+gpu-id=0
+
+# Normalize: SCRFD dùng (x - 127.5) / 128.0
+# nvinfer formula: net-scale-factor * (input - offsets)
+net-scale-factor=0.0078125
+offsets=127.5;127.5;127.5
+model-color-format=0
+# 0=RGB, 1=BGR. SCRFD ONNX expects RGB.
+
+model-engine-file=/home/somethink/parking_system/models/face_det_scrfd_fp16.engine
+onnx-file=/home/somethink/parking_system/models/face_det_scrfd.onnx
+
+batch-size=2
+# 2 sources, nhưng face detection chỉ cần chạy meaningful trên src1.
+# nvinfer không support per-source batch trong DeepStream 7.1 mà không
+# nvstreamdemux/nvstreammux split — chấp nhận chạy thừa trên src0 (~3ms).
+
+network-mode=2
+# 2=FP16
+
+num-detected-classes=1
+# 1 class: face
+
+interval=0
+gie-unique-id=2
+process-mode=1
+# 1=primary (chạy trên full frame, không dependent vào uid khác)
+
+network-type=0
+# 0=detector
+
+cluster-mode=4
+# 4=NONE — parser tự làm NMS
+
+maintain-aspect-ratio=1
+symmetric-padding=1
+infer-dims=3;640;640
+# CHW format
+
+# Cho phép Probe A đọc raw 9 tensors qua frame_user_meta
+output-tensor-meta=1
+
+parse-bbox-func-name=NvDsInferParseCustomScrfd
+custom-lib-path=/home/somethink/parking_system/parsers/libnvds_scrfd_parser.so
+
+# operate-on-class-ids không apply cho primary detector
+# operate-on-gie-id không set vì process-mode=1
+
+[class-attrs-all]
+# Parser đã filter conf >= 0.5 và NMS rồi → đặt threshold rất thấp ở đây
+# để nvinfer nhận hết kết quả parser.
+pre-cluster-threshold=0.0
+nms-iou-threshold=1.0
