@@ -1,0 +1,45 @@
+# nvinfer config — ArcFace MobileFaceNet (SGIE secondary, embedding only)
+# Model: w600k_mbf.onnx (512-dim)
+# Phase 6 mode: input-tensor-from-meta=1 — preprocessed tensor (RGB CHW
+# normalized to [-1,1], aligned to ArcFace 5-keypoint template) is provided
+# by upstream nvdspreprocess element (face_preprocess_config.txt) via custom
+# lib libnvds_face_align.so. nvinfer skips its own preprocess.
+
+[property]
+gpu-id=0
+
+# Normalization performed in nvdspreprocess custom lib; nvinfer values below
+# are ignored when input-tensor-from-meta=1, kept for documentation.
+net-scale-factor=0.0078431372
+offsets=127.5;127.5;127.5
+model-color-format=0
+# 0=RGB (ArcFace ONNX expects RGB)
+
+model-engine-file=/home/somethink/parking_system/models/face_embed_arcface_fp16.engine
+onnx-file=/home/somethink/parking_system/models/face_embed_arcface.onnx
+
+batch-size=16
+network-mode=2
+# FP16
+
+gie-unique-id=3
+operate-on-gie-id=2
+operate-on-class-ids=0
+process-mode=2
+# 2=secondary
+
+network-type=100
+# 100=other (just emit tensor meta, no parser)
+
+output-tensor-meta=1
+
+input-object-min-width=32
+input-object-min-height=32
+
+# Phase 6: consume preprocessed tensor from nvdspreprocess (face alignment
+# + normalize already done by libnvds_face_align.so).
+input-tensor-from-meta=1
+infer-dims=3;112;112
+maintain-aspect-ratio=0
+
+classifier-async-mode=0

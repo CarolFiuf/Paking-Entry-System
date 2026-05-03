@@ -1,0 +1,77 @@
+somethink@somethink:~/parking_system$ python main.py --entry --no-show
+00:37:45 INFO main: Loading models...
+00:37:45 INFO main: PlateDetector skipped (DeepStream nvinfer)
+Loading ./models/plate_ocr_yolov8n.engine for TensorRT inference...
+[05/04/2026-00:37:49] [TRT] [I] Loaded engine size: 7 MiB
+[05/04/2026-00:37:49] [TRT] [W] Using an engine plan file across different models of devices is not recommended and is likely to affect performance or even cause errors.
+[05/04/2026-00:37:49] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +3, now: CPU 0, GPU 8 (MiB)
+00:37:50 INFO engine: PlateOCRYolo ready: ./models/plate_ocr_yolov8n.engine (imgsz=320, conf=0.4)
+00:37:50 INFO main: FaceEngine skipped (DeepStream face chain)
+00:37:50 INFO main: Models loaded in 4.5s (DeepStream=ON, OCR=yolo)
+00:37:50 INFO db: DB ready: 4 vehicles loaded
+00:37:50 INFO main: Web dashboard: http://0.0.0.0:8080
+00:37:51 INFO main: Starting (deepstream=True)
+00:37:51 INFO main: DB: {'current': 4, 'capacity': 500, 'pct': 0.8}
+00:37:51 INFO pipeline: Face chain enabled: PGIE_face → tracker → nvdspreprocess(align, EGL map) → SGIE_embed
+00:37:51 INFO pipeline: DeepStream pipeline built
+Opening in BLOCKING MODE 
+Opening in BLOCKING MODE 
+Setting min object dimensions as 16x16 instead of 1x1 to support VIC compute mode.
+0:00:00.126323808 115760 0xaaaaf66ec4a0 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<face_embed> NvDsInferContext[UID 3]: Info from NvDsInferContextImpl::deserializeEngineAndBackend() <nvdsinfer_context_impl.cpp:2092> [UID = 3]: deserialized trt engine from :/home/somethink/parking_system/models/face_embed_arcface_fp16.engine
+INFO: [FullDims Engine Info]: layers num: 2
+0   INPUT  kFLOAT input.1         3x112x112       min: 1x3x112x112     opt: 8x3x112x112     Max: 16x3x112x112    
+1   OUTPUT kFLOAT 516             512             min: 0               opt: 0               Max: 0               
+
+0:00:00.126471940 115760 0xaaaaf66ec4a0 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<face_embed> NvDsInferContext[UID 3]: Info from NvDsInferContextImpl::generateBackendContext() <nvdsinfer_context_impl.cpp:2195> [UID = 3]: Use deserialized engine model: /home/somethink/parking_system/models/face_embed_arcface_fp16.engine
+0:00:00.132318535 115760 0xaaaaf66ec4a0 INFO                 nvinfer gstnvinfer_impl.cpp:343:notifyLoadModelStatus:<face_embed> [UID 3]: Load new model:./configs/face_embed_config.txt sucessfully
+[face_align] initLib OK (NPP path active, ARCFACE_REF 5-keypoint, 112x112 RGB float CHW)
+gstnvtracker: Loading low-level lib at /opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
+[NvMultiObjectTracker] Initialized
+Setting min object dimensions as 16x16 instead of 1x1 to support VIC compute mode.
+0:00:00.177180425 115760 0xaaaaf66ec4a0 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<face_det> NvDsInferContext[UID 2]: Info from NvDsInferContextImpl::deserializeEngineAndBackend() <nvdsinfer_context_impl.cpp:2092> [UID = 2]: deserialized trt engine from :/home/somethink/parking_system/models/face_det_scrfd_fp16.engine
+INFO: [FullDims Engine Info]: layers num: 10
+0   INPUT  kFLOAT input.1         3x640x640       min: 1x3x640x640     opt: 2x3x640x640     Max: 2x3x640x640     
+1   OUTPUT kFLOAT 446             1               min: 0               opt: 0               Max: 0               
+2   OUTPUT kFLOAT 466             1               min: 0               opt: 0               Max: 0               
+3   OUTPUT kFLOAT 486             1               min: 0               opt: 0               Max: 0               
+4   OUTPUT kFLOAT 449             4               min: 0               opt: 0               Max: 0               
+5   OUTPUT kFLOAT 469             4               min: 0               opt: 0               Max: 0               
+6   OUTPUT kFLOAT 489             4               min: 0               opt: 0               Max: 0               
+7   OUTPUT kFLOAT 452             10              min: 0               opt: 0               Max: 0               
+8   OUTPUT kFLOAT 472             10              min: 0               opt: 0               Max: 0               
+9   OUTPUT kFLOAT 492             10              min: 0               opt: 0               Max: 0               
+
+0:00:00.177315084 115760 0xaaaaf66ec4a0 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<face_det> NvDsInferContext[UID 2]: Info from NvDsInferContextImpl::generateBackendContext() <nvdsinfer_context_impl.cpp:2195> [UID = 2]: Use deserialized engine model: /home/somethink/parking_system/models/face_det_scrfd_fp16.engine
+0:00:00.184774332 115760 0xaaaaf66ec4a0 INFO                 nvinfer gstnvinfer_impl.cpp:343:notifyLoadModelStatus:<face_det> [UID 2]: Load new model:./configs/face_det_config.txt sucessfully
+Setting min object dimensions as 16x16 instead of 1x1 to support VIC compute mode.
+WARNING: [TRT]: Using an engine plan file across different models of devices is not recommended and is likely to affect performance or even cause errors.
+0:00:00.221365944 115760 0xaaaaf66ec4a0 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<plate_det> NvDsInferContext[UID 1]: Info from NvDsInferContextImpl::deserializeEngineAndBackend() <nvdsinfer_context_impl.cpp:2092> [UID = 1]: deserialized trt engine from :/home/somethink/parking_system/models/plate_yolov8n.engine
+INFO: [FullDims Engine Info]: layers num: 2
+0   INPUT  kFLOAT images          3x640x640       min: 1x3x640x640     opt: 2x3x640x640     Max: 2x3x640x640     
+1   OUTPUT kFLOAT output0         5x8400          min: 0               opt: 0               Max: 0               
+
+0:00:00.221464635 115760 0xaaaaf66ec4a0 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<plate_det> NvDsInferContext[UID 1]: Info from NvDsInferContextImpl::generateBackendContext() <nvdsinfer_context_impl.cpp:2195> [UID = 1]: Use deserialized engine model: /home/somethink/parking_system/models/plate_yolov8n.engine
+0:00:00.224185318 115760 0xaaaaf66ec4a0 INFO                 nvinfer gstnvinfer_impl.cpp:343:notifyLoadModelStatus:<plate_det> [UID 1]: Load new model:./configs/plate_det_config.txt sucessfully
+00:37:51 INFO pipeline: Pipeline set_state → PLAYING (ret=<enum GST_STATE_CHANGE_SUCCESS of type Gst.StateChangeReturn>)
+00:37:51 INFO pipeline: DeepStream pipeline started
+00:37:51 INFO main: Web update thread started (DeepStream mode)
+00:37:51 INFO main: DeepStream mode=entry
+00:37:51 INFO pipeline: Pipeline state: null → ready
+00:37:51 INFO pipeline: Pipeline state: ready → paused
+00:37:51 INFO pipeline: Pipeline state: paused → playing
+00:37:52 INFO pipeline: [face] flvdemux pad added: video (video/x-h264)
+00:37:52 INFO pipeline: [face] Linked video → h264parse
+00:37:52 INFO pipeline: Stream started: parking-pipeline
+NvMMLiteOpen : Block : BlockType = 261 
+NvMMLiteBlockCreate : Block : BlockType = 261 
+00:37:52 INFO pipeline: [face] flvdemux pad added: audio (audio/mpeg)
+00:37:52 INFO pipeline: [plate] flvdemux pad added: video (video/x-h264)
+00:37:52 INFO pipeline: [plate] Linked video → h264parse
+NvMMLiteOpen : Block : BlockType = 261 
+00:37:52 INFO pipeline: Stream started: parking-pipeline
+NvMMLiteBlockCreate : Block : BlockType = 261 
+00:37:52 INFO pipeline: [plate] flvdemux pad added: audio (audio/mpeg)
+~~ CLOG[/dvs/git/dirty/git-master_linux/deepstream/sdk/src/utils/nvmultiobjecttracker/src/modules/DataAssociator/DataAssociator.cpp, initializeSimilarityParams() @line 86]: [NvMultiObjectTracker][DataAssociator][Warning] Visual tracker disabled. minMatchingScore4VisualSimilarity is not used
+~~ CLOG[/dvs/git/dirty/git-master_linux/deepstream/sdk/src/utils/nvmultiobjecttracker/src/modules/DataAssociator/DataAssociator.cpp, initializeSimilarityParams() @line 90]: [NvMultiObjectTracker][DataAssociator][Warning] Visual tracker disabled. matchingScoreWeight4VisualSimilarity is not used
+00:37:53 INFO main: ENTRY: plate voted → '99B1-25739'
+00:37:53 WARNING main: ENTRY: plate '99B1-25739' stable nhưng không có fresh face track (gap > 30 frames) — reject

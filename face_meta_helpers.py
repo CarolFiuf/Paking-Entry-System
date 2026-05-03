@@ -22,7 +22,7 @@ import numpy as np
 #   - preprocess/nvds_face_align.cpp khi đọc user_meta
 LANDMARKS_META_TYPE = 0x10001000
 
-CONF_THRESH = 0.5
+CONF_THRESH = 0.30
 NMS_THRESH  = 0.4
 NUM_ANCHORS = 2
 STRIDES = (8, 16, 32)
@@ -139,17 +139,23 @@ def decode_scrfd(layers_by_stride: dict, net_w: int, net_h: int,
     scores = np.concatenate(all_scores, axis=0)
     kps_arr = np.concatenate(all_kps, axis=0)
 
-    # Clamp box vào network input — match parser
-    boxes[:, 0::2] = np.clip(boxes[:, 0::2], 0, net_w)
-    boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, net_h)
-
+    # Order MUST match parsers/nvds_scrfd_parser.cpp:
+    #   NMS on RAW (unclipped) boxes → clip kept boxes → drop zero-area.
+    # Parser does NMS first (line 145) then clips + drops empty (lines 151-156).
     kept_boxes, kept_scores, kept_kps = _nms(boxes, scores, kps_arr,
                                               nms_thresh)
 
     out = []
     for i in range(len(kept_boxes)):
+        b = kept_boxes[i]
+        x1c = max(0.0, float(b[0]))
+        y1c = max(0.0, float(b[1]))
+        x2c = min(float(net_w), float(b[2]))
+        y2c = min(float(net_h), float(b[3]))
+        if x2c - x1c <= 0 or y2c - y1c <= 0:
+            continue
         out.append({
-            "bbox": tuple(float(v) for v in kept_boxes[i]),
+            "bbox": (x1c, y1c, x2c, y2c),
             "conf": float(kept_scores[i]),
             "landmarks": kept_kps[i].astype(np.float32),
         })
@@ -223,35 +229,85 @@ def extract_pgie_face_tensors(frame_meta, gie_uid: int = 2,
     return layers_by_stride
 
 
+_LANDMARKS_BYTES = 5 * 2 * 4   # 5 keypoints × (x,y) × float32
+
+
+def backproject_landmarks_to_frame(lm_net: np.ndarray,
+                                    net_w: int, net_h: int,
+                                    frame_w: int, frame_h: int) -> np.ndarray:
+    """
+    Đảo ngược preprocess maintain-aspect-ratio + symmetric-padding của nvinfer:
+      scale  = min(net_w / frame_w, net_h / frame_h)
+      pad_x  = (net_w - frame_w*scale) / 2
+      pad_y  = (net_h - frame_h*scale) / 2
+      x_frame = (x_net - pad_x) / scale
+      y_frame = (y_net - pad_y) / scale
+
+    Phải khớp với face_det_config.txt (maintain-aspect-ratio=1,
+    symmetric-padding=1).
+    """
+    s = min(net_w / frame_w, net_h / frame_h)
+    pad_x = (net_w - frame_w * s) * 0.5
+    pad_y = (net_h - frame_h * s) * 0.5
+    out = np.empty_like(lm_net, dtype=np.float32)
+    out[:, 0] = (lm_net[:, 0] - pad_x) / s
+    out[:, 1] = (lm_net[:, 1] - pad_y) / s
+    return out
+
+
+def _landmarks_copy_func(data, user_data):
+    """Deep-copy callback cho NvDsUserMeta — DS gọi khi forward batch."""
+    import pyds
+    src = pyds.NvDsUserMeta.cast(data)
+    return pyds.memdup(src.user_meta_data, _LANDMARKS_BYTES)
+
+
+def _landmarks_release_func(data, user_data):
+    """Free callback — DS gọi khi tear down meta."""
+    import pyds
+    src = pyds.NvDsUserMeta.cast(data)
+    pyds.free_buffer(src.user_meta_data)
+
+
 def attach_landmarks_user_meta(batch_meta, obj_meta,
-                                landmarks_5x2: np.ndarray):
+                                landmarks_5x2: np.ndarray) -> bool:
     """
     Attach NvDsUserMeta(LANDMARKS_META_TYPE) vào obj_meta.
-    Data: 10 float32 = [x0,y0,x1,y1,...,x4,y4] (network-input coords).
+    Data: 10 float32 [x0,y0,x1,y1,...,x4,y4] trong frame coords (1280x720).
 
-    nvdspreprocess (Phase 6) sẽ đọc lại type này.
+    libnvds_face_align.so (C++) đọc raw float* từ um->user_meta_data.
     """
+    import ctypes
     import pyds
+
+    if landmarks_5x2.shape != (5, 2):
+        return False
+
     um = pyds.nvds_acquire_user_meta_from_pool(batch_meta)
+    if um is None:
+        return False
+
     data = np.ascontiguousarray(landmarks_5x2.flatten(),
                                  dtype=np.float32).tobytes()
-    # Lưu data — pyds yêu cầu ta giữ reference cho tới khi meta được consume
-    # downstream. Workaround: encode vào bytes object, attach qua
-    # set_user_copyfunc_release. Để đơn giản và an toàn, ta dùng dạng
-    # base64 string trong user_meta (nvinfer/tracker không chạm).
-    import base64
-    um.user_meta_data = base64.b64encode(data).decode("ascii")
+    ptr = pyds.alloc_buffer(_LANDMARKS_BYTES)
+    ctypes.memmove(int(ptr), data, _LANDMARKS_BYTES)
+
+    um.user_meta_data = ptr
     um.base_meta.meta_type = LANDMARKS_META_TYPE
+    pyds.set_user_copyfunc(um, _landmarks_copy_func)
+    pyds.set_user_releasefunc(um, _landmarks_release_func)
     pyds.nvds_add_user_meta_to_obj(obj_meta, um)
+    return True
 
 
 def read_landmarks_user_meta(obj_meta) -> np.ndarray | None:
     """
-    Đọc landmarks (5,2) từ obj_user_meta_list.
+    Đọc landmarks (5,2) từ obj_user_meta_list (debug/Python-side use).
     Trả None nếu không tìm thấy.
     """
+    import ctypes
     import pyds
-    import base64
+
     l_user = obj_meta.obj_user_meta_list
     while l_user is not None:
         try:
@@ -260,9 +316,13 @@ def read_landmarks_user_meta(obj_meta) -> np.ndarray | None:
             break
         if um.base_meta.meta_type == LANDMARKS_META_TYPE:
             try:
-                raw = base64.b64decode(um.user_meta_data)
-                arr = np.frombuffer(raw, dtype=np.float32).reshape(5, 2)
-                return arr.copy()
+                ptr = pyds.get_ptr(um.user_meta_data)
+                arr = np.ctypeslib.as_array(
+                    ctypes.cast(ptr,
+                                 ctypes.POINTER(ctypes.c_float)),
+                    shape=(10,)
+                ).copy().reshape(5, 2)
+                return arr
             except Exception:
                 return None
         l_user = l_user.next

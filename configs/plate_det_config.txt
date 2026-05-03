@@ -50,7 +50,6 @@ infer-dims=3;640;640
 # CHW format, 640x640 input
 
 output-blob-names=output0
-parse-func=0
 parse-bbox-func-name=NvDsInferParseYoloV8
 custom-lib-path=/home/somethink/parking_system/parsers/libnvds_yolov8_parser.so
 output-tensor-meta=0
@@ -58,4 +57,3 @@ output-tensor-meta=0
 [class-attrs-all]
 pre-cluster-threshold=0.4
 nms-iou-threshold=0.45
-

@@ -13,16 +13,22 @@ camera:
   hw_decode: true
   process_every_n: 2
   reconnect_sec: 3
+  face_rotate: -1        # cv2 code 0/1/2/3, -1 = chưa setup (chạy setup_rotation.py)
+  face_rotate_nv: 0    # nvvidconv flip-method tương ứng (auto-write bởi setup script)
 
 # DeepStream pipeline (tắt = fallback GStreamer + Python inference)
 deepstream:
   enabled: true
-  # nvinfer config files cho plate detection
   plate_config: "./configs/plate_det_config.txt"
-  # Batch size (2 sources = 2)
+  # Face chain: SCRFD det → tracker → ArcFace embed
+  face_chain_enabled: true
+  face_det_config: "./configs/face_det_config.txt"
+  face_embed_config: "./configs/face_embed_config.txt"
+  tracker_config: "./configs/tracker_nvdcf.yml"
   batch_size: 2
-  # Tracker (NvDCF hoặc IOU)
-  tracker: "IOU"
+  # Phase 6: GPU face alignment via nvdspreprocess + libnvds_face_align.so
+  face_align_enabled: true
+  face_preprocess_config: "./configs/face_preprocess_config.txt"
 
 plate_detector:
   model: "./models/plate_yolov8n.pt"
@@ -46,7 +52,15 @@ plate_ocr:
 face:
   model_pack: "buffalo_sc"
   det_size: [640, 640]
-  blur_threshold: 10.0   
+  blur_threshold: 10.0
+  # Phase 8 per-track logic (DeepStream mode chỉ; fallback dùng face_avg singular)
+  multi_embedding: true              # gate cho new path
+  k_max: 5                           # bank cap cho entry
+  min_track_frames: 5                # min frames before track candidate-eligible
+  track_idle_drop_frames: 30         # Invariant 1: drop track idle > N frames (~1s @30fps)
+  plate_face_max_gap_frames: 30      # Invariant 2: fresh face required at commit
+  min_quality: 0.4                   # per-frame quality gate
+  dedup_cos: 0.9                    # bank de-dup similarity
 
 recognition:
   face_threshold: 0.3

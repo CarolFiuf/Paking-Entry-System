@@ -95,7 +95,15 @@ class ParkingDB:
             self._pool.putconn(conn)
 
     def _init_schema(self):
-        """Tạo tables + pgvector extension."""
+        """
+        Tạo tables + pgvector extension.
+
+        Phase 7 migration (idempotent, transactional):
+          - active_face_embeddings table (N embeddings/plate, FK CASCADE)
+          - UNIQUE constraint on active.plate
+          - active.embedding NULLable (kept for rollback path)
+          - Backfill afe rows từ active.embedding hiện có
+        """
         with self._conn() as conn:
             cur = conn.cursor()
 
@@ -105,7 +113,7 @@ class ParkingDB:
                 CREATE TABLE IF NOT EXISTS active (
                     id SERIAL PRIMARY KEY,
                     plate TEXT NOT NULL,
-                    embedding vector({DIM}) NOT NULL,
+                    embedding vector({DIM}),
                     entry_time TIMESTAMP DEFAULT now(),
                     conf_plate REAL DEFAULT 0,
                     conf_face REAL DEFAULT 0
@@ -123,19 +131,60 @@ class ParkingDB:
                 )
             """)
 
-            # Index cho plate lookup (duplicate check)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_active_plate
-                ON active(plate)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS active_face_embeddings (
+                    id          SERIAL PRIMARY KEY,
+                    active_id   INT NOT NULL
+                                REFERENCES active(id) ON DELETE CASCADE,
+                    embedding   vector({DIM}) NOT NULL,
+                    quality     REAL,
+                    track_id    BIGINT,
+                    source_id   INT,
+                    created_at  TIMESTAMPTZ DEFAULT NOW()
+                )
             """)
 
-            # IVFFlat index cho vector search
-            # lists = sqrt(N) ~ 22 cho 500 records
-            # Nếu < 100 records, sequential scan nhanh hơn → Postgres tự chọn
-            cur.execute(f"""
+            # Existing schemas may have NOT NULL on active.embedding.
+            # Drop it so Phase 7+ entries can store embeddings only in afe.
+            cur.execute("""
+                ALTER TABLE active ALTER COLUMN embedding DROP NOT NULL
+            """)
+
+            # UNIQUE on plate. Older schemas had a non-unique idx_active_plate;
+            # add a unique index alongside (CREATE UNIQUE INDEX IF NOT EXISTS).
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_active_plate_unique
+                ON active(plate)
+            """)
+            # Old non-unique index becomes redundant; drop if present.
+            cur.execute("DROP INDEX IF EXISTS idx_active_plate")
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_afe_active
+                ON active_face_embeddings(active_id)
+            """)
+
+            # IVFFlat index cho vector search trên active.embedding (legacy
+            # path / rollback). Plate-scoped match dùng JOIN trên afe nên
+            # không cần ivfflat trên afe.
+            cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_active_embedding
                 ON active USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 22)
+            """)
+
+            # Backfill: cho mỗi active row có embedding nhưng chưa có afe row,
+            # copy 1 row sang afe. Idempotent qua NOT EXISTS.
+            cur.execute("""
+                INSERT INTO active_face_embeddings
+                    (active_id, embedding, quality)
+                SELECT a.id, a.embedding, a.conf_face
+                FROM active a
+                WHERE a.embedding IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM active_face_embeddings afe
+                      WHERE afe.active_id = a.id
+                  )
             """)
 
     @staticmethod
@@ -162,31 +211,81 @@ class ParkingDB:
         return emb
 
     # ── ENTRY ──
-    def entry(self, plate: str, embedding: np.ndarray,
-              conf_plate: float = 0, conf_face: float = 0) -> int:
+    def entry(self, plate: str, embeddings,
+              conf_plate: float = 0, conf_face: float = 0,
+              *,
+              qualities: Optional[list] = None,
+              track_ids: Optional[list] = None,
+              source_ids: Optional[list] = None) -> int:
         """
-        Đăng ký xe vào.
+        Đăng ký xe vào. Hỗ trợ N embeddings/xe (Phase 7).
+
+        Args:
+            embeddings: np.ndarray (1 emb, back-compat) hoặc list[np.ndarray].
+            qualities, track_ids, source_ids: list song song với embeddings.
+                Nếu None → fill bằng (conf_face, None, None).
+
+        Side effects:
+            - INSERT 1 row vào `active`, embedding[0] giữ nguyên cho rollback.
+            - Bulk INSERT N rows vào `active_face_embeddings`.
+
         Returns: record_id > 0 | -1 (full) | -2 (duplicate plate)
         """
         if self._stats_cache["current"] >= self.max_cap:
             return -1
 
-        emb_list = embedding.astype(np.float32).tolist()
+        # Normalize: ndarray → [ndarray]
+        if isinstance(embeddings, np.ndarray):
+            emb_list_np = [embeddings]
+        else:
+            emb_list_np = list(embeddings)
+        if not emb_list_np:
+            raise ValueError("entry() requires at least 1 embedding")
+
+        n = len(emb_list_np)
+        emb_lists = [e.astype(np.float32).reshape(-1).tolist()
+                     for e in emb_list_np]
+        for el in emb_lists:
+            if len(el) != DIM:
+                raise ValueError(
+                    f"Invalid embedding dim {len(el)} != {DIM}")
+
+        qual_list = qualities if qualities is not None \
+            else [conf_face] * n
+        tid_list = track_ids if track_ids is not None else [None] * n
+        sid_list = source_ids if source_ids is not None else [None] * n
+        if not (len(qual_list) == len(tid_list) == len(sid_list) == n):
+            raise ValueError(
+                "qualities/track_ids/source_ids length mismatch")
 
         with self._conn() as conn:
             cur = conn.cursor()
 
-            # Check trùng biển số
-            cur.execute("SELECT 1 FROM active WHERE plate = %s", (plate,))
-            if cur.fetchone():
-                return -2
-
+            # Atomic duplicate-plate check: ON CONFLICT trên UNIQUE(plate)
+            # tránh race giữa SELECT-then-INSERT khi 2 entry() đồng thời.
             cur.execute(
                 "INSERT INTO active (plate, embedding, conf_plate, conf_face) "
-                "VALUES (%s, %s, %s, %s) RETURNING id",
-                (plate, emb_list, conf_plate, conf_face)
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (plate) DO NOTHING "
+                "RETURNING id",
+                (plate, emb_lists[0], conf_plate, conf_face)
             )
-            rid = cur.fetchone()[0]
+            row = cur.fetchone()
+            if row is None:
+                return -2
+            rid = row[0]
+
+            # Bulk insert vào afe.
+            afe_rows = [
+                (rid, emb_lists[i], qual_list[i], tid_list[i], sid_list[i])
+                for i in range(n)
+            ]
+            cur.executemany(
+                "INSERT INTO active_face_embeddings "
+                "(active_id, embedding, quality, track_id, source_id) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                afe_rows
+            )
 
         # Cập nhật cache
         with self._stats_lock:
@@ -200,20 +299,81 @@ class ParkingDB:
 
     # ── EXIT: plate lookup + face verify ──
     def find_by_plate(self, plate: str) -> Optional[dict]:
-        """Tìm xe trong bảng active theo biển số, trả về id + embedding."""
+        """
+        Tìm xe trong bảng active theo biển số.
+
+        Trả về:
+            {id, plate, embeddings: list[np.ndarray], embedding: np.ndarray}
+        `embedding` (singular, = embeddings[0]) giữ cho back-compat với
+        main.py tới khi Phase 8 chuyển sang multi-emb.
+        """
         with self._conn() as conn:
             cur = conn.cursor()
-            cur.execute(
-                "SELECT id, plate, embedding FROM active WHERE plate = %s",
-                (plate,))
+            cur.execute("""
+                SELECT a.id, a.plate, afe.embedding
+                FROM active a
+                LEFT JOIN active_face_embeddings afe
+                    ON afe.active_id = a.id
+                WHERE a.plate = %s
+                ORDER BY afe.id
+            """, (plate,))
+            rows = cur.fetchall()
+
+        if not rows:
+            return None
+
+        rid = rows[0][0]
+        plate_out = rows[0][1]
+        embeddings = [self._parse_embedding(r[2]) for r in rows
+                      if r[2] is not None]
+        if not embeddings:
+            return None
+        return {
+            "id": rid,
+            "plate": plate_out,
+            "embeddings": embeddings,
+            "embedding": embeddings[0],
+        }
+
+    def match_exit_by_plate(self, plate: str, candidate_emb: np.ndarray,
+                            threshold: float = 0.45) -> Optional[dict]:
+        """
+        Plate-scoped face verify (Phase 7).
+
+        Pass nếu BẤT KỲ embedding nào của plate đó có cosine sim ≥ threshold
+        với candidate (= "any of N matches"). 1 query, JOIN + MIN distance.
+
+        Returns: {active_id, plate, sim, n_embeddings} | None
+        """
+        emb_list = candidate_emb.astype(np.float32).reshape(-1).tolist()
+        if len(emb_list) != DIM:
+            raise ValueError(f"Invalid embedding dim {len(emb_list)} != {DIM}")
+        max_dist = 1.0 - float(threshold)
+
+        with self._conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT a.id, a.plate,
+                       MIN(afe.embedding <=> %s::vector) AS dist,
+                       COUNT(afe.id) AS n
+                FROM active a
+                JOIN active_face_embeddings afe ON afe.active_id = a.id
+                WHERE a.plate = %s
+                GROUP BY a.id, a.plate
+                HAVING MIN(afe.embedding <=> %s::vector) <= %s
+                LIMIT 1
+            """, (emb_list, plate, emb_list, max_dist))
             row = cur.fetchone()
 
         if not row:
             return None
-
-        rid, plate, emb_raw = row
-        embedding = self._parse_embedding(emb_raw)
-        return {"id": rid, "plate": plate, "embedding": embedding}
+        active_id, plate_out, dist, n = row
+        return {
+            "active_id": int(active_id),
+            "plate": plate_out,
+            "sim": float(1.0 - dist),
+            "n_embeddings": int(n),
+        }
 
     def match_exit(self, embedding: np.ndarray,
                    threshold: float = 0.45) -> Optional[dict]:

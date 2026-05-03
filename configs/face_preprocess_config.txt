@@ -1,0 +1,82 @@
+# nvdspreprocess config — face alignment using libnvds_face_align.so
+# Phase 6.4. Inserts between nvtracker and SGIE (face_embed_arcface).
+#
+# Pipeline role:
+#   Per face obj_meta (PGIE class 0, gie-id=2), our custom lib reads the
+#   5 landmarks attached by Probe A (LANDMARKS_META_TYPE=0x10001000), computes
+#   ArcFace 2x3 similarity, NPP-warps source frame → 112x112 RGB normalized,
+#   and emits a preprocessed tensor consumed by SGIE (gie-id=3) via
+#   input-tensor-from-meta=1.
+
+[property]
+enable=1
+
+# Target SGIE that will consume our tensor (gie-unique-id of face_embed)
+target-unique-ids=3
+
+# Source obj_meta gie (face detector PGIE)
+operate-on-gie-id=2
+
+# 0=NCHW (ArcFace expects CHW)
+network-input-order=0
+
+# 0=process on objects (per-face), 1=process on frames
+process-on-frame=0
+
+# Unique id for this nvdspreprocess element
+unique-id=6
+
+gpu-id=0
+
+# We perform the warp ourselves — nvdspreprocess's scaling pool output
+# (converted_frame_ptr) is NEVER consumed by our custom lib. Keep tiny to
+# avoid wasting GPU on pointless per-object resize work.
+processing-width=112
+processing-height=112
+
+scaling-buf-pool-size=6
+tensor-buf-pool-size=6
+
+# Output tensor for SGIE: max batch 16 (matches face_embed_config batch-size)
+network-input-shape=16;3;112;112
+
+# 0=RGB — our cpp emits RGB, ArcFace expects RGB
+network-color-format=0
+
+# 0=FP32 — our cpp writes Npp32f normalized values
+tensor-data-type=0
+
+# Must match ArcFace ONNX input layer name (verified via onnx.load)
+tensor-name=input.1
+
+# 4=NVBUF_MEM_SURFACE_ARRAY on Jetson. The custom lib maps the original input
+# surface to CUDA via EGL, following gst-nvinfer-custom's allocator pattern.
+scaling-pool-memory-type=4
+
+# 0=Default: VIC on Jetson, enough for nvdspreprocess's internal object crop.
+scaling-pool-compute-hw=0
+
+# 1=Bilinear (only used by default transform; our warp uses NPP linear)
+scaling-filter=1
+
+custom-lib-path=/home/somethink/parking_system/preprocess/libnvds_face_align.so
+custom-tensor-preparation-function=CustomTensorPreparation
+
+[user-configs]
+# Unused by our custom lib (we do normalization in CustomTensorPreparation).
+pixel-normalization-factor=1.0
+
+[group-0]
+# Face camera ONLY (src-id=1 per pipeline.py _add_rtmp_source). Plate cam
+# (src-id=0) doesn't get landmarks attached by Probe A, so nvdspreprocess
+# must skip it — otherwise we'd run alignment on landmark-less obj_metas
+# and feed zero tensors into SGIE.
+src-ids=1
+# PGIE face_det produces single class_id 0 = "face"
+operate-on-class-ids=0
+# Use default async transform for nvdspreprocess's internal object crop.
+custom-input-transformation-function=CustomAsyncTransformation
+# 1=process every face object (no ROI gating)
+process-on-all-objects=1
+input-object-min-width=32
+input-object-min-height=32

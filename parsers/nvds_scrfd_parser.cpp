@@ -30,7 +30,7 @@
  *   4) Output kept detections theo NMS-sorted order
  */
 
-static constexpr float CONF_THRESH = 0.5f;
+static constexpr float CONF_THRESH = 0.30f;
 static constexpr float NMS_THRESH  = 0.4f;
 static constexpr int   NUM_ANCHORS = 2;
 
