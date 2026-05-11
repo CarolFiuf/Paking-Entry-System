@@ -1,8 +1,10 @@
-# nvinfer config — SCRFD-2.5GF Face Detection (PGIE secondary)
-# Model: det_2.5g.onnx từ InsightFace buffalo_m pack
+# nvinfer config — SCRFD Face Detection (PGIE)
+# Model: det_500m.onnx (buffalo_sc) đã re-export thành face_det_scrfd_b1.onnx
+# với outputs 3-D [batch, anchors, K] qua scripts/fix_scrfd_onnx.py.
 # Input: 640x640 RGB, normalize (x-127.5)/128 ≈ scale 1/128, mean 127.5
-# Output: 9 tensors (3 strides × {score, bbox, kps}) — bbox parser handle 6,
-#         landmarks (3) đọc bởi Probe A trong Python qua output-tensor-meta=1.
+# Output: 9 tensors (3 strides × {score, bbox, kps}). Parser emit bbox sau
+#         khi lọc score + hình học landmark; nvdsfaceembed decode lại
+#         landmarks từ frame tensor meta để align + tạo embedding.
 
 [property]
 gpu-id=0
@@ -14,8 +16,8 @@ offsets=127.5;127.5;127.5
 model-color-format=0
 # 0=RGB, 1=BGR. SCRFD ONNX expects RGB.
 
-model-engine-file=/home/somethink/parking_system/models/face_det_scrfd_fp16.engine
-onnx-file=/home/somethink/parking_system/models/face_det_scrfd.onnx
+model-engine-file=/home/somethink/parking_system/models/face_det_scrfd_b1_fp16.engine
+onnx-file=/home/somethink/parking_system/models/face_det_scrfd_b1.onnx
 
 batch-size=2
 # 2 sources, nhưng face detection chỉ cần chạy meaningful trên src1.
@@ -34,7 +36,10 @@ process-mode=1
 # 1=primary (chạy trên full frame, không dependent vào uid khác)
 
 network-type=0
-# 0=detector
+# 0=detector — parser trả NvDsInferParseObjectInfo (bbox), nvinfer auto-
+# transform sang frame coords (1280x720) qua maintain-aspect-ratio.
+# Landmarks decode trong nvdsfaceembed từ raw tensor (xem
+# output-tensor-meta=1 dưới).
 
 cluster-mode=4
 # 4=NONE — parser tự làm NMS
@@ -44,9 +49,8 @@ symmetric-padding=1
 infer-dims=3;640;640
 # CHW format
 
-# Cho phép Probe A đọc raw 9 tensors qua frame_user_meta
+# Required: nvdsfaceembed đọc 9 raw tensors từ frame_user_meta.
 output-tensor-meta=1
-
 parse-bbox-func-name=NvDsInferParseCustomScrfd
 custom-lib-path=/home/somethink/parking_system/parsers/libnvds_scrfd_parser.so
 
@@ -54,7 +58,8 @@ custom-lib-path=/home/somethink/parking_system/parsers/libnvds_scrfd_parser.so
 # operate-on-gie-id không set vì process-mode=1
 
 [class-attrs-all]
-# Parser đã filter conf >= 0.5 và NMS rồi → đặt threshold rất thấp ở đây
-# để nvinfer nhận hết kết quả parser.
-pre-cluster-threshold=0.0
+# Parser lấy ngưỡng này, sau đó lọc thêm hình học landmark và NMS.
+# 0.50 giữ recall tốt hơn; chặn false positive ở downstream bằng yêu cầu
+# phải có landmark + embedding trước khi publish lên dashboard/main.
+pre-cluster-threshold=0.50
 nms-iou-threshold=1.0

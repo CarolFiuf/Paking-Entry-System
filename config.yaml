@@ -11,7 +11,7 @@ camera:
   plate: "rtmp://192.168.118.108/live/plate"
   face: "rtmp://192.168.118.108/live/face"
   hw_decode: true
-  process_every_n: 2
+  process_every_n: 1
   reconnect_sec: 3
   face_rotate: -1        # cv2 code 0/1/2/3, -1 = chưa setup (chạy setup_rotation.py)
   face_rotate_nv: 0    # nvvidconv flip-method tương ứng (auto-write bởi setup script)
@@ -19,16 +19,34 @@ camera:
 # DeepStream pipeline (tắt = fallback GStreamer + Python inference)
 deepstream:
   enabled: true
+  # Set plate_enabled=false khi test riêng face chain. Khi chạy đủ hệ thống,
+  # bật lại true để tạo plate source + plate detector trong DeepStream graph.
+  plate_enabled: true
+  face_enabled: true
   plate_config: "./configs/plate_det_config.txt"
-  # Face chain: SCRFD det → tracker → ArcFace embed
+  # Face chain: SCRFD det → ArcFace embed. NvDCF is disabled by default
+  # because it can drift on face boxes when visual tracking is unavailable.
   face_chain_enabled: true
+  face_tracker_enabled: false
+  face_track_iou_threshold: 0.25  # used only if face_tracker_enabled=true
+  face_track_max_miss: 12         # legacy, kept for old configs
+  # aligned_trt = custom plugin tự decode landmarks, align NPP, chạy ArcFace TRT
+  # và attach embedding vào object meta. direct_sgie là fallback crop/resize.
+  face_embed_backend: "aligned_trt"
+  face_embed_engine: "./models/face_embed_arcface_fp16.engine"
+  face_embed_batch_size: 16
+  face_embed_align_on_gpu: true
+  face_embed_allow_cpu_fallback: true
   face_det_config: "./configs/face_det_config.txt"
   face_embed_config: "./configs/face_embed_config.txt"
   tracker_config: "./configs/tracker_nvdcf.yml"
   batch_size: 2
-  # Phase 6: GPU face alignment via nvdspreprocess + libnvds_face_align.so
-  face_align_enabled: true
+  # Legacy/debug only: nvdspreprocess → nvinfer path can double-free ROI meta.
+  face_align_enabled: false
   face_preprocess_config: "./configs/face_preprocess_config.txt"
+  # Debug isolation: false = keep SGIE output tensor meta enabled but do not
+  # read embedding from Python Probe B.
+  read_face_embeddings: true
 
 plate_detector:
   model: "./models/plate_yolov8n.pt"
@@ -53,13 +71,14 @@ face:
   model_pack: "buffalo_sc"
   det_size: [640, 640]
   blur_threshold: 10.0
-  # Phase 8 per-track logic (DeepStream mode chỉ; fallback dùng face_avg singular)
-  multi_embedding: true              # gate cho new path
+  # DeepStream face path now uses the current validated embedding only.
+  multi_embedding: true              # legacy flag; no longer gates DS path
   k_max: 5                           # bank cap cho entry
   min_track_frames: 5                # min frames before track candidate-eligible
   track_idle_drop_frames: 30         # Invariant 1: drop track idle > N frames (~1s @30fps)
   plate_face_max_gap_frames: 30      # Invariant 2: fresh face required at commit
   min_quality: 0.4                   # per-frame quality gate
+  embedding_hold_frames: 30          # reuse latest embedding only while same face bbox remains visible
   dedup_cos: 0.9                    # bank de-dup similarity
 
 recognition:

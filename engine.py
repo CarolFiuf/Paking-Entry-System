@@ -394,12 +394,13 @@ class FaceEngine:
         brightness = float(gray.mean())
         ok = blur >= blur_thr and 30 < brightness < 230
 
-        log.info(f"FACE QUALITY: blur={blur:.1f} (thr={blur_thr}) "
-                 f"brightness={brightness:.1f} size={crop.shape[1]}x{crop.shape[0]} "
-                 f"→ {'OK' if ok else 'FAIL'}"
-                 f"{' [TOO_BLURRY]' if blur < blur_thr else ''}"
-                 f"{' [TOO_DARK]' if brightness <= 30 else ''}"
-                 f"{' [TOO_BRIGHT]' if brightness >= 230 else ''}")
+        log.debug(f"FACE QUALITY: blur={blur:.1f} (thr={blur_thr}) "
+                  f"brightness={brightness:.1f} "
+                  f"size={crop.shape[1]}x{crop.shape[0]} "
+                  f"→ {'OK' if ok else 'FAIL'}"
+                  f"{' [TOO_BLURRY]' if blur < blur_thr else ''}"
+                  f"{' [TOO_DARK]' if brightness <= 30 else ''}"
+                  f"{' [TOO_BRIGHT]' if brightness >= 230 else ''}")
 
         if not ok:
             return False, None

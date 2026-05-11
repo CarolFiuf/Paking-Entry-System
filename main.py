@@ -180,9 +180,15 @@ class ParkingSystem:
 
         self.use_deepstream = (self.cfg["deepstream"]["enabled"]
                                and HAS_DEEPSTREAM)
+        ds_cfg = self.cfg.get("deepstream", {})
+        self._ds_plate_enabled = bool(
+            self.use_deepstream and ds_cfg.get("plate_enabled", True))
+        self._ds_face_enabled = bool(
+            self.use_deepstream and ds_cfg.get("face_enabled", True))
         self._ds_face_chain = bool(
             self.use_deepstream
-            and self.cfg.get("deepstream", {}).get("face_chain_enabled", False)
+            and self._ds_face_enabled
+            and ds_cfg.get("face_chain_enabled", False)
             and HAS_FACE_HELPERS
         )
         if not self.use_deepstream:
@@ -191,13 +197,20 @@ class ParkingSystem:
                 pcfg["model"], pcfg["imgsz"], pcfg["conf"], pcfg["device"])
         else:
             self.plate_det = None
-            log.info("PlateDetector skipped (DeepStream nvinfer)")
+            if self._ds_plate_enabled:
+                log.info("PlateDetector skipped (DeepStream plate nvinfer)")
+            else:
+                log.info("PlateDetector skipped (DeepStream plate disabled)")
 
         # ★ v5: OCR backend selection
         ocr_cfg = self.cfg["plate_ocr"]
         ocr_backend = ocr_cfg.get("backend", "yolo")
+        self.plate_ocr = None
 
-        if ocr_backend == "yolo":
+        if self.use_deepstream and not self._ds_plate_enabled:
+            ocr_backend = "disabled"
+            log.info("Plate OCR skipped (DeepStream plate disabled)")
+        elif ocr_backend == "yolo":
             self.plate_ocr = PlateOCRYolo(
                 model_path=ocr_cfg["model"],
                 imgsz=ocr_cfg.get("imgsz", 320),
@@ -236,20 +249,11 @@ class ParkingSystem:
         self.face_thr = rcfg["face_threshold"]
         self.blur_thr = fcfg_full.get("blur_threshold", 35.0)
 
-        # Phase 8: per-track state cho DeepStream path.
-        # face_tracks[tid] = {"avg": EmbeddingAvg, "last_update": int, "n_frames": int}
-        self.face_tracks: dict = {}
         self.cur_frame_id = 0
-        self._face_avg_frames = rcfg["face_avg_frames"]
-        self._multi_emb = bool(fcfg_full.get("multi_embedding", True))
-        self._k_max = int(fcfg_full.get("k_max", 5))
-        self._min_track_frames = int(fcfg_full.get("min_track_frames", 5))
-        self._track_idle_drop = int(
-            fcfg_full.get("track_idle_drop_frames", 30))
-        self._plate_face_max_gap = int(
-            fcfg_full.get("plate_face_max_gap_frames", 30))
         self._face_min_quality = float(fcfg_full.get("min_quality", 0.4))
-        self._dedup_cos = float(fcfg_full.get("dedup_cos", 0.92))
+        self._face_embedding_hold_frames = int(
+            fcfg_full.get("embedding_hold_frames", 30))
+        self._last_face_embedding = None
 
         # ── Web state (shared reference với web.py) ──
         self.state = {
@@ -284,118 +288,145 @@ class ParkingSystem:
         return self.face_eng
 
     # ──────────────────────────────────────────────
-    # Phase 8 — Per-track helpers (DeepStream path)
+    # DeepStream face helpers
     # ──────────────────────────────────────────────
-    def _expire_tracks(self):
-        """Invariant 1 (idle expiry): drop tracks không update > N frames."""
-        if not self.face_tracks:
-            return
-        cutoff = self.cur_frame_id - self._track_idle_drop
-        expired = [tid for tid, t in self.face_tracks.items()
-                   if t["last_update"] < cutoff]
-        for tid in expired:
-            del self.face_tracks[tid]
-
     def _reset_tracks(self):
-        """Invariant 1 (hard reset): gọi sau entry/exit success + mode switch."""
-        if self.face_tracks:
-            self.face_tracks.clear()
+        """Compatibility hook; current DS face path has no track state."""
+        self._last_face_embedding = None
+        return
 
-    def _has_fresh_track(self) -> bool:
-        """
-        Invariant 2: tại commit time, phải có ít nhất 1 track:
-          - n_frames >= min_track_frames (track "chín")
-          - last_update gần đây (≤ plate_face_max_gap_frames)
-        """
-        cutoff = self.cur_frame_id - self._plate_face_max_gap
-        for t in self.face_tracks.values():
-            if (t["n_frames"] >= self._min_track_frames
-                    and t["last_update"] >= cutoff
-                    and t["avg"].ready):
-                return True
-        return False
+    @staticmethod
+    def _bbox_iou(a, b) -> float:
+        if not a or not b:
+            return 0.0
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        return inter / (area_a + area_b - inter + 1e-6)
 
-    def _update_face_tracks(self, face_data, frame_face):
-        """
-        Tích lũy embedding per-track từ DeepStream face_data.
+    def _pick_display_face(self, face_data):
+        candidates = self._valid_embedding_faces(face_data)
+        if not candidates:
+            return self._recent_face_detection(face_data)
+        return max(candidates, key=lambda f: float(f.get("conf", 0.0)))
 
-        face_data: list[{bbox, conf, track_id, embedding, landmarks}]
-        Bỏ qua face không có track_id hoặc embedding (untracked / SGIE miss).
-        """
-        if not face_data:
-            return
-        for f in face_data:
-            tid = f.get("track_id")
-            emb = f.get("embedding")
-            bbox = f.get("bbox")
-            if tid is None or emb is None or bbox is None:
-                continue
+    @staticmethod
+    def _valid_bbox(bbox) -> bool:
+        if not bbox:
+            return False
+        x1, y1, x2, y2 = bbox
+        return x2 > x1 and y2 > y1
 
-            # Per-frame quality gate (CPU; sẽ thay bằng landmark geometry sau MVP)
-            ok, q = FaceEngine.quality(frame_face, bbox, self.blur_thr)
-            if not ok or q is None or q < self._face_min_quality:
-                continue
+    def _landmarks_plausible(self, face) -> bool:
+        bbox = face.get("bbox")
+        landmarks = face.get("landmarks")
+        if not self._valid_bbox(bbox) or landmarks is None:
+            return False
 
-            t = self.face_tracks.get(tid)
-            if t is None:
-                t = {
-                    "avg": EmbeddingAvg(self._face_avg_frames),
-                    "last_update": self.cur_frame_id,
-                    "n_frames": 0,
-                }
-                self.face_tracks[tid] = t
+        try:
+            lm = np.asarray(landmarks, dtype=np.float32).reshape(-1, 2)
+        except ValueError:
+            return False
+        if lm.shape != (5, 2) or not np.isfinite(lm).all():
+            return False
 
-            t["avg"].update(emb, q)
-            t["last_update"] = self.cur_frame_id
-            t["n_frames"] += 1
+        x1, y1, x2, y2 = bbox
+        w, h = float(x2 - x1), float(y2 - y1)
+        aspect = w / (h + 1e-6)
+        if w < 24 or h < 24 or aspect < 0.40 or aspect > 1.70:
+            return False
 
-    def _build_bank(self) -> list:
-        """
-        Build embedding bank cho entry: quality-sorted, dedup, capped to k_max.
+        pad_x, pad_y = 0.25 * w, 0.25 * h
+        if (lm[:, 0].min() < x1 - pad_x or lm[:, 0].max() > x2 + pad_x or
+                lm[:, 1].min() < y1 - pad_y or lm[:, 1].max() > y2 + pad_y):
+            return False
 
-        Lọc cùng condition với Invariant 2 (mature + fresh + ready). Không lọc
-        freshness ở đây sẽ cho phép track vừa-chưa-expire (idle 25/30 frames)
-        lọt vào bank → embedding của xe cũ bị gắn cho xe mới.
+        le, re, nose, ml, mr = lm
+        if re[0] <= le[0] or mr[0] <= ml[0]:
+            return False
 
-        Returns: list[(emb: ndarray, quality: float, track_id: int)]
-        """
-        cutoff = self.cur_frame_id - self._plate_face_max_gap
-        candidates = [
-            (tid, t["avg"]._latest, t["avg"]._latest_quality, t["n_frames"])
-            for tid, t in self.face_tracks.items()
-            if (t["n_frames"] >= self._min_track_frames
-                and t["last_update"] >= cutoff
-                and t["avg"].ready)
+        eye_dist = float(np.linalg.norm(re - le))
+        mouth_dist = float(np.linalg.norm(mr - ml))
+        if eye_dist < 0.10 * w or eye_dist > 0.85 * w:
+            return False
+        if mouth_dist < 0.07 * w or mouth_dist > 0.85 * w:
+            return False
+
+        eye_y = float((le[1] + re[1]) * 0.5)
+        mouth_y = float((ml[1] + mr[1]) * 0.5)
+        if nose[1] <= eye_y - 0.20 * h or nose[1] >= mouth_y + 0.30 * h:
+            return False
+        if mouth_y <= eye_y + 0.07 * h:
+            return False
+        return True
+
+    def _valid_embedding_faces(self, face_data):
+        return [
+            f for f in face_data or []
+            if (f.get("embedding") is not None
+                and f.get("landmarks") is not None
+                and self._landmarks_plausible(f))
         ]
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        bank = []
-        for tid, emb, q, _ in candidates:
-            if any(float(np.dot(emb, b[0])) > self._dedup_cos for b in bank):
-                continue
-            bank.append((emb, q, tid))
-            if len(bank) >= self._k_max:
-                break
-        return bank
 
-    def _best_track_emb(self):
-        """
-        Pick highest-quality MATURE + FRESH track cho exit candidate.
+    def _recent_face_detection(self, face_data):
+        cache = self._last_face_embedding
+        if not cache:
+            return None
+        if self.cur_frame_id - cache["frame_id"] > self._face_embedding_hold_frames:
+            return None
 
-        Phải khớp condition với _has_fresh_track / _build_bank, nếu không gate
-        có thể pass trên track B (fresh) nhưng picker chọn track A (stale,
-        higher quality) → match wrong car.
-        """
-        cutoff = self.cur_frame_id - self._plate_face_max_gap
-        eligible = [
-            t for t in self.face_tracks.values()
-            if (t["n_frames"] >= self._min_track_frames
-                and t["last_update"] >= cutoff
-                and t["avg"].ready)
-        ]
-        if not eligible:
-            return None, 0.0
-        best = max(eligible, key=lambda t: t["avg"]._latest_quality)
-        return best["avg"]._latest, float(best["avg"]._latest_quality)
+        visible = [f for f in face_data or [] if self._valid_bbox(f.get("bbox"))]
+        if not visible:
+            return None
+
+        ref_bbox = cache.get("track_bbox") or cache["bbox"]
+        best = max(
+            visible,
+            key=lambda f: self._bbox_iou(
+                f.get("detector_bbox") or f.get("bbox"), ref_bbox))
+        best_iou = self._bbox_iou(
+            best.get("detector_bbox") or best.get("bbox"), ref_bbox)
+        return best if best_iou >= 0.10 else None
+
+    def _remember_face_embedding(self, face, embedding, quality):
+        self._last_face_embedding = {
+            "bbox": face["bbox"],
+            "track_bbox": face.get("detector_bbox") or face["bbox"],
+            "embedding": embedding,
+            "quality": float(quality),
+            "conf": float(face.get("conf", 0.0)),
+            "frame_id": self.cur_frame_id,
+        }
+
+    def _pick_current_embedding_face(self, face_data, frame_face):
+        candidates = sorted(
+            self._valid_embedding_faces(face_data),
+            key=lambda f: float(f.get("conf", 0.0)),
+            reverse=True)
+        for best in candidates:
+            ok, q = FaceEngine.quality(frame_face, best["bbox"],
+                                       self.blur_thr)
+            if ok and q is not None and q >= self._face_min_quality:
+                self._remember_face_embedding(best, best["embedding"], q)
+                return best, best["embedding"], float(q)
+        recent = self._recent_face_detection(face_data)
+        cache = self._last_face_embedding
+        if recent is not None and cache is not None:
+            ok, q = FaceEngine.quality(frame_face, recent["bbox"],
+                                       self.blur_thr)
+            if ok and q is not None and q >= self._face_min_quality:
+                cache["bbox"] = recent["bbox"]
+                cache["track_bbox"] = (
+                    recent.get("detector_bbox") or recent["bbox"])
+                cache["quality"] = float(q)
+                cache["conf"] = float(recent.get("conf", cache["conf"]))
+                cache["frame_id"] = self.cur_frame_id
+                return recent, cache["embedding"], float(q)
+        return None, None, None
 
     # ── Parallel inference helpers ──
     def _run_ocr(self, crop):
@@ -427,7 +458,7 @@ class ParkingSystem:
                       frame_face, face_data=None) -> dict:
         # Phase 8: DeepStream path (face_data từ pipeline). Fallback (face_data=None)
         # giữ nguyên code path cũ với face_avg singular.
-        if face_data is not None and self._multi_emb:
+        if face_data is not None:
             return self._process_entry_ds(
                 frame_plate, plate_dets, frame_face, face_data)
 
@@ -532,7 +563,7 @@ class ParkingSystem:
     def process_exit(self, frame_face, frame_plate,
                      plate_dets=None, face_data=None) -> dict:
         # Phase 8: DeepStream path. Fallback giữ nguyên.
-        if face_data is not None and self._multi_emb:
+        if face_data is not None:
             return self._process_exit_ds(
                 frame_face, frame_plate, plate_dets, face_data)
 
@@ -631,18 +662,13 @@ class ParkingSystem:
         result = {"ok": False, "plate": "", "face_conf": 0,
                   "plate_bbox": None, "face_bbox": None}
 
-        # Invariant 1: expire stale tracks every frame.
-        self._expire_tracks()
-
-        # Update face_tracks từ DeepStream face_data (per-track).
-        # Vẫn làm dù chưa có plate — giúp track "chín" sớm hơn.
+        current_face = None
+        current_emb = None
+        current_q = None
         if face_data:
-            self._update_face_tracks(face_data, frame_face)
-            # Best face cho display + web event (highest conf trong frame này).
-            valid = [f for f in face_data
-                     if f.get("bbox") is not None]
-            if valid:
-                best_f = max(valid, key=lambda f: float(f.get("conf", 0.0)))
+            # Prefer detector bbox captured before tracker for dashboard.
+            best_f = self._pick_display_face(face_data)
+            if best_f:
                 bx1, by1, bx2, by2 = best_f["bbox"]
                 result["face_bbox"] = best_f["bbox"]
                 result["face_conf"] = float(best_f.get("conf", 0.0))
@@ -652,6 +678,8 @@ class ParkingSystem:
                                 max(0, bx1):min(fw, bx2)]
                 if fc.size > 0:
                     result["face_crop"] = fc.copy()
+            current_face, current_emb, current_q = (
+                self._pick_current_embedding_face(face_data, frame_face))
 
         if not plate_dets:
             return result
@@ -684,35 +712,26 @@ class ParkingSystem:
         result["plate"] = stable
         log.info(f"ENTRY: plate voted → '{stable}'")
 
-        # Invariant 2: fresh face required at commit.
-        if not self._has_fresh_track():
-            log.warning(
-                f"ENTRY: plate '{stable}' stable nhưng không có fresh face "
-                f"track (gap > {self._plate_face_max_gap} frames) — reject")
+        # Invariant 2: current frame must contain a usable face embedding.
+        if current_emb is None:
+            log.debug(
+                f"ENTRY: plate '{stable}' stable nhưng không có current face "
+                "embedding — reject")
             self.plate_voter.clear()
             return result
 
-        # Build embedding bank.
-        bank = self._build_bank()
-        if not bank:
-            log.debug("ENTRY: bank rỗng — chưa track nào đủ chín")
-            return result
-
-        embs = [b[0] for b in bank]
-        quals = [float(b[1]) for b in bank]
-        tids = [int(b[2]) for b in bank]
-        face_conf_for_db = quals[0]
+        tid = current_face.get("track_id") if current_face else None
+        face_conf_for_db = current_q if current_q is not None else 0.0
 
         code = self.db.entry(
-            stable, embs, ocr_conf, face_conf_for_db,
-            qualities=quals, track_ids=tids,
+            stable, [current_emb], ocr_conf, face_conf_for_db,
+            qualities=[face_conf_for_db], track_ids=[tid],
         )
         if code > 0:
             result["ok"] = True
             self.plate_voter.clear()
             self._reset_tracks()
-            log.info(f"✅ ENTRY OK: {stable} (id={code}, "
-                     f"bank={len(embs)} embeddings)")
+            log.info(f"✅ ENTRY OK: {stable} (id={code}, current embedding)")
             self._emit("entry", {"plate": stable}, result)
         elif code == -1:
             log.warning("❌ BÃI ĐẦY")
@@ -726,13 +745,10 @@ class ParkingSystem:
         result = {"ok": False, "plate": "", "sim": 0.0,
                   "face_bbox": None, "plate_bbox": None}
 
-        # Invariant 1: expire + update.
-        self._expire_tracks()
+        current_emb = None
         if face_data:
-            self._update_face_tracks(face_data, frame_face)
-            valid = [f for f in face_data if f.get("bbox") is not None]
-            if valid:
-                best_f = max(valid, key=lambda f: float(f.get("conf", 0.0)))
+            best_f = self._pick_display_face(face_data)
+            if best_f:
                 bx1, by1, bx2, by2 = best_f["bbox"]
                 result["face_bbox"] = best_f["bbox"]
                 fh, fw = frame_face.shape[:2]
@@ -740,6 +756,8 @@ class ParkingSystem:
                                 max(0, bx1):min(fw, bx2)]
                 if fc.size > 0:
                     result["face_crop"] = fc.copy()
+            _, current_emb, _ = self._pick_current_embedding_face(
+                face_data, frame_face)
 
         if not plate_dets:
             return result
@@ -763,19 +781,15 @@ class ParkingSystem:
         if not exit_plate:
             return result
 
-        # Invariant 2: fresh face required at commit.
-        if not self._has_fresh_track():
+        # Invariant 2: current frame must contain a usable face embedding.
+        if current_emb is None:
             log.debug(
-                f"EXIT: plate '{exit_plate}' stable nhưng không có fresh face")
-            return result
-
-        # Pick best track as candidate.
-        candidate_emb, cand_q = self._best_track_emb()
-        if candidate_emb is None:
+                f"EXIT: plate '{exit_plate}' stable nhưng không có current "
+                "face embedding")
             return result
 
         match = self.db.match_exit_by_plate(
-            exit_plate, candidate_emb, threshold=self.face_thr)
+            exit_plate, current_emb, threshold=self.face_thr)
         if not match:
             log.debug(f"EXIT: {exit_plate} — no embedding match "
                       f"(thr={self.face_thr})")
@@ -792,7 +806,7 @@ class ParkingSystem:
         self.plate_voter.clear()
         self._reset_tracks()
         log.info(f"✅ EXIT: {match['plate']} (sim={sim:.3f}, "
-                 f"bank={match['n_embeddings']})")
+                 f"embeddings={match['n_embeddings']})")
         self._emit("exit",
                    {"plate": match["plate"], "sim": sim}, result)
         return result
@@ -879,15 +893,16 @@ class ParkingSystem:
             t0 = time.time()
             fp = cam_plate.latest
             ff = cam_face.latest
-            if fp is not None and ff is not None:
-                ff_rot = self._apply_rotation(ff)
-                try:
+            try:
+                if fp is not None:
                     update_frame("plate",
                                  self._annotate_plate(fp, self._last_result))
+                if ff is not None:
+                    ff_rot = self._apply_rotation(ff)
                     update_frame("face",
                                  self._annotate_face(ff_rot, self._last_result))
-                except Exception:
-                    pass
+            except Exception:
+                pass
             elapsed = time.time() - t0
             time.sleep(max(0.0, interval - elapsed))
 
@@ -897,14 +912,15 @@ class ParkingSystem:
         while self.running:
             t0 = time.time()
             fp, _, ff, _ = ds.get_all()
-            if fp is not None and ff is not None:
-                try:
+            try:
+                if fp is not None:
                     update_frame("plate",
                                  self._annotate_plate(fp, self._last_result))
+                if ff is not None:
                     update_frame("face",
                                  self._annotate_face(ff, self._last_result))
-                except Exception:
-                    pass
+            except Exception:
+                pass
             elapsed = time.time() - t0
             time.sleep(max(0.0, interval - elapsed))
 
@@ -934,21 +950,49 @@ class ParkingSystem:
                     continue
 
                 fp, plate_dets, ff, face_data = ds.get_all()
+                self.state["plate_cam_ok"] = fp is not None
+                self.state["face_cam_ok"] = ff is not None
+                frame_idx += 1
 
-                if fp is None or ff is None:
+                plate_ready = (not self._ds_plate_enabled) or fp is not None
+                face_ready = (not self._ds_face_enabled) or ff is not None
+
+                if not plate_ready or not face_ready:
                     time.sleep(0.01)
-                    frame_idx += 1
                     if frame_idx % 300 == 0:
+                        plate_state = ("DISABLED" if not self._ds_plate_enabled
+                                       else ("OK" if fp is not None else "NONE"))
+                        face_state = ("DISABLED" if not self._ds_face_enabled
+                                      else ("OK" if ff is not None else "NONE"))
                         log.warning(f"Waiting frames... "
-                                    f"plate={'OK' if fp is not None else 'NONE'} "
-                                    f"face={'OK' if ff is not None else 'NONE'}")
+                                    f"plate={plate_state} face={face_state}")
                     continue
 
-                frame_idx += 1
-                self.cur_frame_id += 1
+                # Single-camera debug mode: keep the pipeline and dashboard
+                # alive, but do not call entry/exit logic that requires both
+                # plate and face frames.
+                if not (self._ds_plate_enabled and self._ds_face_enabled):
+                    if ff is not None and self._ds_face_chain:
+                        self.cur_frame_id += 1
+                        best = self._pick_display_face(face_data)
+                        if best:
+                            self._last_result = {
+                                "ok": False,
+                                "face_bbox": best.get("bbox"),
+                                "face_conf": best.get("conf", 0.0),
+                            }
 
-                self.state["plate_cam_ok"] = True
-                self.state["face_cam_ok"] = True
+                    n_fps += 1
+                    now = time.time()
+                    elapsed = now - t_fps
+                    if elapsed >= 1.0:
+                        self.state["fps"] = round(n_fps / elapsed, 1)
+                        self.state["stream_fps"] = ds.stream_fps
+                        self._cached_stats = self.db.stats()
+                        n_fps, t_fps = 0, now
+                    continue
+
+                self.cur_frame_id += 1
 
                 # DeepStream face frames are already rotated at source ingress
                 # via camera.face_rotate_nv. Do not rotate again here.

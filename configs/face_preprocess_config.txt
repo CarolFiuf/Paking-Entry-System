@@ -2,11 +2,11 @@
 # Phase 6.4. Inserts between nvtracker and SGIE (face_embed_arcface).
 #
 # Pipeline role:
-#   Per face obj_meta (PGIE class 0, gie-id=2), our custom lib reads the
-#   5 landmarks attached by Probe A (LANDMARKS_META_TYPE=0x10001000), computes
-#   ArcFace 2x3 similarity, NPP-warps source frame → 112x112 RGB normalized,
-#   and emits a preprocessed tensor consumed by SGIE (gie-id=3) via
-#   input-tensor-from-meta=1.
+#   Per face obj_meta (PGIE class 0, gie-id=2), our custom lib decodes SCRFD
+#   raw tensor meta from face_det frame_user_meta, IoU-matches bbox →
+#   landmarks, computes ArcFace 2x3 similarity, NPP-warps source frame →
+#   112x112 RGB normalized, and emits a preprocessed tensor consumed by SGIE
+#   (gie-id=3) via input-tensor-from-meta=1.
 
 [property]
 enable=1
@@ -65,12 +65,17 @@ custom-tensor-preparation-function=CustomTensorPreparation
 [user-configs]
 # Unused by our custom lib (we do normalization in CustomTensorPreparation).
 pixel-normalization-factor=1.0
+# Debug isolation only: 1 = skip SCRFD tensor decode/landmark match and feed
+# zero tensors to SGIE. Keep 0 for real embeddings.
+debug-zero-tensor=0
+# 1 = detach ROI from object before SGIE output meta attach. This avoids the
+# DeepStream ROI release bug, but SGIE output cannot be matched back to object.
+# Keep 0; pipeline.py nulls roi.object_meta after reading ROI tensor meta.
+detach-roi-object-meta=0
 
 [group-0]
-# Face camera ONLY (src-id=1 per pipeline.py _add_rtmp_source). Plate cam
-# (src-id=0) doesn't get landmarks attached by Probe A, so nvdspreprocess
-# must skip it — otherwise we'd run alignment on landmark-less obj_metas
-# and feed zero tensors into SGIE.
+# Face camera ONLY (src-id=1 per pipeline.py _add_rtmp_source).
+# Plate cam (src-id=0) must be skipped.
 src-ids=1
 # PGIE face_det produces single class_id 0 = "face"
 operate-on-class-ids=0

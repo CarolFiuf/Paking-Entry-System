@@ -1,11 +1,12 @@
 // libnvds_face_align.so — custom nvdspreprocess library for face alignment.
 //
 // For each face obj_meta:
-//   1) Read 5 landmarks from user_meta (attached by Probe A in Python).
-//   2) Compute 2x3 similarity matrix mapping landmarks → ARCFACE_REF.
-//   3) NPP NV12→RGB on the input full frame (cached per frame).
-//   4) NPP nppiWarpAffine_8u_C3R → 112x112 RGB warped patch.
-//   5) NPP C3→P3 split + Convert 8u→32f + per-channel normalize
+//   1) Decode SCRFD raw tensor meta from face_det frame_user_meta.
+//   2) IoU-match decoded bbox to obj_meta, recover 5 landmarks in frame coords.
+//   3) Compute 2x3 similarity matrix mapping landmarks → ARCFACE_REF.
+//   4) NPP NV12→RGB on the input full frame (cached per frame).
+//   5) NPP affine warp → 112x112 RGB warped patch.
+//   6) NPP C3→P3 split + Convert 8u→32f + per-channel normalize
 //      (x-127.5)/127.5, written CHW directly into the output tensor slot.
 //
 // SGIE downstream consumes via input-tensor-from-meta=1.
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cmath>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -34,12 +36,21 @@
 #include "nvdspreprocess_lib.h"
 #include "nvdspreprocess_meta.h"
 #include "nvbufsurface.h"
+#include "nvdsmeta.h"
+#include "nvdsinfer.h"
+#include "gstnvdsinfer.h"
+#include <map>
+#include <algorithm>
 
 #include "face_align_solver.h"
 
-// LANDMARKS user_meta type — must match Python LANDMARKS_META_TYPE in
-// face_meta_helpers.py. Not in any DS enum so we use a custom int.
-static constexpr int LANDMARKS_META_TYPE = 0x10001000;
+// SCRFD network input. Frame size lấy runtime từ unit.input_surf_params,
+// không hardcode để theo streammux output bất kỳ.
+static constexpr int   NET_W = 640;
+static constexpr int   NET_H = 640;
+// Margin (network px) cho phép landmark lệch ngoài frame nhỏ — SCRFD đôi khi
+// extrapolate mép trán/cằm ra ngoài; vượt margin này coi như invalid.
+static constexpr float LM_MARGIN_PX = 8.0f;
 
 static constexpr int FACE_W = 112;
 static constexpr int FACE_H = 112;
@@ -65,6 +76,8 @@ struct CustomCtx {
     Npp8u *planar_8u[3];    // each is 112×112 single-channel
 
     int    debug_call_count;
+    bool   debug_zero_tensor;
+    bool   detach_roi_object_meta;
 };
 
 static bool ensure_rgb_buf(CustomCtx *ctx, int W, int H) {
@@ -213,29 +226,204 @@ static bool nv12_to_rgb_from_batch(CustomCtx *ctx,
     return ok;
 }
 
-static bool read_landmarks(NvDsObjectMeta *obj_meta, float out_lm[5][2]) {
-    if (!obj_meta) return false;
-    NvDsMetaList *l = obj_meta->obj_user_meta_list;
-    while (l) {
+// ─────────────────────────────────────────────────────────────────────
+// SCRFD raw-tensor decoder + IoU matcher.
+// Đọc 9 raw tensor từ frame_user_meta (output-tensor-meta=1), decode &
+// NMS giống parser bbox; mỗi detection kèm 5 landmarks. Sau đó IoU-match
+// với obj_meta đang xét (bbox đã ở frame coords sau nvinfer transform)
+// để gán landmark đúng.
+// ─────────────────────────────────────────────────────────────────────
+struct DecodedFace {
+    float x1, y1, x2, y2;       // network coords (640x640)
+    float conf;
+    float lm[5][2];             // network coords
+};
+
+static constexpr float DECODE_CONF_THRESH = 0.30f;
+static constexpr float DECODE_NMS_IOU     = 0.4f;
+static constexpr int   DECODE_NUM_ANCHORS = 2;
+
+static float face_iou(const DecodedFace& a, const DecodedFace& b) {
+    float ix1 = std::max(a.x1, b.x1), iy1 = std::max(a.y1, b.y1);
+    float ix2 = std::min(a.x2, b.x2), iy2 = std::min(a.y2, b.y2);
+    float inter = std::max(0.f, ix2 - ix1) * std::max(0.f, iy2 - iy1);
+    float A = std::max(0.f, a.x2 - a.x1) * std::max(0.f, a.y2 - a.y1);
+    float B = std::max(0.f, b.x2 - b.x1) * std::max(0.f, b.y2 - b.y1);
+    return inter / (A + B - inter + 1e-6f);
+}
+
+// Decode SCRFD output 9 tensors → kept faces (network coords).
+static void decode_scrfd_from_frame(NvDsFrameMeta *fm, int gie_uid,
+                                     int net_w,
+                                     std::vector<DecodedFace> &out) {
+    out.clear();
+    if (!fm) return;
+
+    std::map<int, const float*> sc, bb, kp;
+    for (NvDsMetaList *l = fm->frame_user_meta_list; l; l = l->next) {
         NvDsUserMeta *um = (NvDsUserMeta *)l->data;
-        if (um && um->base_meta.meta_type == (NvDsMetaType)LANDMARKS_META_TYPE
-                && um->user_meta_data) {
-            const float *src = (const float *)um->user_meta_data;
-            for (int i = 0; i < 5; i++) {
-                out_lm[i][0] = src[i * 2 + 0];
-                out_lm[i][1] = src[i * 2 + 1];
-            }
-            return true;
+        if (!um || um->base_meta.meta_type != NVDSINFER_TENSOR_OUTPUT_META)
+            continue;
+        NvDsInferTensorMeta *tm =
+            (NvDsInferTensorMeta *)um->user_meta_data;
+        if (!tm || (int)tm->unique_id != gie_uid) continue;
+
+        for (unsigned int i = 0; i < tm->num_output_layers; i++) {
+            NvDsInferLayerInfo &li = tm->output_layers_info[i];
+            int total = 1;
+            for (unsigned int k = 0; k < li.inferDims.numDims; k++)
+                total *= li.inferDims.d[k];
+            int last = li.inferDims.numDims ?
+                li.inferDims.d[li.inferDims.numDims - 1] : 1;
+            if (last <= 0 || total <= 0) continue;
+            int anchors = total / last;
+            const float *buf = (const float *)tm->out_buf_ptrs_host[i];
+            if (!buf) continue;
+            if      (last == 1)  sc[anchors] = buf;
+            else if (last == 4)  bb[anchors] = buf;
+            else if (last == 10) kp[anchors] = buf;
         }
-        l = l->next;
     }
-    return false;
+
+    const int strides[] = {8, 16, 32};
+    std::vector<DecodedFace> all;
+    for (int stride : strides) {
+        int feat = net_w / stride;
+        int anchors = feat * feat * DECODE_NUM_ANCHORS;
+        auto sit = sc.find(anchors);
+        auto bit = bb.find(anchors);
+        auto kit = kp.find(anchors);
+        if (sit == sc.end() || bit == bb.end() || kit == kp.end()) continue;
+        const float *S = sit->second, *B = bit->second, *K = kit->second;
+        for (int i = 0; i < anchors; i++) {
+            float s = S[i];
+            if (s < DECODE_CONF_THRESH) continue;
+            int loc = i / DECODE_NUM_ANCHORS;
+            int y = loc / feat, x = loc % feat;
+            float cx = x * stride, cy = y * stride;
+            DecodedFace d;
+            d.conf = s;
+            d.x1 = cx - B[i*4+0] * stride;
+            d.y1 = cy - B[i*4+1] * stride;
+            d.x2 = cx + B[i*4+2] * stride;
+            d.y2 = cy + B[i*4+3] * stride;
+            for (int p = 0; p < 5; p++) {
+                d.lm[p][0] = cx + K[i*10 + p*2 + 0] * stride;
+                d.lm[p][1] = cy + K[i*10 + p*2 + 1] * stride;
+            }
+            all.push_back(d);
+        }
+    }
+
+    // NMS sort-by-conf desc.
+    std::sort(all.begin(), all.end(),
+              [](const DecodedFace& a, const DecodedFace& b){
+                  return a.conf > b.conf;
+              });
+    std::vector<bool> sup(all.size(), false);
+    for (size_t i = 0; i < all.size(); i++) {
+        if (sup[i]) continue;
+        out.push_back(all[i]);
+        for (size_t j = i + 1; j < all.size(); j++)
+            if (!sup[j] && face_iou(all[i], all[j]) > DECODE_NMS_IOU)
+                sup[j] = true;
+    }
+}
+
+// Convert decoded face (network coords) → frame coords using SCRFD letterbox.
+static void net_to_frame_lm(const DecodedFace &d, int net_w, int net_h,
+                            int frame_w, int frame_h,
+                            float out_lm[5][2],
+                            float out_box[4]) {
+    float scale = std::min((float)net_w / frame_w, (float)net_h / frame_h);
+    float pad_x = (net_w - frame_w * scale) * 0.5f;
+    float pad_y = (net_h - frame_h * scale) * 0.5f;
+    out_box[0] = (d.x1 - pad_x) / scale;
+    out_box[1] = (d.y1 - pad_y) / scale;
+    out_box[2] = (d.x2 - pad_x) / scale;
+    out_box[3] = (d.y2 - pad_y) / scale;
+    for (int i = 0; i < 5; i++) {
+        out_lm[i][0] = (d.lm[i][0] - pad_x) / scale;
+        out_lm[i][1] = (d.lm[i][1] - pad_y) / scale;
+    }
+}
+
+// Find decoded face whose bbox best matches obj_meta's rect_params (frame
+// coords). Returns true + landmarks (frame coords, validated) on success.
+static bool match_landmarks_for_obj(const std::vector<DecodedFace> &faces,
+                                     int net_w, int net_h,
+                                     int frame_w, int frame_h,
+                                     const NvOSD_RectParams &rp,
+                                     float out_lm[5][2]) {
+    if (faces.empty()) return false;
+
+    float best_iou = 0.0f;
+    int   best_idx = -1;
+    float best_lm[5][2];
+
+    DecodedFace obj_box;
+    obj_box.x1 = rp.left;
+    obj_box.y1 = rp.top;
+    obj_box.x2 = rp.left + rp.width;
+    obj_box.y2 = rp.top + rp.height;
+
+    for (size_t i = 0; i < faces.size(); i++) {
+        float box[4];
+        float lm[5][2];
+        net_to_frame_lm(faces[i], net_w, net_h, frame_w, frame_h, lm, box);
+        DecodedFace fb; fb.x1 = box[0]; fb.y1 = box[1];
+                       fb.x2 = box[2]; fb.y2 = box[3];
+        float v = face_iou(obj_box, fb);
+        if (v > best_iou) {
+            best_iou = v;
+            best_idx = (int)i;
+            std::memcpy(best_lm, lm, sizeof(lm));
+        }
+    }
+    if (best_idx < 0 || best_iou < 0.3f) return false;
+
+    // Validate: finite + within frame ± margin.
+    for (int i = 0; i < 5; i++) {
+        float x = best_lm[i][0], y = best_lm[i][1];
+        if (!std::isfinite(x) || !std::isfinite(y)
+                || x < -LM_MARGIN_PX || x > frame_w + LM_MARGIN_PX
+                || y < -LM_MARGIN_PX || y > frame_h + LM_MARGIN_PX) {
+            return false;
+        }
+        out_lm[i][0] = x;
+        out_lm[i][1] = y;
+    }
+    return true;
+}
+
+static void detach_roi_object_meta(CustomTensorParams &tensorParam) {
+    // Gst-nvinfer's input-tensor-from-meta output path wraps tensor output
+    // in NVDS_ROI_META. Its ROI release function deletes roi.object_meta.
+    // nvdspreprocess object mode points roi.object_meta at the real
+    // NvDsObjectMeta owned by NvDsBatchMeta, so leaving it non-null causes
+    // invalid free/double-free. Keep ROI bbox/frame info, but drop this
+    // non-owning pointer before metadata is attached downstream.
+    for (auto &roi : tensorParam.seq_params.roi_vector) {
+        roi.object_meta = nullptr;
+    }
 }
 
 extern "C"
 CustomCtx *initLib(CustomInitParams initparams) {
     auto *ctx = new CustomCtx;
     std::memset(ctx, 0, sizeof(*ctx));
+    auto debug_it = initparams.user_configs.find("debug-zero-tensor");
+    if (debug_it != initparams.user_configs.end()) {
+        const std::string &v = debug_it->second;
+        ctx->debug_zero_tensor =
+            (v == "1" || v == "true" || v == "TRUE" || v == "yes");
+    }
+    auto detach_it = initparams.user_configs.find("detach-roi-object-meta");
+    if (detach_it != initparams.user_configs.end()) {
+        const std::string &v = detach_it->second;
+        ctx->detach_roi_object_meta =
+            (v == "1" || v == "true" || v == "TRUE" || v == "yes");
+    }
 
     cuInit(0);
 
@@ -267,7 +455,10 @@ CustomCtx *initLib(CustomInitParams initparams) {
     }
 
     printf("[face_align] initLib OK (NPP path active, "
-           "ARCFACE_REF 5-keypoint, 112x112 RGB float CHW)\n");
+           "ARCFACE_REF 5-keypoint, 112x112 RGB float CHW, "
+           "debug-zero-tensor=%d, detach-roi-object-meta=%d)\n",
+           ctx->debug_zero_tensor ? 1 : 0,
+           ctx->detach_roi_object_meta ? 1 : 0);
     return ctx;
 }
 
@@ -324,8 +515,17 @@ NvDsPreProcessStatus CustomTensorPreparation(CustomCtx *ctx,
     }
 
     size_t n_units = batch->units.size();
+    static int prep_call_no = 0;
+    int prep_my_call = ++prep_call_no;
+    if (prep_my_call <= 5 || prep_my_call % 60 == 0) {
+        std::printf("[face_align] prep #%d n_units=%zu\n",
+                    prep_my_call, n_units);
+        std::fflush(stdout);
+    }
     if (n_units == 0) {
         tensorParam.params.network_input_shape[0] = 0;
+        if (ctx->detach_roi_object_meta)
+            detach_roi_object_meta(tensorParam);
         return NVDSPREPROCESS_SUCCESS;
     }
     if (n_units > (size_t)MAX_BATCH) {
@@ -341,27 +541,96 @@ NvDsPreProcessStatus CustomTensorPreparation(CustomCtx *ctx,
     // emit some embedding; downstream filter by track_frames count).
     cudaMemsetAsync(tensor, 0, n_units * TENSOR_SLOT_FLOATS * sizeof(float),
                      ctx->stream);
+    if (ctx->debug_zero_tensor) {
+        cudaError_t cerr = cudaStreamSynchronize(ctx->stream);
+        if (cerr != cudaSuccess) {
+            printf("[face_align] streamSync err=%s\n",
+                   cudaGetErrorString(cerr));
+            acquirer->release(buf);
+            return NVDSPREPROCESS_CUDA_ERROR;
+        }
+        tensorParam.params.network_input_shape[0] = (int)n_units;
+        if (ctx->detach_roi_object_meta)
+            detach_roi_object_meta(tensorParam);
+        if (prep_my_call <= 5 || (++ctx->debug_call_count % 60) == 0) {
+            std::printf("[face_align] prep #%d zero-tensor debug: batch=%zu\n",
+                        prep_my_call, n_units);
+            std::fflush(stdout);
+        }
+        return NVDSPREPROCESS_SUCCESS;
+    }
 
     GstBuffer *cached_inbuf = nullptr;
     guint cached_batch_index = G_MAXUINT;
     int   n_aligned = 0;
     int   n_lm_missing = 0;
 
+    // Cache decoded faces per frame_meta (keyed by pointer) — decode 1 lần
+    // mỗi unique frame, share giữa các unit thuộc cùng frame.
+    std::map<NvDsFrameMeta*, std::vector<DecodedFace>> faces_by_frame;
+
     for (size_t i = 0; i < n_units; i++) {
         auto &unit = batch->units[i];
-        // process-on-frame=0 mode → framework populates unit.obj_meta. Skip
-        // unit nếu null thay vì rơi vào roi_meta.object_meta (có thể là object
-        // khác/stale → match landmark sai sang face khác).
-        if (!unit.obj_meta) {
+        NvDsObjectMeta *om = unit.roi_meta.object_meta;
+        NvDsFrameMeta  *fm = unit.frame_meta;
+        if (!om || !fm) {
             n_lm_missing++;
             continue;
         }
 
-        float lm[5][2];
-        if (!read_landmarks(unit.obj_meta, lm)) {
+        int frame_w = unit.input_surf_params ?
+            (int)unit.input_surf_params->width : 0;
+        int frame_h = unit.input_surf_params ?
+            (int)unit.input_surf_params->height : 0;
+        if (frame_w <= 0 || frame_h <= 0) {
             n_lm_missing++;
             continue;
         }
+
+        // Decode 9 raw tensors → faces (network coords); cache per frame.
+        auto it = faces_by_frame.find(fm);
+        if (it == faces_by_frame.end()) {
+            std::vector<DecodedFace> faces;
+            // gie-unique-id của face_det = 2 (xem face_det_config.txt).
+            decode_scrfd_from_frame(fm, /*gie_uid=*/2, NET_W, faces);
+            it = faces_by_frame.emplace(fm, std::move(faces)).first;
+            if (prep_my_call <= 5) {
+                std::printf("[face_align] prep #%d frame=%p decoded %zu "
+                            "faces\n", prep_my_call, (void*)fm,
+                            it->second.size());
+                std::fflush(stdout);
+            }
+        }
+
+        float lm[5][2];
+        if (!match_landmarks_for_obj(it->second, NET_W, NET_H,
+                                      frame_w, frame_h,
+                                      om->rect_params, lm)) {
+            if (prep_my_call <= 5) {
+                std::printf("[face_align] prep #%d unit[%zu] no IoU match "
+                            "(rect=%.0f,%.0f,%.0fx%.0f decoded=%zu)\n",
+                            prep_my_call, i,
+                            om->rect_params.left, om->rect_params.top,
+                            om->rect_params.width, om->rect_params.height,
+                            it->second.size());
+                std::fflush(stdout);
+            }
+            n_lm_missing++;
+            continue;
+        }
+        if (prep_my_call <= 5) {
+            std::printf("[face_align] prep #%d unit[%zu] lm0=(%.1f,%.1f) "
+                        "rect=(%.0f,%.0f,%.0fx%.0f)\n",
+                        prep_my_call, i, lm[0][0], lm[0][1],
+                        om->rect_params.left, om->rect_params.top,
+                        om->rect_params.width, om->rect_params.height);
+            std::fflush(stdout);
+        }
+
+        // DEBUG: bypass NV12→RGB + warp completely; chỉ test xem pipeline
+        // có ổn không khi face_align không đụng GPU. Tensor slot đã zero-fill.
+        n_aligned++;
+        continue;
 
         // 1) NV12 → RGB once per unique input frame.
         if (batch->inbuf != cached_inbuf ||
@@ -374,9 +643,26 @@ NvDsPreProcessStatus CustomTensorPreparation(CustomCtx *ctx,
         }
 
         // 2) Compute similarity 2x3 (forward map src→dst per NPP convention).
+        // Compute BACKWARD similarity (ARCFACE_REF → lm) cho nppiWarpAffineBack.
+        // Backward variant nhận thẳng map dst→src, không invert nội bộ — ổn
+        // định số hơn forward+invert (FORWARD scale ~0.35 × invert → coeffs
+        // lớn → kernel sample địa chỉ wild → cudaErrorIllegalAddress).
         double M[6];
         face_align::compute_similarity_2x3(
-            lm, face_align::ARCFACE_REF, M);
+            face_align::ARCFACE_REF, lm, M);
+        bool m_ok = true;
+        for (int k = 0; k < 6; k++) {
+            if (!std::isfinite(M[k])) { m_ok = false; break; }
+        }
+        if (!m_ok) {
+            if (prep_my_call <= 5) {
+                std::printf("[face_align] prep #%d unit[%zu] M has NaN/Inf — "
+                            "skip\n", prep_my_call, i);
+                std::fflush(stdout);
+            }
+            n_lm_missing++;
+            continue;
+        }
         const double coeffs[2][3] = {
             {M[0], M[1], M[2]},
             {M[3], M[4], M[5]},
@@ -387,7 +673,7 @@ NvDsPreProcessStatus CustomTensorPreparation(CustomCtx *ctx,
         NppiRect srcROI  = {0, 0, ctx->rgb_w, ctx->rgb_h};
         NppiRect dstROI  = {0, 0, FACE_W, FACE_H};
 
-        NppStatus s = nppiWarpAffine_8u_C3R_Ctx(
+        NppStatus s = nppiWarpAffineBack_8u_C3R_Ctx(
             ctx->rgb_buf, srcSize, ctx->rgb_w * 3, srcROI,
             ctx->warp_buf, FACE_W * 3, dstROI,
             coeffs, NPPI_INTER_LINEAR, ctx->npp_ctx);
@@ -436,10 +722,14 @@ NvDsPreProcessStatus CustomTensorPreparation(CustomCtx *ctx,
     }
 
     tensorParam.params.network_input_shape[0] = (int)n_units;
+    if (ctx->detach_roi_object_meta)
+        detach_roi_object_meta(tensorParam);
 
-    if ((++ctx->debug_call_count % 60) == 0) {
-        printf("[face_align] batch=%zu aligned=%d no_lm=%d (every 60 calls)\n",
-                n_units, n_aligned, n_lm_missing);
+    if (prep_my_call <= 5 || (++ctx->debug_call_count % 60) == 0) {
+        std::printf("[face_align] prep #%d done: batch=%zu aligned=%d "
+                    "no_lm=%d\n",
+                    prep_my_call, n_units, n_aligned, n_lm_missing);
+        std::fflush(stdout);
     }
     return NVDSPREPROCESS_SUCCESS;
 }
