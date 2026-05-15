@@ -406,6 +406,8 @@ class ParkingSystem:
         # 4) Process face result — tích lũy identity sớm (cả frame, batch)
         if faces_data:
             self.tracker.update_batch(faces_data)
+            result["face_bboxes"] = [(f["bbox"], f["conf"])
+                                     for f in faces_data]
             best = max(faces_data, key=lambda f: f["conf"])
             result["face_bbox"] = best["bbox"]
             result["face_conf"] = best["conf"]
@@ -493,6 +495,8 @@ class ParkingSystem:
         # Process face — tích lũy identity sớm (cả frame, batch)
         if faces_data:
             self.tracker.update_batch(faces_data)
+            result["face_bboxes"] = [(f["bbox"], f["conf"])
+                                     for f in faces_data]
             best = max(faces_data, key=lambda f: f["conf"])
             result["face_bbox"] = best["bbox"]
             if best["crop"] is not None:
@@ -605,22 +609,23 @@ class ParkingSystem:
         return vis
 
     def _annotate_face(self, frame, result):
-        if not result.get("face_bbox"):
+        bboxes = result.get("face_bboxes")
+        if not bboxes and not result.get("face_bbox"):
             return frame
+        if not bboxes:
+            bboxes = [(result["face_bbox"], result.get("face_conf", 0))]
+
         vis = frame.copy()
-        x1, y1, x2, y2 = result["face_bbox"]
         color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-        label = ""
-        if result.get("ok") and result.get("sim"):
-            label = f"MATCH {result['sim']:.2f}"
-        elif result.get("face_conf"):
-            label = f"face {result['face_conf']:.2f}"
-        if label:
-            cv2.rectangle(vis, (x1, y1-28), (x1+len(label)*12, y1),
+
+        for bbox, conf in bboxes:
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            label = f"face {conf:.2f}"
+            cv2.rectangle(vis, (x1, y1-22), (x1+len(label)*10, y1),
                           (0, 0, 0), -1)
-            cv2.putText(vis, label, (x1+4, y1-8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(vis, label, (x1+4, y1-6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         return vis
     
     def _web_update_loop(self, cam_plate, cam_face, interval: float = 0.1):
@@ -846,12 +851,18 @@ class ParkingSystem:
             x1, y1, x2, y2 = result["plate_bbox"]
             cv2.rectangle(p, (int(x1*sx), int(y1*sy)),
                           (int(x2*sx), int(y2*sy)), (0, 255, 0), 2)
-        if result.get("face_bbox"):
+        face_bboxes = result.get("face_bboxes") or (
+            [(result["face_bbox"], result.get("face_conf", 0))]
+            if result.get("face_bbox") else []
+        )
+        if face_bboxes:
             sx = f.shape[1] / ff.shape[1]
             sy = f.shape[0] / ff.shape[0]
-            x1, y1, x2, y2 = result["face_bbox"]
-            cv2.rectangle(f, (int(x1*sx), int(y1*sy)),
-                          (int(x2*sx), int(y2*sy)), (0, 255, 255), 2)
+            color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
+            for bbox, _conf in face_bboxes:
+                x1, y1, x2, y2 = bbox
+                cv2.rectangle(f, (int(x1*sx), int(y1*sy)),
+                              (int(x2*sx), int(y2*sy)), color, 2)
 
         color = (0, 255, 0) if result.get("ok") else (100, 100, 100)
         for img, label in [(p, "PLATE"), (f, "FACE")]:
