@@ -113,7 +113,6 @@ class ParkingDB:
                 CREATE TABLE IF NOT EXISTS active (
                     id SERIAL PRIMARY KEY,
                     plate TEXT NOT NULL,
-                    embedding vector({DIM}),
                     entry_time TIMESTAMP DEFAULT now(),
                     conf_plate REAL DEFAULT 0,
                     conf_face REAL DEFAULT 0
@@ -132,22 +131,14 @@ class ParkingDB:
             """)
 
             cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS active_face_embeddings (
+                CREATE TABLE IF NOT EXISTS active_faces (
                     id          SERIAL PRIMARY KEY,
                     active_id   INT NOT NULL
                                 REFERENCES active(id) ON DELETE CASCADE,
                     embedding   vector({DIM}) NOT NULL,
-                    quality     REAL,
-                    track_id    BIGINT,
-                    source_id   INT,
-                    created_at  TIMESTAMPTZ DEFAULT NOW()
+                    conf        REAL DEFAULT 0,
+                    quality     REAL DEFAULT 0
                 )
-            """)
-
-            # Existing schemas may have NOT NULL on active.embedding.
-            # Drop it so Phase 7+ entries can store embeddings only in afe.
-            cur.execute("""
-                ALTER TABLE active ALTER COLUMN embedding DROP NOT NULL
             """)
 
             # UNIQUE on plate. Older schemas had a non-unique idx_active_plate;
@@ -160,31 +151,13 @@ class ParkingDB:
             cur.execute("DROP INDEX IF EXISTS idx_active_plate")
 
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_afe_active
-                ON active_face_embeddings(active_id)
+                CREATE INDEX IF NOT EXISTS idx_active_faces_active_id
+                ON active_faces(active_id)
             """)
-
-            # IVFFlat index cho vector search trên active.embedding (legacy
-            # path / rollback). Plate-scoped match dùng JOIN trên afe nên
-            # không cần ivfflat trên afe.
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_active_embedding
-                ON active USING ivfflat (embedding vector_cosine_ops)
+                CREATE INDEX IF NOT EXISTS idx_active_faces_embedding
+                ON active_faces USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 22)
-            """)
-
-            # Backfill: cho mỗi active row có embedding nhưng chưa có afe row,
-            # copy 1 row sang afe. Idempotent qua NOT EXISTS.
-            cur.execute("""
-                INSERT INTO active_face_embeddings
-                    (active_id, embedding, quality)
-                SELECT a.id, a.embedding, a.conf_face
-                FROM active a
-                WHERE a.embedding IS NOT NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM active_face_embeddings afe
-                      WHERE afe.active_id = a.id
-                  )
             """)
 
     @staticmethod
@@ -214,20 +187,13 @@ class ParkingDB:
     def entry(self, plate: str, embeddings,
               conf_plate: float = 0, conf_face: float = 0,
               *,
-              qualities: Optional[list] = None,
-              track_ids: Optional[list] = None,
-              source_ids: Optional[list] = None) -> int:
+              qualities: Optional[list] = None) -> int:
         """
-        Đăng ký xe vào. Hỗ trợ N embeddings/xe (Phase 7).
+        Đăng ký xe vào. Hỗ trợ N embeddings/xe.
 
         Args:
             embeddings: np.ndarray (1 emb, back-compat) hoặc list[np.ndarray].
-            qualities, track_ids, source_ids: list song song với embeddings.
-                Nếu None → fill bằng (conf_face, None, None).
-
-        Side effects:
-            - INSERT 1 row vào `active`, embedding[0] giữ nguyên cho rollback.
-            - Bulk INSERT N rows vào `active_face_embeddings`.
+            qualities: list song song với embeddings. Nếu None → fill bằng conf_face.
 
         Returns: record_id > 0 | -1 (full) | -2 (duplicate plate)
         """
@@ -252,11 +218,8 @@ class ParkingDB:
 
         qual_list = qualities if qualities is not None \
             else [conf_face] * n
-        tid_list = track_ids if track_ids is not None else [None] * n
-        sid_list = source_ids if source_ids is not None else [None] * n
-        if not (len(qual_list) == len(tid_list) == len(sid_list) == n):
-            raise ValueError(
-                "qualities/track_ids/source_ids length mismatch")
+        if len(qual_list) != n:
+            raise ValueError("qualities length mismatch")
 
         with self._conn() as conn:
             cur = conn.cursor()
@@ -264,27 +227,26 @@ class ParkingDB:
             # Atomic duplicate-plate check: ON CONFLICT trên UNIQUE(plate)
             # tránh race giữa SELECT-then-INSERT khi 2 entry() đồng thời.
             cur.execute(
-                "INSERT INTO active (plate, embedding, conf_plate, conf_face) "
-                "VALUES (%s, %s, %s, %s) "
+                "INSERT INTO active (plate, conf_plate, conf_face) "
+                "VALUES (%s, %s, %s) "
                 "ON CONFLICT (plate) DO NOTHING "
                 "RETURNING id",
-                (plate, emb_lists[0], conf_plate, conf_face)
+                (plate, conf_plate, conf_face)
             )
             row = cur.fetchone()
             if row is None:
                 return -2
             rid = row[0]
 
-            # Bulk insert vào afe.
-            afe_rows = [
-                (rid, emb_lists[i], qual_list[i], tid_list[i], sid_list[i])
+            face_rows = [
+                (rid, emb_lists[i], conf_face, qual_list[i])
                 for i in range(n)
             ]
             cur.executemany(
-                "INSERT INTO active_face_embeddings "
-                "(active_id, embedding, quality, track_id, source_id) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                afe_rows
+                "INSERT INTO active_faces "
+                "(active_id, embedding, conf, quality) "
+                "VALUES (%s, %s, %s, %s)",
+                face_rows
             )
 
         # Cập nhật cache
@@ -310,12 +272,12 @@ class ParkingDB:
         with self._conn() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT a.id, a.plate, afe.embedding
+                SELECT a.id, a.plate, af.embedding
                 FROM active a
-                LEFT JOIN active_face_embeddings afe
-                    ON afe.active_id = a.id
+                LEFT JOIN active_faces af
+                    ON af.active_id = a.id
                 WHERE a.plate = %s
-                ORDER BY afe.id
+                ORDER BY af.id
             """, (plate,))
             rows = cur.fetchall()
 
@@ -354,13 +316,13 @@ class ParkingDB:
             cur = conn.cursor()
             cur.execute("""
                 SELECT a.id, a.plate,
-                       MIN(afe.embedding <=> %s::vector) AS dist,
-                       COUNT(afe.id) AS n
+                       MIN(af.embedding <=> %s::vector) AS dist,
+                       COUNT(af.id) AS n
                 FROM active a
-                JOIN active_face_embeddings afe ON afe.active_id = a.id
+                JOIN active_faces af ON af.active_id = a.id
                 WHERE a.plate = %s
                 GROUP BY a.id, a.plate
-                HAVING MIN(afe.embedding <=> %s::vector) <= %s
+                HAVING MIN(af.embedding <=> %s::vector) <= %s
                 LIMIT 1
             """, (emb_list, plate, emb_list, max_dist))
             row = cur.fetchone()

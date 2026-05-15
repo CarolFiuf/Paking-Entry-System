@@ -720,12 +720,11 @@ class ParkingSystem:
             self.plate_voter.clear()
             return result
 
-        tid = current_face.get("track_id") if current_face else None
         face_conf_for_db = current_q if current_q is not None else 0.0
 
         code = self.db.entry(
             stable, [current_emb], ocr_conf, face_conf_for_db,
-            qualities=[face_conf_for_db], track_ids=[tid],
+            qualities=[face_conf_for_db],
         )
         if code > 0:
             result["ok"] = True

@@ -19,10 +19,8 @@ model-color-format=0
 model-engine-file=/home/somethink/parking_system/models/face_det_scrfd_b1_fp16.engine
 onnx-file=/home/somethink/parking_system/models/face_det_scrfd_b1.onnx
 
-batch-size=2
-# 2 sources, nhưng face detection chỉ cần chạy meaningful trên src1.
-# nvinfer không support per-source batch trong DeepStream 7.1 mà không
-# nvstreamdemux/nvstreammux split — chấp nhận chạy thừa trên src0 (~3ms).
+batch-size=1
+# Split DeepStream mode: face detector chỉ nhận face camera.
 
 network-mode=2
 # 2=FP16

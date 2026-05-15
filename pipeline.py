@@ -2,21 +2,18 @@
 pipeline.py — Video Pipeline
 DeepStream GPU pipeline (nếu có pyds) hoặc fallback GStreamer + OpenCV.
 
-DeepStream chain (Phase 4+5):
-  src0(plate) → flvdemux → h264parse → nvv4l2dec → queue ─┐
-  src1(face)  → flvdemux → h264parse → nvv4l2dec →        │
-                nvvidconv(flip-method) → queue ───────────┴→
-                nvstreammux(batch=2) →
-                nvinfer(plate, uid=1) →
-                nvinfer(face_det,   uid=2, output-tensor-meta=1) →
-                nvconv → caps RGBA →
-                nvdsfaceembed(custom align + TensorRT ArcFace) →
-                fakesink (Probe B reads results)
+DeepStream chain (default split mode):
+  plate_src → decode → nvstreammux(batch=1) → nvinfer(plate, uid=1)
+            → nvconv RGBA → fakesink
 
-Probe B exports per source:
-  - source 0: plate frame + plate detections (uid=1)
-  - source 1: face frame + face data list (uid=2 obj +
-              embedding/landmarks when nvdsfaceembed succeeds)
+  face_src  → decode → nvstreammux(batch=1) → nvinfer(face_det, uid=2)
+            → nvconv RGBA → nvdsfaceembed(custom align + TensorRT ArcFace)
+            → fakesink
+
+Probe B exports:
+  - plate pipeline: plate frame + plate detections (uid=1)
+  - face pipeline: face frame + face data list (uid=2 obj +
+                   embedding/landmarks when nvdsfaceembed succeeds)
 
 Fallback mode (no pyds):
   RTMP → GStreamer NVDEC → OpenCV → Python inference (StreamReader class).
@@ -162,7 +159,7 @@ class DeepStreamPipeline:
             raise RuntimeError("DeepStream needs at least one enabled source")
 
         self._plate_source_id = 0
-        self._face_source_id = 1
+        self._face_source_id = 0
         self._plate_gie_uid = 1
         self._face_gie_uid = 2
 
@@ -219,8 +216,16 @@ class DeepStreamPipeline:
         self._dbg_obj_tensor_uids = {}
         self._dbg_emb_read_err = 0
         self._dbg_emb_null_ptr = 0
+        self._plate_pipeline = None
+        self._face_pipeline = None
+        self._pipelines = []
+        self._pgie_face = None
+        self._tracker = None
+        self._sgie_face = None
+        self._face_preproc = None
+        self._face_embedder = None
 
-        self._build_pipeline(plate_src, face_src)
+        self._build_split_pipelines(plate_src, face_src)
 
     @staticmethod
     def _register_local_plugins():
@@ -254,179 +259,169 @@ class DeepStreamPipeline:
             log.debug(f"Could not read face detector threshold: {e}")
         return default
 
-    def _build_pipeline(self, plate_src: str, face_src: str):
-        """Xây dựng DeepStream pipeline bằng element API (không parse_launch)."""
-
-        self._pipeline = Gst.Pipeline.new("parking-pipeline")
-        ds_cfg = self.cfg["deepstream"]
-        face_flip = int(self.cfg.get("camera", {}).get("face_rotate_nv", 0))
-
-        # ── Streammux ──
-        mux = self._make_element("nvstreammux", "mux")
-        highest_source_id = -1
-        if self._plate_enabled:
-            highest_source_id = max(highest_source_id, self._plate_source_id)
-        if self._face_enabled:
-            highest_source_id = max(highest_source_id, self._face_source_id)
-        batch_size = max(int(ds_cfg.get("batch_size", 2)),
-                         highest_source_id + 1)
+    @staticmethod
+    def _configure_mux(mux, batch_size: int = 1):
         mux.set_property("batch-size", batch_size)
         mux.set_property("width", 1280)
         mux.set_property("height", 720)
         mux.set_property("batched-push-timeout", 40000)
         mux.set_property("live-source", 1)
 
-        # ── Sources ──
+    def _attach_bus(self, pipeline):
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+
+    def _link_many(self, elements: list) -> bool:
+        for prev, elem in zip(elements, elements[1:]):
+            if not prev.link(elem):
+                log.error(f"Failed to link {prev.get_name()} → "
+                          f"{elem.get_name()}")
+                return False
+        return True
+
+    def _build_split_pipelines(self, plate_src: str, face_src: str):
+        """Build independent batch=1 plate and face DeepStream pipelines."""
         if self._plate_enabled:
-            self._add_rtmp_source(plate_src, source_id=self._plate_source_id,
-                                  mux=mux, name_prefix="plate",
-                                  flip_method=0)
+            self._build_plate_pipeline(plate_src)
         else:
-            log.info("Plate source disabled in DeepStream graph")
+            log.info("Plate pipeline disabled")
 
         if self._face_enabled:
-            self._add_rtmp_source(face_src, source_id=self._face_source_id,
-                                  mux=mux, name_prefix="face",
-                                  flip_method=face_flip)
+            self._build_face_pipeline(face_src)
         else:
-            log.info("Face source disabled in DeepStream graph")
+            log.info("Face pipeline disabled")
 
-        # ── PGIE plate detector ──
-        pgie_plate = None
-        if self._plate_enabled:
-            pgie_plate = self._make_element("nvinfer", "plate_det")
-            pgie_plate.set_property("config-file-path",
-                                    ds_cfg["plate_config"])
+        log.info("DeepStream split pipelines built "
+                 f"(plate={self._plate_enabled}, face={self._face_enabled}, "
+                 "batch=1+1)")
 
-        self._pgie_face = None
-        self._tracker = None
-        self._sgie_face = None
-        self._face_embedder = None
+    def _build_plate_pipeline(self, plate_src: str):
+        ds_cfg = self.cfg["deepstream"]
+        pipeline = Gst.Pipeline.new("parking-plate-pipeline")
+        self._plate_pipeline = pipeline
+        self._pipelines.append(pipeline)
 
+        mux = self._make_element("nvstreammux", "plate_mux", pipeline)
+        self._configure_mux(mux, 1)
+        self._add_rtmp_source(plate_src, source_id=self._plate_source_id,
+                              mux=mux, name_prefix="plate", flip_method=0,
+                              pipeline=pipeline)
+
+        pgie_plate = self._make_element("nvinfer", "plate_det", pipeline)
+        pgie_plate.set_property("config-file-path", ds_cfg["plate_config"])
+
+        nvconv = self._make_element("nvvideoconvert", "plate_nvconv_out",
+                                    pipeline)
+        capsfilter = self._make_element("capsfilter", "plate_caps_rgba",
+                                        pipeline)
+        capsfilter.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"))
+
+        sink = self._make_element("fakesink", "plate_sink", pipeline)
+        sink.set_property("sync", 0)
+        sink.set_property("async", 0)
+
+        self._link_many([mux, pgie_plate, nvconv, capsfilter, sink])
+        sink.get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BUFFER, self._probe_callback, "plate")
+        self._attach_bus(pipeline)
+        log.info("Plate pipeline: src → mux(batch=1) → plate_det → sink")
+
+    def _build_face_pipeline(self, face_src: str):
+        ds_cfg = self.cfg["deepstream"]
+        face_flip = int(self.cfg.get("camera", {}).get("face_rotate_nv", 0))
+
+        pipeline = Gst.Pipeline.new("parking-face-pipeline")
+        self._face_pipeline = pipeline
+        self._pipelines.append(pipeline)
+
+        mux = self._make_element("nvstreammux", "face_mux", pipeline)
+        self._configure_mux(mux, 1)
+        self._add_rtmp_source(face_src, source_id=self._face_source_id,
+                              mux=mux, name_prefix="face",
+                              flip_method=face_flip, pipeline=pipeline)
+
+        link_order = [mux]
         if self._face_chain and HAS_FACE_HELPERS:
-            # ── PGIE face detector (SCRFD) ──
-            pgie_face = self._make_element("nvinfer", "face_det")
+            pgie_face = self._make_element("nvinfer", "face_det", pipeline)
             pgie_face.set_property("config-file-path",
-                                    ds_cfg["face_det_config"])
+                                   ds_cfg["face_det_config"])
             self._pgie_face = pgie_face
+            link_order.append(pgie_face)
 
             if self._face_tracker_enabled:
-                tracker = self._make_element("nvtracker", "face_tracker")
-                tracker.set_property("ll-lib-file",
-                                      "/opt/nvidia/deepstream/deepstream/lib/"
-                                      "libnvds_nvmultiobjecttracker.so")
+                tracker = self._make_element("nvtracker", "face_tracker",
+                                             pipeline)
+                tracker.set_property(
+                    "ll-lib-file",
+                    "/opt/nvidia/deepstream/deepstream/lib/"
+                    "libnvds_nvmultiobjecttracker.so")
                 tracker.set_property("ll-config-file",
-                                      ds_cfg["tracker_config"])
-                tracker.set_property("tracker-width",  640)
+                                     ds_cfg["tracker_config"])
+                tracker.set_property("tracker-width", 640)
                 tracker.set_property("tracker-height", 384)
                 self._tracker = tracker
+                link_order.append(tracker)
 
-            if self._face_embed_backend in ("aligned_trt", "custom_trt"):
-                self._face_preproc = None
-                embedder = self._make_element(
-                    "nvdsfaceembed", "face_embed_aligned")
-                engine_path = ds_cfg.get(
-                    "face_embed_engine",
-                    "./models/face_embed_arcface_fp16.engine")
-                embedder.set_property("engine-file",
-                                      os.path.abspath(engine_path))
-                embedder.set_property("gpu-id", 0)
-                embedder.set_property("unique-id", 7)
-                embedder.set_property("face-gie-id", self._face_gie_uid)
-                embedder.set_property("source-id", self._face_source_id)
-                embedder.set_property(
-                    "batch-size", int(ds_cfg.get("face_embed_batch_size", 16)))
-                embedder.set_property(
-                    "align-on-gpu",
-                    bool(ds_cfg.get("face_embed_align_on_gpu", True)))
-                embedder.set_property(
-                    "allow-cpu-fallback",
-                    bool(ds_cfg.get("face_embed_allow_cpu_fallback", True)))
-                decode_thr = ds_cfg.get("face_embed_decode_conf_threshold")
-                if decode_thr is None:
-                    decode_thr = self._read_nvinfer_precluster_threshold(
-                        ds_cfg["face_det_config"], 0.50)
-                embedder.set_property("decode-conf-threshold",
-                                      float(decode_thr))
-                embedder.set_property("net-width", self._net_w)
-                embedder.set_property("net-height", self._net_w)
-                embedder.set_property("input-object-min-width", 32)
-                embedder.set_property("input-object-min-height", 32)
-                self._face_embedder = embedder
-                chain = "PGIE_face"
-                if self._tracker:
-                    chain += " → tracker"
-                chain += " → nvdsfaceembed(aligned TensorRT ArcFace)"
-                log.info(f"Face chain: {chain}")
-            elif self._face_align:
-                # ── nvdspreprocess: ArcFace alignment via custom lib ──
-                preproc = self._make_element(
-                    "nvdspreprocess", "face_preprocess")
+            if self._face_align:
+                preproc = self._make_element("nvdspreprocess",
+                                             "face_preprocess", pipeline)
                 preproc.set_property("config-file",
-                                      ds_cfg["face_preprocess_config"])
+                                     ds_cfg["face_preprocess_config"])
                 self._face_preproc = preproc
-
-                # ── SGIE face embedding (ArcFace) ──
-                sgie_face = self._make_element("nvinfer", "face_embed")
+                sgie_face = self._make_element("nvinfer", "face_embed",
+                                               pipeline)
                 sgie_face.set_property("config-file-path",
-                                        ds_cfg["face_embed_config"])
+                                       ds_cfg["face_embed_config"])
                 self._sgie_face = sgie_face
-
+                link_order += [preproc, sgie_face]
                 chain = "PGIE_face"
                 if self._tracker:
                     chain += " → tracker"
                 chain += " → nvdspreprocess(align) → SGIE_embed"
                 log.info(f"Face chain: {chain}")
+            elif self._face_embed_backend in ("aligned_trt", "custom_trt"):
+                chain = "PGIE_face"
+                if self._tracker:
+                    chain += " → tracker"
+                chain += " → nvdsfaceembed(aligned TensorRT ArcFace)"
+                log.info(f"Face chain: {chain}")
             else:
-                self._face_preproc = None
-                sgie_face = self._make_element("nvinfer", "face_embed")
+                sgie_face = self._make_element("nvinfer", "face_embed",
+                                               pipeline)
                 sgie_face.set_property("config-file-path",
-                                        ds_cfg["face_embed_config"])
+                                       ds_cfg["face_embed_config"])
                 self._sgie_face = sgie_face
+                link_order.append(sgie_face)
                 log.warning("face_align_enabled=false: SGIE_embed uses "
                             "nvinfer object crop/resize (no landmark align)")
         elif self._face_chain and not HAS_FACE_HELPERS:
             log.warning("face_chain_enabled=true nhưng face_meta_helpers "
                         "import fail — disable face chain")
 
-        # ── Output convert + sink ──
-        nvconv = self._make_element("nvvideoconvert", "nvconv_out")
-        capsfilter = self._make_element("capsfilter", "caps_rgba")
-        caps = Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA")
-        capsfilter.set_property("caps", caps)
+        nvconv = self._make_element("nvvideoconvert", "face_nvconv_out",
+                                    pipeline)
+        capsfilter = self._make_element("capsfilter", "face_caps_rgba",
+                                        pipeline)
+        capsfilter.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"))
+        link_order += [nvconv, capsfilter]
 
-        sink = self._make_element("fakesink", "sink")
+        if (self._face_chain and HAS_FACE_HELPERS and
+                self._face_embed_backend in ("aligned_trt", "custom_trt") and
+                not self._face_align):
+            embedder = self._make_face_embedder(pipeline, ds_cfg)
+            self._face_embedder = embedder
+            link_order.append(embedder)
+
+        sink = self._make_element("fakesink", "face_sink", pipeline)
         sink.set_property("sync", 0)
         sink.set_property("async", 0)
+        link_order.append(sink)
 
-        # ── Link chain:
-        #   mux → [plate_det] → [face_det → optional tracker/preprocess/sgie]
-        #       → nvconv → caps → sink
-        prev = mux
-        link_order = []
-        if pgie_plate is not None:
-            link_order.append(pgie_plate)
-        if self._pgie_face:
-            link_order.append(self._pgie_face)
-            if self._tracker:
-                link_order.append(self._tracker)
-            if self._face_preproc and self._sgie_face:
-                link_order += [self._face_preproc, self._sgie_face]
-            elif self._sgie_face:
-                link_order += [self._sgie_face]
-        link_order += [nvconv, capsfilter]
-        if self._face_embedder:
-            link_order += [self._face_embedder]
-        link_order += [sink]
-        for elem in link_order:
-            if not prev.link(elem):
-                log.error(f"Failed to link {prev.get_name()} → "
-                          f"{elem.get_name()}")
-                return
-            prev = elem
+        self._link_many(link_order)
 
-        # Only needed when a tracker is enabled; no-tracker mode already emits
-        # current detector boxes at the sink probe.
         if self._pgie_face and self._tracker:
             face_det_src_pad = self._pgie_face.get_static_pad("src")
             if face_det_src_pad:
@@ -434,32 +429,56 @@ class DeepStreamPipeline:
                     Gst.PadProbeType.BUFFER,
                     self._probe_face_detector_boxes, None)
 
-        # ── Probe B: cuối pipeline (sink pad) ──
-        sink_pad = sink.get_static_pad("sink")
-        sink_pad.add_probe(
-            Gst.PadProbeType.BUFFER, self._probe_callback, None)
+        sink.get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BUFFER, self._probe_callback, "face")
+        self._attach_bus(pipeline)
+        log.info("Face pipeline: src → mux(batch=1) → face_det → embed → sink")
 
-        # ── Bus watch ──
-        bus = self._pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self._on_bus_message)
+    def _make_face_embedder(self, pipeline, ds_cfg):
+        embedder = self._make_element("nvdsfaceembed", "face_embed_aligned",
+                                      pipeline)
+        engine_path = ds_cfg.get(
+            "face_embed_engine",
+            "./models/face_embed_arcface_fp16.engine")
+        embedder.set_property("engine-file", os.path.abspath(engine_path))
+        embedder.set_property("gpu-id", 0)
+        embedder.set_property("unique-id", 7)
+        embedder.set_property("face-gie-id", self._face_gie_uid)
+        embedder.set_property("source-id", self._face_source_id)
+        embedder.set_property(
+            "batch-size", int(ds_cfg.get("face_embed_batch_size", 16)))
+        embedder.set_property(
+            "align-on-gpu",
+            bool(ds_cfg.get("face_embed_align_on_gpu", True)))
+        embedder.set_property(
+            "allow-cpu-fallback",
+            bool(ds_cfg.get("face_embed_allow_cpu_fallback", True)))
+        decode_thr = ds_cfg.get("face_embed_decode_conf_threshold")
+        if decode_thr is None:
+            decode_thr = self._read_nvinfer_precluster_threshold(
+                ds_cfg["face_det_config"], 0.50)
+        embedder.set_property("decode-conf-threshold", float(decode_thr))
+        embedder.set_property("net-width", self._net_w)
+        embedder.set_property("net-height", self._net_w)
+        embedder.set_property("input-object-min-width", 32)
+        embedder.set_property("input-object-min-height", 32)
+        return embedder
 
-        log.info("DeepStream pipeline built "
-                 f"(plate={self._plate_enabled}, face={self._face_enabled}, "
-                 f"batch={batch_size})")
-
-    def _make_element(self, factory: str, name: str):
+    def _make_element(self, factory: str, name: str, pipeline=None):
         """Tạo GStreamer element, add vào pipeline."""
         elem = Gst.ElementFactory.make(factory, name)
         if not elem:
             raise RuntimeError(
                 f"Cannot create element: {factory} ({name}). "
                 f"Plugin missing? Try: gst-inspect-1.0 {factory}")
-        self._pipeline.add(elem)
+        if pipeline is None:
+            raise RuntimeError(f"No target pipeline for element {name}")
+        pipeline.add(elem)
         return elem
 
     def _add_rtmp_source(self, rtmp_url: str, source_id: int,
-                         mux, name_prefix: str, flip_method: int = 0):
+                         mux, name_prefix: str, flip_method: int = 0,
+                         pipeline=None):
         """
         Thêm 1 RTMP source vào pipeline.
 
@@ -470,16 +489,18 @@ class DeepStreamPipeline:
           0=none, 1=90CCW, 2=180, 3=90CW, 4=horiz, 6=vert
           Áp dụng per-source ingress để rotate face cam mà không demux/remux.
         """
-        src = self._make_element("rtmpsrc", f"{name_prefix}_src")
+        src = self._make_element("rtmpsrc", f"{name_prefix}_src", pipeline)
         src.set_property("location", rtmp_url)
         src.set_property("timeout", 10)
 
-        demux = self._make_element("flvdemux", f"{name_prefix}_demux")
-        parse = self._make_element("h264parse", f"{name_prefix}_parse")
+        demux = self._make_element("flvdemux", f"{name_prefix}_demux",
+                                   pipeline)
+        parse = self._make_element("h264parse", f"{name_prefix}_parse",
+                                   pipeline)
         decoder = self._make_element("nvv4l2decoder",
-                                     f"{name_prefix}_decoder")
+                                     f"{name_prefix}_decoder", pipeline)
 
-        queue = self._make_element("queue", f"{name_prefix}_queue")
+        queue = self._make_element("queue", f"{name_prefix}_queue", pipeline)
         queue.set_property("max-size-buffers", 5)
         queue.set_property("leaky", 2)
 
@@ -492,7 +513,7 @@ class DeepStreamPipeline:
         # Optional flip per source
         if flip_method != 0:
             flip = self._make_element("nvvideoconvert",
-                                       f"{name_prefix}_flip")
+                                       f"{name_prefix}_flip", pipeline)
             flip.set_property("flip-method", flip_method)
             if not decoder.link(flip):
                 log.error(f"Failed to link {name_prefix}_decoder → flip")
@@ -620,6 +641,7 @@ class DeepStreamPipeline:
         buf = info.get_buffer()
         if not buf:
             return Gst.PadProbeReturn.OK
+        stream_kind = user_data
 
         # FPS đo stream thật (mọi batch)
         self._probe_count += 1
@@ -644,6 +666,12 @@ class DeepStreamPipeline:
                 break
 
             source_id = frame_meta.source_id
+            is_plate_frame = (
+                stream_kind == "plate" or
+                (stream_kind is None and source_id == self._plate_source_id))
+            is_face_frame = (
+                stream_kind == "face" or
+                (stream_kind is None and source_id == self._face_source_id))
 
             surface = pyds.get_nvds_buf_surface(hash(buf),
                                                 frame_meta.batch_id)
@@ -655,11 +683,11 @@ class DeepStreamPipeline:
             detector_face_data = (
                 self._consume_face_detector_boxes(
                     source_id, frame_meta.frame_num)
-                if source_id == self._face_source_id else []
+                if is_face_frame else []
             )
             roi_embeddings = (
                 self._extract_face_roi_embeddings(frame_meta)
-                if source_id == self._face_source_id else []
+                if is_face_frame else []
             )
             total_obj = 0
             uid2_post = 0
@@ -677,14 +705,12 @@ class DeepStreamPipeline:
                         int(rect.left + rect.width),
                         int(rect.top + rect.height))
 
-                if (source_id == self._plate_source_id
-                        and uid == self._plate_gie_uid):
+                if is_plate_frame and uid == self._plate_gie_uid:
                     plate_dets.append({
                         "bbox": bbox,
                         "conf": float(obj_meta.confidence),
                     })
-                elif (source_id == self._face_source_id
-                        and uid == self._face_gie_uid):
+                elif is_face_frame and uid == self._face_gie_uid:
                     uid2_post += 1
                     fd = self._extract_face_meta(
                         obj_meta, bbox, roi_embeddings, frame.shape)
@@ -697,19 +723,19 @@ class DeepStreamPipeline:
                     break
 
             with self._lock:
-                if source_id == self._plate_source_id:
+                if is_plate_frame:
                     self._plate_frame = frame
                     self._plate_detections = plate_dets
                     self._frame_seq += 1
                     self._frame_event.set()
-                elif source_id == self._face_source_id:
+                elif is_face_frame:
                     self._face_frame = frame
                     self._face_data = detector_face_data + face_data
                     self._frame_seq += 1
                     self._frame_event.set()
 
             # Debug stats
-            if source_id == self._face_source_id:
+            if is_face_frame:
                 self._dbg_n_face_frames += 1
                 self._dbg_n_face_all_obj += total_obj
                 self._dbg_n_face_uid2 += uid2_post
@@ -1074,9 +1100,10 @@ class DeepStreamPipeline:
             src = message.src.get_name() if message.src else "?"
             log.warning(f"GST WARN [{src}]: {warn.message}")
         elif t == Gst.MessageType.STATE_CHANGED:
-            if message.src == self._pipeline:
+            if message.src in self._pipelines:
                 old, new, pending = message.parse_state_changed()
-                log.info(f"Pipeline state: {old.value_nick} → "
+                src = message.src.get_name() if message.src else "pipeline"
+                log.info(f"{src} state: {old.value_nick} → "
                          f"{new.value_nick}")
         elif t == Gst.MessageType.STREAM_START:
             src = message.src.get_name() if message.src else "?"
@@ -1086,14 +1113,15 @@ class DeepStreamPipeline:
 
     def start(self):
         """Start pipeline."""
-        ret = self._pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            log.error("Failed to set pipeline to PLAYING")
-            # Log chi tiết
-            ret2 = self._pipeline.get_state(5 * Gst.SECOND)
-            log.error(f"Pipeline state: {ret2}")
-        else:
-            log.info(f"Pipeline set_state → PLAYING (ret={ret})")
+        for pipeline in self._pipelines:
+            ret = pipeline.set_state(Gst.State.PLAYING)
+            name = pipeline.get_name()
+            if ret == Gst.StateChangeReturn.FAILURE:
+                log.error(f"{name}: failed to set PLAYING")
+                ret2 = pipeline.get_state(5 * Gst.SECOND)
+                log.error(f"{name}: state={ret2}")
+            else:
+                log.info(f"{name} set_state → PLAYING (ret={ret})")
 
         # GLib main loop trên thread riêng (cần cho bus messages)
         self._loop = GLib.MainLoop()
@@ -1124,7 +1152,8 @@ class DeepStreamPipeline:
 
     def stop(self):
         self._stop.set()
-        self._pipeline.set_state(Gst.State.NULL)
+        for pipeline in self._pipelines:
+            pipeline.set_state(Gst.State.NULL)
         if hasattr(self, "_loop"):
             self._loop.quit()
         log.info("DeepStream pipeline stopped")

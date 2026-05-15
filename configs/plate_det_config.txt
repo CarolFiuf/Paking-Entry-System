@@ -22,8 +22,8 @@ model-engine-file=/home/somethink/parking_system/models/plate_yolov8n.engine
 onnx-file=/home/somethink/parking_system/models/plate_yolov8n.onnx
 # model-engine-file=./models/plate_yolov8n.engine
 
-batch-size=2
-# 2 sources trong pipeline
+batch-size=1
+# Split DeepStream mode: plate detector chỉ nhận plate camera.
 
 network-mode=2
 # 0=FP32, 1=INT8, 2=FP16

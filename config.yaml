@@ -40,7 +40,6 @@ deepstream:
   face_det_config: "./configs/face_det_config.txt"
   face_embed_config: "./configs/face_embed_config.txt"
   tracker_config: "./configs/tracker_nvdcf.yml"
-  batch_size: 2
   # Legacy/debug only: nvdspreprocess → nvinfer path can double-free ROI meta.
   face_align_enabled: false
   face_preprocess_config: "./configs/face_preprocess_config.txt"
