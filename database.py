@@ -95,20 +95,30 @@ class ParkingDB:
             self._pool.putconn(conn)
 
     def _init_schema(self):
-        """Tạo tables + pgvector extension."""
+        """Tạo tables + pgvector extension. Idempotent + migrate schema cũ."""
         with self._conn() as conn:
             cur = conn.cursor()
 
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
-            cur.execute(f"""
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS active (
                     id SERIAL PRIMARY KEY,
                     plate TEXT NOT NULL,
-                    embedding vector({DIM}) NOT NULL,
                     entry_time TIMESTAMP DEFAULT now(),
                     conf_plate REAL DEFAULT 0,
                     conf_face REAL DEFAULT 0
+                )
+            """)
+
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS active_faces (
+                    id SERIAL PRIMARY KEY,
+                    active_id INTEGER NOT NULL
+                        REFERENCES active(id) ON DELETE CASCADE,
+                    embedding vector({DIM}) NOT NULL,
+                    conf REAL DEFAULT 0,
+                    quality REAL DEFAULT 0
                 )
             """)
 
@@ -123,20 +133,39 @@ class ParkingDB:
                 )
             """)
 
-            # Index cho plate lookup (duplicate check)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_active_plate
                 ON active(plate)
             """)
 
-            # IVFFlat index cho vector search
-            # lists = sqrt(N) ~ 22 cho 500 records
-            # Nếu < 100 records, sequential scan nhanh hơn → Postgres tự chọn
-            cur.execute(f"""
-                CREATE INDEX IF NOT EXISTS idx_active_embedding
-                ON active USING ivfflat (embedding vector_cosine_ops)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_active_faces_active_id
+                ON active_faces(active_id)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_active_faces_embedding
+                ON active_faces USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 22)
             """)
+
+            # Migrate schema cũ: nếu active.embedding còn tồn tại thì chuyển
+            # dữ liệu sang active_faces rồi drop column.
+            cur.execute("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'active' AND column_name = 'embedding'
+            """)
+            if cur.fetchone():
+                cur.execute("""
+                    INSERT INTO active_faces (active_id, embedding, conf, quality)
+                    SELECT id, embedding, conf_face, 1.0 FROM active
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM active_faces
+                        WHERE active_faces.active_id = active.id
+                    )
+                """)
+                cur.execute("ALTER TABLE active DROP COLUMN embedding")
+                log.info("Migrated active.embedding → active_faces")
 
     @staticmethod
     def _parse_embedding(raw) -> np.ndarray:
@@ -162,31 +191,45 @@ class ParkingDB:
         return emb
 
     # ── ENTRY ──
-    def entry(self, plate: str, embedding: np.ndarray,
-              conf_plate: float = 0, conf_face: float = 0) -> int:
+    def entry(self, plate: str, slots: list,
+              conf_plate: float = 0) -> int:
         """
-        Đăng ký xe vào.
-        Returns: record_id > 0 | -1 (full) | -2 (duplicate plate)
+        Đăng ký xe vào với N identity slot (1 ≤ N ≤ MAX_SLOTS).
+        slots: list[dict] với keys {embedding, conf, quality}.
+        Returns: record_id > 0 | -1 (full) | -2 (duplicate plate) | -3 (no slot)
         """
+        if not slots:
+            return -3
         if self._stats_cache["current"] >= self.max_cap:
             return -1
 
-        emb_list = embedding.astype(np.float32).tolist()
+        max_face_conf = max(float(s.get("conf", 0)) for s in slots)
 
         with self._conn() as conn:
             cur = conn.cursor()
 
-            # Check trùng biển số
             cur.execute("SELECT 1 FROM active WHERE plate = %s", (plate,))
             if cur.fetchone():
                 return -2
 
             cur.execute(
-                "INSERT INTO active (plate, embedding, conf_plate, conf_face) "
-                "VALUES (%s, %s, %s, %s) RETURNING id",
-                (plate, emb_list, conf_plate, conf_face)
+                "INSERT INTO active (plate, conf_plate, conf_face) "
+                "VALUES (%s, %s, %s) RETURNING id",
+                (plate, conf_plate, max_face_conf)
             )
             rid = cur.fetchone()[0]
+
+            for s in slots:
+                emb_list = np.asarray(s["embedding"],
+                                      dtype=np.float32).tolist()
+                cur.execute(
+                    "INSERT INTO active_faces "
+                    "(active_id, embedding, conf, quality) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (rid, emb_list,
+                     float(s.get("conf", 0)),
+                     float(s.get("quality", 0)))
+                )
 
         # Cập nhật cache
         with self._stats_lock:
@@ -194,45 +237,49 @@ class ParkingDB:
             self._stats_cache["pct"] = round(
             100 * self._stats_cache["current"] / max(self.max_cap, 1), 1)
 
-        log.info(f"ENTRY: {plate} (id={rid}, "
+        log.info(f"ENTRY: {plate} (id={rid}, slots={len(slots)}, "
                  f"total={self._stats_cache['current']})")
         return rid
 
     # ── EXIT: plate lookup + face verify ──
     def find_by_plate(self, plate: str) -> Optional[dict]:
-        """Tìm xe trong bảng active theo biển số, trả về id + embedding."""
+        """Tìm xe trong bảng active theo biển số, trả về id + list embedding."""
         with self._conn() as conn:
             cur = conn.cursor()
-            cur.execute(
-                "SELECT id, plate, embedding FROM active WHERE plate = %s",
-                (plate,))
-            row = cur.fetchone()
+            cur.execute("""
+                SELECT a.id, af.embedding
+                FROM active a
+                JOIN active_faces af ON af.active_id = a.id
+                WHERE a.plate = %s
+            """, (plate,))
+            rows = cur.fetchall()
 
-        if not row:
+        if not rows:
             return None
 
-        rid, plate, emb_raw = row
-        embedding = self._parse_embedding(emb_raw)
-        return {"id": rid, "plate": plate, "embedding": embedding}
+        rid = rows[0][0]
+        embeddings = [self._parse_embedding(r[1]) for r in rows]
+        return {"id": rid, "plate": plate, "embeddings": embeddings}
 
     def match_exit(self, embedding: np.ndarray,
                    threshold: float = 0.45) -> Optional[dict]:
         """
-        Cosine similarity search bằng pgvector.
-        1 - (embedding <=> query) = cosine similarity
-        <=> là cosine distance operator của pgvector
+        Cosine similarity search bằng pgvector qua bảng active_faces.
+        Mỗi xe có thể có nhiều embedding → group theo active_id, lấy max.
         """
         emb_list = embedding.astype(np.float32).tolist()
 
         with self._conn() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT id, plate,
-                       1 - (embedding <=> %s::vector) AS similarity
-                FROM active
-                ORDER BY embedding <=> %s::vector
+                SELECT a.id, a.plate,
+                       MAX(1 - (af.embedding <=> %s::vector)) AS similarity
+                FROM active a
+                JOIN active_faces af ON af.active_id = a.id
+                GROUP BY a.id, a.plate
+                ORDER BY similarity DESC
                 LIMIT 3
-            """, (emb_list, emb_list))
+            """, (emb_list,))
 
             rows = cur.fetchall()
 

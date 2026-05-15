@@ -49,9 +49,12 @@ face:
   blur_threshold: 10.0   
 
 recognition:
-  face_threshold: 0.3
+  face_threshold: 0.6
   plate_vote_frames: 5
-  face_avg_frames: 3
+  max_identities: 3
+  identity_split_thr: 0.6
+  min_seed_quality: 0.3
+  identity_min_hits: 2
   plate_regex: "^\\d{2}[A-Z]\\d?-?\\d{3,5}\\.?\\d{0,2}$"
 
 database:

@@ -47,8 +47,8 @@ def enforce_plate_format(text: str) -> str:
                 chars[i] = _LETTER_TO_DIGIT.get(chars[i], chars[i])
     # Tối đa 6 số liên tiếp tính từ cuối (format dài nhất: XXYN-NNNNN = 6 số đuôi).
     # Nếu char thứ 7 từ cuối lên vẫn là digit → ép thành letter (vị trí kỳ vọng là chữ).
-    if len(chars) >= 7 and chars[-7].isdigit():
-        chars[-7] = _DIGIT_TO_LETTER.get(chars[-7], chars[-7])
+    # if len(chars) >= 7 and chars[-7].isdigit():
+    #     chars[-7] = _DIGIT_TO_LETTER.get(chars[-7], chars[-7])
     return ''.join(chars)
 
 
@@ -376,7 +376,7 @@ class FaceEngine:
         } for f in faces]
 
     @staticmethod
-    def quality(frame, bbox, blur_thr=35.0):
+    def quality(frame, bbox, conf=1.0, blur_thr=35.0):
         """
         Gộp gate + score: 1 crop, 1 cvtColor, 1 Laplacian, 1 mean.
         Returns: (ok, score)
@@ -396,6 +396,7 @@ class FaceEngine:
 
         log.info(f"FACE QUALITY: blur={blur:.1f} (thr={blur_thr}) "
                  f"brightness={brightness:.1f} size={crop.shape[1]}x{crop.shape[0]} "
+                 f"conf={conf:.2f} "
                  f"→ {'OK' if ok else 'FAIL'}"
                  f"{' [TOO_BLURRY]' if blur < blur_thr else ''}"
                  f"{' [TOO_DARK]' if brightness <= 30 else ''}"
@@ -407,5 +408,9 @@ class FaceEngine:
         blur_score = min(blur / 500.0, 1.0)
         bright_score = 1.0 - abs(brightness - 128) / 128.0
         size_score = min((x2 - x1) * (y2 - y1) / 20000.0, 1.0)
-        score = blur_score * 0.5 + bright_score * 0.2 + size_score * 0.3
+        conf_score = float(min(max(conf, 0.0), 1.0))
+        score = (blur_score   * 0.4
+                 + bright_score * 0.15
+                 + size_score   * 0.25
+                 + conf_score   * 0.2)
         return True, score
