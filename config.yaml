@@ -29,6 +29,11 @@ deepstream:
   face_embed_batch_size: 16
   face_embed_align_on_gpu: true
   face_embed_allow_cpu_fallback: true
+  # nvdsfaceembed v2+: plugin tự tính blur+brightness quality. Set 0.0 để
+  # disable plugin-side skip (vẫn fill meta.quality nếu < min_quality).
+  face_embed_min_quality: 0.0
+  # Bật log thống kê probe mỗi 5s (face_frames/dets/emb/err).
+  debug_probe: true
 
 plate_detector:
   model: "./models/plate_yolov8n.pt"
@@ -54,13 +59,17 @@ face:
   model_pack: "buffalo_sc"
   det_size: [640, 640]
   blur_threshold: 10.0
-  min_quality: 0.4                   # per-frame quality gate
-  embedding_hold_frames: 30          # reuse latest embedding while same face bbox visible
+  min_quality: 0.3                   # per-frame quality gate (fallback path)
 
 recognition:
   face_threshold: 0.3
   plate_vote_frames: 5
-  face_avg_frames: 3
+  # IdentityTracker (multi-slot, mutual-exclusion).
+  max_identities: 3                  # xe chở 2 người + dự phòng
+  identity_split_thr: 0.45           # cos sim ngưỡng cùng identity
+  min_seed_quality: 0.3              # quality min để seed slot mới
+  identity_min_hits: 2               # số frame min trước khi slot được commit
+  identity_iou_bridge: 0.5           # IoU bridge khi pose change làm sim thấp
   plate_regex: "^\\d{2}[A-Z]\\d?-?\\d{3,5}\\.?\\d{0,2}$"
 
 database:

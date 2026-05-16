@@ -28,6 +28,9 @@ extern "C" cudaError_t launch_face_align_rgba_chw_kernel(
     const uint8_t *rgba, int src_w, int src_h, int src_pitch, float *dst,
     int slot, const double coeffs[6], cudaStream_t stream);
 
+extern "C" cudaError_t launch_face_quality_kernel(
+    const float *aligned, float *out, int batch_size, cudaStream_t stream);
+
 #define PACKAGE "nvdsfaceembed"
 #define VERSION "1.0"
 #define LICENSE "Proprietary"
@@ -74,6 +77,11 @@ struct _GstNvDsFaceEmbed {
     float *trt_input_dev;
     float *trt_output_dev;
     float *trt_output_host;
+    // Quality output: 2 float/face [blur_var, mean_brightness], thang [0,255].
+    float *quality_dev;
+    float *quality_host;
+    gfloat min_quality;
+    gfloat blur_threshold;
 
     nvinfer1::IRuntime *runtime;
     nvinfer1::ICudaEngine *engine;
@@ -136,7 +144,9 @@ enum {
     PROP_DEBUG_INTERVAL,
     PROP_DECODE_CONF_THRESHOLD,
     PROP_ALIGN_ON_GPU,
-    PROP_ALLOW_CPU_FALLBACK
+    PROP_ALLOW_CPU_FALLBACK,
+    PROP_MIN_QUALITY,
+    PROP_BLUR_THRESHOLD
 };
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
@@ -429,12 +439,28 @@ static void face_embed_meta_release(gpointer data, gpointer user_data) {
     }
 }
 
+// Quality score [0, 1] gộp từ Laplacian variance, mean brightness, bbox area.
+// Match công thức Python FaceEngine.quality để Python/Plugin đồng nhất.
+static float compute_quality_score(float blur_var, float mean,
+                                   float bbox_w, float bbox_h,
+                                   float blur_thr) {
+    if (!std::isfinite(blur_var) || !std::isfinite(mean)) return 0.0f;
+    if (blur_var < blur_thr) return 0.0f;
+    if (mean <= 30.0f || mean >= 230.0f) return 0.0f;
+    float blur_s = std::min(blur_var / 500.0f, 1.0f);
+    float bright_s = 1.0f - std::fabs(mean - 128.0f) / 128.0f;
+    float area = std::max(0.0f, bbox_w) * std::max(0.0f, bbox_h);
+    float size_s = std::min(area / 20000.0f, 1.0f);
+    return blur_s * 0.5f + bright_s * 0.2f + size_s * 0.3f;
+}
+
 static void attach_embedding_meta(GstNvDsFaceEmbed *self,
                                   NvDsBatchMeta *batch_meta,
                                   NvDsObjectMeta *obj_meta,
                                   const float *embedding,
                                   const float lm[5][2],
-                                  const float bbox[4]) {
+                                  const float bbox[4],
+                                  float quality) {
     if (!batch_meta || !obj_meta || !embedding) return;
 
     auto *payload = (ParkingFaceEmbeddingMeta *)g_malloc0(
@@ -457,6 +483,7 @@ static void attach_embedding_meta(GstNvDsFaceEmbed *self,
     for (int i = 0; i < 4; i++) {
         payload->bbox[i] = bbox[i];
     }
+    payload->quality = quality;
 
     NvDsUserMeta *um = nvds_acquire_user_meta_from_pool(batch_meta);
     if (!um) {
@@ -582,6 +609,15 @@ static gboolean gst_nvdsfaceembed_start(GstBaseTransform *btrans) {
                        (size_t)self->max_batch_size * FACE_TENSOR_FLOATS *
                            sizeof(float)) != cudaSuccess)
         return FALSE;
+    // 2 float/face: [blur_var, mean_brightness] thang [0,255].
+    if (cudaMalloc(&self->quality_dev,
+                   (size_t)self->max_batch_size * 2 *
+                       sizeof(float)) != cudaSuccess)
+        return FALSE;
+    if (cudaMallocHost(&self->quality_host,
+                       (size_t)self->max_batch_size * 2 *
+                           sizeof(float)) != cudaSuccess)
+        return FALSE;
 
     self->embed_meta_type = nvds_get_user_meta_type(
         (gchar *)PARKING_FACE_EMBED_META_DESC);
@@ -620,6 +656,14 @@ static gboolean gst_nvdsfaceembed_stop(GstBaseTransform *btrans) {
     if (self->trt_input_dev) {
         cudaFree(self->trt_input_dev);
         self->trt_input_dev = nullptr;
+    }
+    if (self->quality_host) {
+        cudaFreeHost(self->quality_host);
+        self->quality_host = nullptr;
+    }
+    if (self->quality_dev) {
+        cudaFree(self->quality_dev);
+        self->quality_dev = nullptr;
     }
     if (self->stream) {
         cudaStreamDestroy(self->stream);
@@ -686,13 +730,36 @@ static bool process_jobs_chunk_cpu(GstNvDsFaceEmbed *self,
         return false;
     }
 
+    err = launch_face_quality_kernel(self->trt_input_dev, self->quality_dev,
+                                     batch_size, self->stream);
+    if (err != cudaSuccess) {
+        GST_WARNING_OBJECT(self, "quality kernel failed: %s",
+                           cudaGetErrorString(err));
+        return false;
+    }
+    err = cudaMemcpyAsync(self->quality_host, self->quality_dev,
+                          (size_t)batch_size * 2 * sizeof(float),
+                          cudaMemcpyDeviceToHost, self->stream);
+    if (err != cudaSuccess) {
+        GST_WARNING_OBJECT(self, "quality memcpy failed: %s",
+                           cudaGetErrorString(err));
+        return false;
+    }
+
     if (!run_trt(self, batch_size)) return false;
 
     for (int i = 0; i < batch_size; i++) {
         const FaceJob &job = jobs[begin + i];
         const float *emb = self->trt_output_host + i * EMBED_DIMS;
+        float blur_var = self->quality_host[i * 2 + 0];
+        float mean_b   = self->quality_host[i * 2 + 1];
+        float bw = job.bbox[2] - job.bbox[0];
+        float bh = job.bbox[3] - job.bbox[1];
+        float quality = compute_quality_score(blur_var, mean_b, bw, bh,
+                                              self->blur_threshold);
+        if (quality < self->min_quality) continue;
         attach_embedding_meta(self, batch_meta, job.obj_meta, emb, job.lm,
-                              job.bbox);
+                              job.bbox, quality);
         self->stat_emb++;
         self->stat_cpu++;
     }
@@ -721,6 +788,28 @@ static bool process_jobs_chunk_gpu(GstNvDsFaceEmbed *self,
     }
 
     int batch_size = (int)(end - begin);
+    if (ok) {
+        cudaError_t err = launch_face_quality_kernel(self->trt_input_dev,
+                                                     self->quality_dev,
+                                                     batch_size,
+                                                     self->stream);
+        if (err != cudaSuccess) {
+            GST_WARNING_OBJECT(self, "quality kernel failed: %s",
+                               cudaGetErrorString(err));
+            ok = false;
+        }
+    }
+    if (ok) {
+        cudaError_t err = cudaMemcpyAsync(
+            self->quality_host, self->quality_dev,
+            (size_t)batch_size * 2 * sizeof(float),
+            cudaMemcpyDeviceToHost, self->stream);
+        if (err != cudaSuccess) {
+            GST_WARNING_OBJECT(self, "quality memcpy failed: %s",
+                               cudaGetErrorString(err));
+            ok = false;
+        }
+    }
     if (ok) ok = run_trt(self, batch_size);
 
     if (!ok) {
@@ -734,8 +823,15 @@ static bool process_jobs_chunk_gpu(GstNvDsFaceEmbed *self,
     for (int i = 0; i < batch_size; i++) {
         const FaceJob &job = jobs[begin + i];
         const float *emb = self->trt_output_host + i * EMBED_DIMS;
+        float blur_var = self->quality_host[i * 2 + 0];
+        float mean_b   = self->quality_host[i * 2 + 1];
+        float bw = job.bbox[2] - job.bbox[0];
+        float bh = job.bbox[3] - job.bbox[1];
+        float quality = compute_quality_score(blur_var, mean_b, bw, bh,
+                                              self->blur_threshold);
+        if (quality < self->min_quality) continue;
         attach_embedding_meta(self, batch_meta, job.obj_meta, emb, job.lm,
-                              job.bbox);
+                              job.bbox, quality);
         self->stat_emb++;
         self->stat_gpu++;
     }
@@ -914,6 +1010,12 @@ static void gst_nvdsfaceembed_set_property(GObject *object, guint prop_id,
         case PROP_ALLOW_CPU_FALLBACK:
             self->allow_cpu_fallback = g_value_get_boolean(value);
             break;
+        case PROP_MIN_QUALITY:
+            self->min_quality = (gfloat)g_value_get_double(value);
+            break;
+        case PROP_BLUR_THRESHOLD:
+            self->blur_threshold = (gfloat)g_value_get_double(value);
+            break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
             break;
@@ -967,6 +1069,12 @@ static void gst_nvdsfaceembed_get_property(GObject *object, guint prop_id,
         case PROP_ALLOW_CPU_FALLBACK:
             g_value_set_boolean(value, self->allow_cpu_fallback);
             break;
+        case PROP_MIN_QUALITY:
+            g_value_set_double(value, self->min_quality);
+            break;
+        case PROP_BLUR_THRESHOLD:
+            g_value_set_double(value, self->blur_threshold);
+            break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
             break;
@@ -997,6 +1105,10 @@ static void gst_nvdsfaceembed_init(GstNvDsFaceEmbed *self) {
     self->decode_conf_threshold = DEFAULT_DECODE_CONF_THRESH;
     self->align_on_gpu = TRUE;
     self->allow_cpu_fallback = TRUE;
+    // Default: vẫn attach mọi face (Python filter), không skip embedding nào.
+    self->min_quality = 0.0f;
+    // Match Python FaceEngine.quality.blur_thr default.
+    self->blur_threshold = 10.0f;
     self->engine_file = g_strdup(
         "/home/somethink/parking_system/models/face_embed_arcface_fp16.engine");
 }
@@ -1106,6 +1218,21 @@ static void gst_nvdsfaceembed_class_init(GstNvDsFaceEmbedClass *klass) {
                              TRUE,
                              (GParamFlags)(G_PARAM_READWRITE |
                                            G_PARAM_STATIC_STRINGS)));
+    g_object_class_install_property(
+        gobject_class, PROP_MIN_QUALITY,
+        g_param_spec_double("min-quality", "Min quality",
+                            "Skip attach embedding meta if computed quality "
+                            "score < this threshold (0..1). 0 = always attach.",
+                            0.0, 1.0, 0.0,
+                            (GParamFlags)(G_PARAM_READWRITE |
+                                          G_PARAM_STATIC_STRINGS)));
+    g_object_class_install_property(
+        gobject_class, PROP_BLUR_THRESHOLD,
+        g_param_spec_double("blur-threshold", "Blur threshold",
+                            "Minimum Laplacian variance to accept face (0..)",
+                            0.0, 10000.0, 10.0,
+                            (GParamFlags)(G_PARAM_READWRITE |
+                                          G_PARAM_STATIC_STRINGS)));
 
     gst_element_class_add_pad_template(
         element_class, gst_static_pad_template_get(&src_template));

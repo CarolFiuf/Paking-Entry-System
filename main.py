@@ -126,42 +126,153 @@ class PlateVoter:
         self._buf.clear()
 
 
-class EmbeddingAvg:
+class IdentityTracker:
     """
-    Weighted average by quality score.
-    Frame chất lượng cao (ít blur, sáng vừa, face to) được weight cao hơn.
+    Multi-identity tracker với mutual exclusion trong cùng frame: 2 face khác
+    nhau ⇒ 2 người khác nhau. Mỗi slot giữ embedding sample có quality cao
+    nhất từng thấy (best-of-N).
+
+    update_batch(faces) cho 1 frame:
+      A. Lọc face có quality.
+      B. Tính ma trận sim K×M (K face × M slot).
+      C. Greedy assignment theo sim giảm dần: mỗi slot ≤ 1 face/frame,
+         mỗi face ≤ 1 slot. Best-of-N replace.
+      D. Face chưa gán → seed slot mới, trừ khi giống slot đã claim
+         (cùng người bị double-detect).
+
+    Bridge bbox/IoU thay vai trò tracker visual khi face quay đi 1-2 frame:
+    nếu face có IoU cao với last_bbox của slot, vẫn được gán dù sim thấp.
     """
- 
-    def __init__(self, n=3):
-        self.n = n
-        self._buf = []  # list of (embedding, quality)
-        self._latest = None
 
-    def update(self, emb, quality=1.0):
-        self._buf.append((emb, max(quality, 0.01)))  # avoid zero weight
-        if len(self._buf) > self.n:
-            self._buf.pop(0)
+    def __init__(self, max_slots=3, split_thr=0.45,
+                 min_seed_quality=0.3, min_hits=2,
+                 iou_bridge=0.5):
+        self.max_slots = max_slots
+        self.split_thr = split_thr
+        self.min_seed_quality = min_seed_quality
+        self.min_hits = min_hits
+        self.iou_bridge = iou_bridge
+        self._slots = []  # list[dict{embedding, conf, quality, hits, bbox}]
 
-        # Weighted average
-        weights = np.array([q for _, q in self._buf])
-        weights = weights / weights.sum()
-        avg = sum(w * e for (e, _), w in zip(self._buf, weights))
-        n = np.linalg.norm(avg)
-        self._latest = avg / n if n > 0 else avg
-        return self._latest
+    @staticmethod
+    def _cos(a, b):
+        # Embedding đã L2-normalized ⇒ dot product = cosine.
+        return float(np.dot(a, b))
+
+    @staticmethod
+    def _iou(a, b):
+        if not a or not b:
+            return 0.0
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        return inter / (area_a + area_b - inter + 1e-6)
+
+    def update_batch(self, faces):
+        cand = [f for f in faces
+                if f.get("quality") is not None
+                and f.get("embedding") is not None]
+        if not cand:
+            return
+
+        cand_embs = [np.asarray(f["embedding"], dtype=np.float32)
+                     for f in cand]
+
+        # B. Sim matrix K×M
+        if self._slots:
+            sims = np.array([
+                [self._cos(e, s["embedding"]) for s in self._slots]
+                for e in cand_embs
+            ])
+        else:
+            sims = np.zeros((len(cand), 0))
+
+        # C. Greedy mutual-exclusion assignment theo similarity
+        claimed_face = set()
+        claimed_slot = set()
+        pairs = sorted(
+            ((float(sims[i, j]), i, j)
+             for i in range(len(cand)) for j in range(len(self._slots))),
+            reverse=True
+        )
+        for sim, i, j in pairs:
+            if sim < self.split_thr:
+                break
+            if i in claimed_face or j in claimed_slot:
+                continue
+            self._replace_if_better(j, cand[i], cand_embs[i])
+            claimed_face.add(i)
+            claimed_slot.add(j)
+
+        # C'. Bridge IoU cho face/slot chưa claim — vá khi face quay đi.
+        if self._slots:
+            for i, f in enumerate(cand):
+                if i in claimed_face:
+                    continue
+                best_iou = 0.0
+                best_j = -1
+                for j, slot in enumerate(self._slots):
+                    if j in claimed_slot:
+                        continue
+                    iou = self._iou(f.get("bbox"), slot.get("bbox"))
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_j = j
+                if best_j >= 0 and best_iou >= self.iou_bridge:
+                    self._replace_if_better(best_j, f, cand_embs[i])
+                    claimed_face.add(i)
+                    claimed_slot.add(best_j)
+
+        # D. Seed face chưa gán
+        for i, f in enumerate(cand):
+            if i in claimed_face:
+                continue
+            if claimed_slot and any(
+                    float(sims[i, j]) >= self.split_thr
+                    for j in claimed_slot):
+                continue
+            if (len(self._slots) < self.max_slots
+                    and f["quality"] >= self.min_seed_quality):
+                self._slots.append({
+                    "embedding": cand_embs[i],
+                    "conf": float(f["conf"]),
+                    "quality": float(f["quality"]),
+                    "bbox": f.get("bbox"),
+                    "hits": 1,
+                })
+
+    def _replace_if_better(self, slot_idx, face, emb):
+        slot = self._slots[slot_idx]
+        slot["hits"] += 1
+        slot["bbox"] = face.get("bbox") or slot["bbox"]
+        if face["quality"] > slot["quality"]:
+            slot["embedding"] = emb
+            slot["conf"] = float(face["conf"])
+            slot["quality"] = float(face["quality"])
+
+    def committed(self):
+        """Slot đủ điều kiện commit (hits ≥ min_hits)."""
+        return [s for s in self._slots if s["hits"] >= self.min_hits]
+
+    def best_committed(self):
+        """Slot quality cao nhất trong committed, dùng cho display + exit query."""
+        c = self.committed()
+        return max(c, key=lambda s: s["quality"]) if c else None
 
     @property
     def ready(self):
-        return self._latest is not None
+        return any(s["hits"] >= self.min_hits for s in self._slots)
 
     @property
-    def _latest_quality(self):
-        """Max quality trong buf — đại diện cho 'best frame seen' của track."""
-        return max((q for _, q in self._buf), default=0.0)
+    def slots(self):
+        return list(self._slots)
 
     def clear(self):
-        self._buf.clear()
-        self._latest = None
+        self._slots.clear()
 
 
 # ──────────────────────────────────────────────
@@ -184,7 +295,6 @@ class ParkingSystem:
             self.use_deepstream and ds_cfg.get("plate_enabled", True))
         self._ds_face_enabled = bool(
             self.use_deepstream and ds_cfg.get("face_enabled", True))
-        self._ds_face_chain = self._ds_face_enabled
         if not self.use_deepstream:
             pcfg = self.cfg["plate_detector"]
             self.plate_det = PlateDetector(
@@ -218,7 +328,7 @@ class ParkingSystem:
                 ocr_cfg.get("use_gpu", True))
 
         self.face_eng = None
-        if self._ds_face_chain:
+        if self._ds_face_enabled:
             log.info("FaceEngine skipped (DeepStream face chain)")
         else:
             self._load_face_engine()
@@ -239,15 +349,17 @@ class ParkingSystem:
         fcfg_full = self.cfg.get("face", {})
         self.validator = PlateValidator()
         self.plate_voter = PlateVoter(rcfg["plate_vote_frames"])
-        self.face_avg = EmbeddingAvg(rcfg["face_avg_frames"])  # fallback path
         self.face_thr = rcfg["face_threshold"]
         self.blur_thr = fcfg_full.get("blur_threshold", 35.0)
-
-        self.cur_frame_id = 0
-        self._face_min_quality = float(fcfg_full.get("min_quality", 0.4))
-        self._face_embedding_hold_frames = int(
-            fcfg_full.get("embedding_hold_frames", 30))
-        self._last_face_embedding = None
+        self._face_min_quality = float(fcfg_full.get("min_quality", 0.3))
+        self.tracker = IdentityTracker(
+            max_slots=rcfg.get("max_identities", 3),
+            split_thr=rcfg.get("identity_split_thr", 0.45),
+            min_seed_quality=rcfg.get("min_seed_quality",
+                                      self._face_min_quality),
+            min_hits=rcfg.get("identity_min_hits", 2),
+            iou_bridge=rcfg.get("identity_iou_bridge", 0.5),
+        )
 
         # ── Web state (shared reference với web.py) ──
         self.state = {
@@ -282,145 +394,36 @@ class ParkingSystem:
         return self.face_eng
 
     # ──────────────────────────────────────────────
-    # DeepStream face helpers
+    # Face helpers (DS path đẩy face_data từ pipeline)
     # ──────────────────────────────────────────────
-    def _reset_tracks(self):
-        """Compatibility hook; current DS face path has no track state."""
-        self._last_face_embedding = None
-        return
-
-    @staticmethod
-    def _bbox_iou(a, b) -> float:
-        if not a or not b:
-            return 0.0
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-        return inter / (area_a + area_b - inter + 1e-6)
+    def _ensure_quality(self, face_data, frame_face):
+        """
+        Đảm bảo mỗi face có field `quality`. Plugin nvdsfaceembed (v2+) đã set
+        sẵn; fallback dùng CPU FaceEngine.quality khi plugin chưa fill (vd
+        plugin chưa rebuild với A1) hoặc khi chạy InsightFace path.
+        """
+        if not face_data:
+            return face_data
+        for f in face_data:
+            if f.get("embedding") is None:
+                f["quality"] = None
+                continue
+            if f.get("quality") is not None:
+                continue
+            if frame_face is None:
+                f["quality"] = None
+                continue
+            _, q = FaceEngine.quality(frame_face, f["bbox"], self.blur_thr)
+            f["quality"] = q
+        return face_data
 
     def _pick_display_face(self, face_data):
-        candidates = self._valid_embedding_faces(face_data)
-        if not candidates:
-            return self._recent_face_detection(face_data)
-        return max(candidates, key=lambda f: float(f.get("conf", 0.0)))
-
-    @staticmethod
-    def _valid_bbox(bbox) -> bool:
-        if not bbox:
-            return False
-        x1, y1, x2, y2 = bbox
-        return x2 > x1 and y2 > y1
-
-    def _landmarks_plausible(self, face) -> bool:
-        bbox = face.get("bbox")
-        landmarks = face.get("landmarks")
-        if not self._valid_bbox(bbox) or landmarks is None:
-            return False
-
-        try:
-            lm = np.asarray(landmarks, dtype=np.float32).reshape(-1, 2)
-        except ValueError:
-            return False
-        if lm.shape != (5, 2) or not np.isfinite(lm).all():
-            return False
-
-        x1, y1, x2, y2 = bbox
-        w, h = float(x2 - x1), float(y2 - y1)
-        aspect = w / (h + 1e-6)
-        if w < 24 or h < 24 or aspect < 0.40 or aspect > 1.70:
-            return False
-
-        pad_x, pad_y = 0.25 * w, 0.25 * h
-        if (lm[:, 0].min() < x1 - pad_x or lm[:, 0].max() > x2 + pad_x or
-                lm[:, 1].min() < y1 - pad_y or lm[:, 1].max() > y2 + pad_y):
-            return False
-
-        le, re, nose, ml, mr = lm
-        if re[0] <= le[0] or mr[0] <= ml[0]:
-            return False
-
-        eye_dist = float(np.linalg.norm(re - le))
-        mouth_dist = float(np.linalg.norm(mr - ml))
-        if eye_dist < 0.10 * w or eye_dist > 0.85 * w:
-            return False
-        if mouth_dist < 0.07 * w or mouth_dist > 0.85 * w:
-            return False
-
-        eye_y = float((le[1] + re[1]) * 0.5)
-        mouth_y = float((ml[1] + mr[1]) * 0.5)
-        if nose[1] <= eye_y - 0.20 * h or nose[1] >= mouth_y + 0.30 * h:
-            return False
-        if mouth_y <= eye_y + 0.07 * h:
-            return False
-        return True
-
-    def _valid_embedding_faces(self, face_data):
-        return [
-            f for f in face_data or []
-            if (f.get("embedding") is not None
-                and f.get("landmarks") is not None
-                and self._landmarks_plausible(f))
-        ]
-
-    def _recent_face_detection(self, face_data):
-        cache = self._last_face_embedding
-        if not cache:
+        """Face để vẽ bbox dashboard: ưu tiên có embedding, max conf."""
+        if not face_data:
             return None
-        if self.cur_frame_id - cache["frame_id"] > self._face_embedding_hold_frames:
-            return None
-
-        visible = [f for f in face_data or [] if self._valid_bbox(f.get("bbox"))]
-        if not visible:
-            return None
-
-        ref_bbox = cache.get("track_bbox") or cache["bbox"]
-        best = max(
-            visible,
-            key=lambda f: self._bbox_iou(
-                f.get("detector_bbox") or f.get("bbox"), ref_bbox))
-        best_iou = self._bbox_iou(
-            best.get("detector_bbox") or best.get("bbox"), ref_bbox)
-        return best if best_iou >= 0.10 else None
-
-    def _remember_face_embedding(self, face, embedding, quality):
-        self._last_face_embedding = {
-            "bbox": face["bbox"],
-            "track_bbox": face.get("detector_bbox") or face["bbox"],
-            "embedding": embedding,
-            "quality": float(quality),
-            "conf": float(face.get("conf", 0.0)),
-            "frame_id": self.cur_frame_id,
-        }
-
-    def _pick_current_embedding_face(self, face_data, frame_face):
-        candidates = sorted(
-            self._valid_embedding_faces(face_data),
-            key=lambda f: float(f.get("conf", 0.0)),
-            reverse=True)
-        for best in candidates:
-            ok, q = FaceEngine.quality(frame_face, best["bbox"],
-                                       self.blur_thr)
-            if ok and q is not None and q >= self._face_min_quality:
-                self._remember_face_embedding(best, best["embedding"], q)
-                return best, best["embedding"], float(q)
-        recent = self._recent_face_detection(face_data)
-        cache = self._last_face_embedding
-        if recent is not None and cache is not None:
-            ok, q = FaceEngine.quality(frame_face, recent["bbox"],
-                                       self.blur_thr)
-            if ok and q is not None and q >= self._face_min_quality:
-                cache["bbox"] = recent["bbox"]
-                cache["track_bbox"] = (
-                    recent.get("detector_bbox") or recent["bbox"])
-                cache["quality"] = float(q)
-                cache["conf"] = float(recent.get("conf", cache["conf"]))
-                cache["frame_id"] = self.cur_frame_id
-                return recent, cache["embedding"], float(q)
-        return None, None, None
+        with_emb = [f for f in face_data if f.get("embedding") is not None]
+        pool = with_emb if with_emb else face_data
+        return max(pool, key=lambda f: float(f.get("conf", 0.0)))
 
     # ── Parallel inference helpers ──
     def _run_ocr(self, crop):
@@ -432,271 +435,119 @@ class ParkingSystem:
         return raw_text, ocr_conf, plate, dt
 
     def _run_face(self, frame_face):
-        """Face detect + quality. Returns (best_face, quality, face_crop, dt_ms) or None."""
+        """
+        Fallback non-DS face inference: chạy InsightFace, attach quality cho
+        mỗi face, trả về list face_dict tương thích DS path.
+        Returns: (face_data: list[dict], dt_ms)
+        """
         t0 = time.time()
         faces = self._load_face_engine()(frame_face)
-        if not faces:
-            return None
-        best_f = max(faces, key=lambda f: f["conf"])
-        fx1, fy1, fx2, fy2 = best_f["bbox"]
-        fh, fw = frame_face.shape[:2]
-        face_crop = frame_face[max(0, fy1):min(fh, fy2),
-                               max(0, fx1):min(fw, fx2)]
-        fc = face_crop.copy() if face_crop.size > 0 else None
-        _, quality = FaceEngine.quality(frame_face, best_f["bbox"], self.blur_thr)
+        out = []
+        for f in faces:
+            _, q = FaceEngine.quality(frame_face, f["bbox"], self.blur_thr)
+            out.append({
+                "bbox": f["bbox"],
+                "conf": f["conf"],
+                "embedding": f["embedding"],
+                "quality": q,
+            })
         dt = (time.time() - t0) * 1000
-        return best_f, quality, fc, dt
+        return out, dt
 
-    # ── ENTRY ──
+    # ──────────────────────────────────────────────
+    # Plate crop + display helpers
+    # ──────────────────────────────────────────────
+    @staticmethod
+    def _crop_plate(frame_plate, bbox):
+        x1, y1, x2, y2 = bbox
+        h, w = frame_plate.shape[:2]
+        box_w, box_h = x2 - x1, y2 - y1
+        mx = max(10, int(box_w * 0.08))
+        my = max(8, int(box_h * 0.12))
+        return frame_plate[max(0, y1 - my):min(h, y2 + my),
+                           max(0, x1 - mx):min(w, x2 + mx)]
+
+    def _fill_display(self, result, frame_face, face_data):
+        """Set face_bbox/face_conf/face_crop cho dashboard event payload."""
+        best_f = self._pick_display_face(face_data)
+        if not best_f:
+            return
+        result["face_bbox"] = best_f["bbox"]
+        result["face_conf"] = float(best_f.get("conf", 0.0))
+        if frame_face is None:
+            return
+        bx1, by1, bx2, by2 = best_f["bbox"]
+        fh, fw = frame_face.shape[:2]
+        fc = frame_face[max(0, by1):min(fh, by2),
+                        max(0, bx1):min(fw, bx2)]
+        if fc.size > 0:
+            result["face_crop"] = fc.copy()
+
+    # ──────────────────────────────────────────────
+    # ENTRY / EXIT — unified tracker-based logic
+    # Cả DS path (face_data từ pipeline) và fallback (face_data=None) đều
+    # đẩy vào IdentityTracker. DB nhận list embedding/quality từ committed
+    # slots khi plate vote stable.
+    # ──────────────────────────────────────────────
     def process_entry(self, frame_plate, plate_dets,
                       frame_face, face_data=None) -> dict:
-        # Phase 8: DeepStream path (face_data từ pipeline). Fallback (face_data=None)
-        # giữ nguyên code path cũ với face_avg singular.
-        if face_data is not None:
-            return self._process_entry_ds(
-                frame_plate, plate_dets, frame_face, face_data)
-
         result = {"ok": False, "plate": "", "face_conf": 0,
                   "plate_bbox": None, "face_bbox": None}
 
-        # 1) Plate detection
-        if plate_dets is None:
-            plate_dets = self.plate_det(frame_plate) if self.plate_det else []
-
-        if not plate_dets:
-            log.debug("ENTRY: no plate detected")
-            return result
-        best_p = max(plate_dets, key=lambda p: p["conf"])
-        x1, y1, x2, y2 = best_p["bbox"]
-        result["plate_bbox"] = best_p["bbox"]
-
-        log.debug(f"ENTRY: plate det bbox=({x1},{y1},{x2},{y2}) "
-                  f"conf={best_p['conf']:.2f}")
-
-        # 2) Crop
-        h, w = frame_plate.shape[:2]
-        box_w, box_h = x2 - x1, y2 - y1
-        mx = max(10, int(box_w * 0.08))
-        my = max(8, int(box_h * 0.12))
-        crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
-                           max(0, x1 - mx):min(w, x2 + mx)]
-
-        log.debug(f"ENTRY CROP: frame={w}x{h} bbox=({x1},{y1},{x2},{y2}) "
-                  f"margin=({mx},{my}) "
-                  f"crop={crop.shape if crop.size > 0 else 'EMPTY'}")
-
-        if crop.size > 0:
-            result["plate_crop"] = crop.copy()
-
-        # 3) OCR + Face song song (GPU releases GIL → true overlap)
-        t_parallel = time.time()
-        fut_ocr = self._executor.submit(self._run_ocr, crop)
-        fut_face = self._executor.submit(self._run_face, frame_face)
-
-        raw_text, ocr_conf, plate, dt_ocr = fut_ocr.result()
-        face_data = fut_face.result()
-        dt_parallel = (time.time() - t_parallel) * 1000
-
-        dt_face = 0.0
-        log.debug(f"ENTRY OCR: raw='{raw_text}' conf={ocr_conf:.2f} "
-                  f"→ valid='{plate}'")
-
-        # 4) Process face result — tích lũy embedding sớm
-        if face_data:
-            best_f, quality, face_crop, dt_face = face_data
-            result["face_bbox"] = best_f["bbox"]
-            result["face_conf"] = best_f["conf"]
-            if face_crop is not None:
-                result["face_crop"] = face_crop
-            if quality is not None:
-                self.face_avg.update(best_f["embedding"], quality)
-
-        # Timing: nếu parallel hoạt động → total ≈ max(ocr, face)
-        saved = dt_ocr + dt_face - dt_parallel
-        log.debug(f"⏱ ENTRY ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
-                  f"parallel={dt_parallel:.0f}ms "
-                  f"(saved {saved:.0f}ms)")
-        self.state["timing"] = {
-            "ocr_ms": round(dt_ocr, 1),
-            "face_ms": round(dt_face, 1),
-            "parallel_ms": round(dt_parallel, 1),
-            "saved_ms": round(saved, 1),
-        }
-
-        # 5) Vote
-        stable = self.plate_voter.vote(plate)
-        if not stable:
-            result["plate"] = plate
-            log.debug(f"ENTRY: voting... buf={self.plate_voter._buf}")
-            return result
-        result["plate"] = stable
-        log.info(f"ENTRY: plate voted → '{stable}'")
-
-        # 6) Register — dùng embedding đã tích lũy từ các frame trước
-        if not self.face_avg.ready:
-            log.debug("ENTRY: plate ready nhưng chưa có face embedding")
-            return result
-
-        face_conf = result.get("face_conf", 0)
-        code = self.db.entry(stable, self.face_avg._latest,
-                             ocr_conf, face_conf)
-        if code > 0:
-            result["ok"] = True
-            self.plate_voter.clear()
-            self.face_avg.clear()
-            log.info(f"✅ ENTRY OK: {stable} (id={code})")
-            self._emit("entry", {"plate": stable}, result)
-        elif code == -1:
-            log.warning("❌ BÃI ĐẦY")
-        elif code == -2:
-            log.warning(f"❌ TRÙNG BIỂN SỐ: {stable}")
-
-        return result
-
-    # ── EXIT (plate-first → face verify) ──
-    def process_exit(self, frame_face, frame_plate,
-                     plate_dets=None, face_data=None) -> dict:
-        # Phase 8: DeepStream path. Fallback giữ nguyên.
-        if face_data is not None:
-            return self._process_exit_ds(
-                frame_face, frame_plate, plate_dets, face_data)
-
-        result = {"ok": False, "plate": "", "sim": 0.0,
-                  "face_bbox": None, "plate_bbox": None}
-
-        # ── Bước 1: Plate detection + crop ──
+        # Plate detect fallback (non-DS).
         if plate_dets is None and self.plate_det:
-            plate_dets = self.plate_det(frame_plate)
-        if not plate_dets:
-            return result
+            plate_dets = self.plate_det(frame_plate) if frame_plate is not None \
+                else []
 
-        best_p = max(plate_dets, key=lambda p: p["conf"])
-        result["plate_bbox"] = best_p["bbox"]
-        x1, y1, x2, y2 = best_p["bbox"]
-        h, w = frame_plate.shape[:2]
-        box_w, box_h = x2 - x1, y2 - y1
-        mx = max(10, int(box_w * 0.08))
-        my = max(8, int(box_h * 0.12))
-        crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
-                           max(0, x1 - mx):min(w, x2 + mx)]
-        if crop.size == 0:
-            return result
-        result["plate_crop"] = crop.copy()
-
-        # ── Bước 2: OCR + Face song song ──
-        t_parallel = time.time()
-        fut_ocr = self._executor.submit(self._run_ocr, crop)
-        fut_face = self._executor.submit(self._run_face, frame_face)
-
-        raw_text, _, plate, dt_ocr = fut_ocr.result()
-        face_data = fut_face.result()
-        dt_parallel = (time.time() - t_parallel) * 1000
-
+        # Face inference fallback (non-DS path).
         dt_face = 0.0
-        # Process face — tích lũy embedding sớm
+        if face_data is None and frame_face is not None:
+            t_parallel = time.time()
+            fut_ocr = None
+            if plate_dets and frame_plate is not None:
+                best_p = max(plate_dets, key=lambda p: p["conf"])
+                crop = self._crop_plate(frame_plate, best_p["bbox"])
+                fut_ocr = self._executor.submit(self._run_ocr, crop) \
+                    if crop.size > 0 else None
+            fut_face = self._executor.submit(self._run_face, frame_face)
+            face_data, dt_face = fut_face.result()
+            if fut_ocr is not None:
+                ocr_result = fut_ocr.result()
+            else:
+                ocr_result = None
+            dt_parallel = (time.time() - t_parallel) * 1000
+            self.state["timing"] = {
+                "face_ms": round(dt_face, 1),
+                "parallel_ms": round(dt_parallel, 1),
+            }
+        else:
+            ocr_result = None
+            self.state["timing"] = {}
+
+        # Quality fill + push vào tracker mỗi frame có face_data.
+        face_data = self._ensure_quality(face_data, frame_face)
         if face_data:
-            best_f, quality, face_crop, dt_face = face_data
-            result["face_bbox"] = best_f["bbox"]
-            if face_crop is not None:
-                result["face_crop"] = face_crop
-            if quality is not None:
-                self.face_avg.update(best_f["embedding"], quality)
+            self._fill_display(result, frame_face, face_data)
+            self.tracker.update_batch(face_data)
 
-        saved = dt_ocr + dt_face - dt_parallel
-        log.debug(f"⏱ EXIT ocr={dt_ocr:.0f}ms face={dt_face:.0f}ms "
-                  f"parallel={dt_parallel:.0f}ms "
-                  f"(saved {saved:.0f}ms)")
-        self.state["timing"] = {
-            "ocr_ms": round(dt_ocr, 1),
-            "face_ms": round(dt_face, 1),
-            "parallel_ms": round(dt_parallel, 1),
-            "saved_ms": round(saved, 1),
-        }
-
-        # ── Bước 3: Vote + tìm record ──
-        exit_plate = self.plate_voter.vote(plate)
-        if not exit_plate:
-            return result
-
-        record = self.db.find_by_plate(exit_plate)
-        if not record:
-            log.debug(f"EXIT: biển {exit_plate} không tìm thấy trong DB")
-            return result
-
-        # ── Bước 4: Verify face embedding ──
-        if not self.face_avg.ready:
-            return result
-
-        emb = self.face_avg._latest
-        sim = float(np.dot(emb, record["embedding"])
-                    / (np.linalg.norm(emb) * np.linalg.norm(record["embedding"])
-                       + 1e-8))
-        if sim < self.face_thr:
-            log.debug(f"EXIT: face không khớp cho {exit_plate} "
-                      f"(sim={sim:.3f} < thr={self.face_thr})")
-            return result
-
-        # ── Bước 5: Xác nhận xe ra ──
-        self.db.exit(record["id"], sim)
-        result["ok"] = True
-        result["plate"] = record["plate"]
-        result["sim"] = sim
-        self.plate_voter.clear()
-        self.face_avg.clear()
-        log.info(f"✅ EXIT: {record['plate']} (sim={sim:.3f})")
-        self._emit("exit", {"plate": record["plate"],
-                            "sim": sim}, result)
-        return result
-
-    # ──────────────────────────────────────────────
-    # Phase 8 — DeepStream paths (per-track logic)
-    # ──────────────────────────────────────────────
-    def _process_entry_ds(self, frame_plate, plate_dets,
-                          frame_face, face_data) -> dict:
-        result = {"ok": False, "plate": "", "face_conf": 0,
-                  "plate_bbox": None, "face_bbox": None}
-
-        current_face = None
-        current_emb = None
-        current_q = None
-        if face_data:
-            # Prefer detector bbox captured before tracker for dashboard.
-            best_f = self._pick_display_face(face_data)
-            if best_f:
-                bx1, by1, bx2, by2 = best_f["bbox"]
-                result["face_bbox"] = best_f["bbox"]
-                result["face_conf"] = float(best_f.get("conf", 0.0))
-                # Crop face từ frame_face cho web event payload.
-                fh, fw = frame_face.shape[:2]
-                fc = frame_face[max(0, by1):min(fh, by2),
-                                max(0, bx1):min(fw, bx2)]
-                if fc.size > 0:
-                    result["face_crop"] = fc.copy()
-            current_face, current_emb, current_q = (
-                self._pick_current_embedding_face(face_data, frame_face))
-
+        # Không có plate ⇒ chỉ accumulate tracker, không commit.
         if not plate_dets:
             return result
         best_p = max(plate_dets, key=lambda p: p["conf"])
-        x1, y1, x2, y2 = best_p["bbox"]
         result["plate_bbox"] = best_p["bbox"]
-
-        # Crop plate cho OCR.
-        h, w = frame_plate.shape[:2]
-        box_w, box_h = x2 - x1, y2 - y1
-        mx = max(10, int(box_w * 0.08))
-        my = max(8, int(box_h * 0.12))
-        crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
-                           max(0, x1 - mx):min(w, x2 + mx)]
+        crop = self._crop_plate(frame_plate, best_p["bbox"])
         if crop.size == 0:
             return result
         result["plate_crop"] = crop.copy()
 
-        # OCR (face inference đã chạy trên GPU qua DeepStream → no parallel needed).
-        raw_text, ocr_conf, plate, dt_ocr = self._run_ocr(crop)
-        self.state["timing"] = {"ocr_ms": round(dt_ocr, 1)}
+        # OCR: dùng kết quả parallel nếu fallback đã chạy, không thì serial.
+        if ocr_result is not None:
+            raw_text, ocr_conf, plate, dt_ocr = ocr_result
+        else:
+            raw_text, ocr_conf, plate, dt_ocr = self._run_ocr(crop)
+        self.state["timing"]["ocr_ms"] = round(dt_ocr, 1)
         log.debug(f"ENTRY OCR: raw='{raw_text}' conf={ocr_conf:.2f} "
-                  f"→ valid='{plate}' ({dt_ocr:.0f}ms)")
+                  f"→ '{plate}' ({dt_ocr:.0f}ms)")
 
         # Vote.
         stable = self.plate_voter.vote(plate)
@@ -706,83 +557,82 @@ class ParkingSystem:
         result["plate"] = stable
         log.info(f"ENTRY: plate voted → '{stable}'")
 
-        # Invariant 2: current frame must contain a usable face embedding.
-        if current_emb is None:
-            log.debug(
-                f"ENTRY: plate '{stable}' stable nhưng không có current face "
-                "embedding — reject")
-            self.plate_voter.clear()
+        # Commit: cần có ít nhất 1 committed slot.
+        slots = self.tracker.committed()
+        if not slots:
+            log.debug(f"ENTRY: plate '{stable}' stable nhưng tracker chưa "
+                      f"có slot đủ hits")
             return result
 
-        face_conf_for_db = current_q if current_q is not None else 0.0
-
+        embeddings = [s["embedding"] for s in slots]
+        qualities = [s["quality"] for s in slots]
+        best_q = max(qualities)
         code = self.db.entry(
-            stable, [current_emb], ocr_conf, face_conf_for_db,
-            qualities=[face_conf_for_db],
+            stable, embeddings, ocr_conf, best_q,
+            qualities=qualities,
         )
         if code > 0:
             result["ok"] = True
             self.plate_voter.clear()
-            self._reset_tracks()
-            log.info(f"✅ ENTRY OK: {stable} (id={code}, current embedding)")
+            self.tracker.clear()
+            log.info(f"✅ ENTRY OK: {stable} (id={code}, "
+                     f"ids={len(slots)})")
             self._emit("entry", {"plate": stable}, result)
         elif code == -1:
             log.warning("❌ BÃI ĐẦY")
         elif code == -2:
             log.warning(f"❌ TRÙNG BIỂN SỐ: {stable}")
-
+            self.plate_voter.clear()
+            self.tracker.clear()
         return result
 
-    def _process_exit_ds(self, frame_face, frame_plate,
-                         plate_dets, face_data) -> dict:
+    def process_exit(self, frame_face, frame_plate,
+                     plate_dets=None, face_data=None) -> dict:
         result = {"ok": False, "plate": "", "sim": 0.0,
                   "face_bbox": None, "plate_bbox": None}
 
-        current_emb = None
+        if plate_dets is None and self.plate_det:
+            plate_dets = self.plate_det(frame_plate) if frame_plate is not None \
+                else []
+
+        dt_face = 0.0
+        if face_data is None and frame_face is not None:
+            face_data, dt_face = self._run_face(frame_face)
+            self.state["timing"] = {"face_ms": round(dt_face, 1)}
+        else:
+            self.state["timing"] = {}
+
+        face_data = self._ensure_quality(face_data, frame_face)
         if face_data:
-            best_f = self._pick_display_face(face_data)
-            if best_f:
-                bx1, by1, bx2, by2 = best_f["bbox"]
-                result["face_bbox"] = best_f["bbox"]
-                fh, fw = frame_face.shape[:2]
-                fc = frame_face[max(0, by1):min(fh, by2),
-                                max(0, bx1):min(fw, bx2)]
-                if fc.size > 0:
-                    result["face_crop"] = fc.copy()
-            _, current_emb, _ = self._pick_current_embedding_face(
-                face_data, frame_face)
+            self._fill_display(result, frame_face, face_data)
+            self.tracker.update_batch(face_data)
 
         if not plate_dets:
             return result
         best_p = max(plate_dets, key=lambda p: p["conf"])
         result["plate_bbox"] = best_p["bbox"]
-        x1, y1, x2, y2 = best_p["bbox"]
-        h, w = frame_plate.shape[:2]
-        box_w, box_h = x2 - x1, y2 - y1
-        mx = max(10, int(box_w * 0.08))
-        my = max(8, int(box_h * 0.12))
-        crop = frame_plate[max(0, y1 - my):min(h, y2 + my),
-                           max(0, x1 - mx):min(w, x2 + mx)]
+        crop = self._crop_plate(frame_plate, best_p["bbox"])
         if crop.size == 0:
             return result
         result["plate_crop"] = crop.copy()
 
         raw_text, _, plate, dt_ocr = self._run_ocr(crop)
-        self.state["timing"] = {"ocr_ms": round(dt_ocr, 1)}
+        self.state["timing"]["ocr_ms"] = round(dt_ocr, 1)
 
         exit_plate = self.plate_voter.vote(plate)
         if not exit_plate:
             return result
 
-        # Invariant 2: current frame must contain a usable face embedding.
-        if current_emb is None:
-            log.debug(
-                f"EXIT: plate '{exit_plate}' stable nhưng không có current "
-                "face embedding")
+        # Verify face: query DB cho slot quality cao nhất (slots khác sẽ vẫn
+        # match qua MIN(distance) trong active_faces vì store nhiều embedding).
+        best_slot = self.tracker.best_committed()
+        if best_slot is None:
+            log.debug(f"EXIT: plate '{exit_plate}' stable nhưng tracker "
+                      f"chưa có committed slot")
             return result
 
         match = self.db.match_exit_by_plate(
-            exit_plate, current_emb, threshold=self.face_thr)
+            exit_plate, best_slot["embedding"], threshold=self.face_thr)
         if not match:
             log.debug(f"EXIT: {exit_plate} — no embedding match "
                       f"(thr={self.face_thr})")
@@ -797,7 +647,7 @@ class ParkingSystem:
         result["plate"] = match["plate"]
         result["sim"] = sim
         self.plate_voter.clear()
-        self._reset_tracks()
+        self.tracker.clear()
         log.info(f"✅ EXIT: {match['plate']} (sim={sim:.3f}, "
                  f"embeddings={match['n_embeddings']})")
         self._emit("exit",
@@ -965,8 +815,7 @@ class ParkingSystem:
                 # alive, but do not call entry/exit logic that requires both
                 # plate and face frames.
                 if not (self._ds_plate_enabled and self._ds_face_enabled):
-                    if ff is not None and self._ds_face_chain:
-                        self.cur_frame_id += 1
+                    if ff is not None and self._ds_face_enabled:
                         best = self._pick_display_face(face_data)
                         if best:
                             self._last_result = {
@@ -985,8 +834,6 @@ class ParkingSystem:
                         n_fps, t_fps = 0, now
                     continue
 
-                self.cur_frame_id += 1
-
                 # DeepStream face frames are already rotated at source ingress
                 # via camera.face_rotate_nv. Do not rotate again here.
 
@@ -997,11 +844,11 @@ class ParkingSystem:
                 elif mode == "entry":
                     result = self.process_entry(
                         fp, plate_dets, ff,
-                        face_data=face_data if self._ds_face_chain else None)
+                        face_data=face_data if self._ds_face_enabled else None)
                 else:
                     result = self.process_exit(
                         ff, fp, plate_dets,
-                        face_data=face_data if self._ds_face_chain else None)
+                        face_data=face_data if self._ds_face_enabled else None)
 
                 self._last_result = result
 
@@ -1026,8 +873,7 @@ class ParkingSystem:
                         mode = "exit" if mode == "entry" else "entry"
                         self.state["mode"] = mode
                         self.plate_voter.clear()
-                        self.face_avg.clear()
-                        self._reset_tracks()
+                        self.tracker.clear()
                         log.info(f"Mode → {mode.upper()}")
 
         except KeyboardInterrupt:
@@ -1076,7 +922,6 @@ class ParkingSystem:
                     break
 
                 frame_idx += 1
-                self.cur_frame_id += 1
 
                 if skip_n > 1 and frame_idx % skip_n != 0:
                     continue
@@ -1116,8 +961,7 @@ class ParkingSystem:
                         mode = "exit" if mode == "entry" else "entry"
                         self.state["mode"] = mode
                         self.plate_voter.clear()
-                        self.face_avg.clear()
-                        self._reset_tracks()
+                        self.tracker.clear()
                         log.info(f"Mode → {mode.upper()}")
 
         except KeyboardInterrupt:

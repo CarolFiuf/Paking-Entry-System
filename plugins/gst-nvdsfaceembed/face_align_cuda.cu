@@ -60,3 +60,71 @@ extern "C" cudaError_t launch_face_align_rgba_chw_kernel(
         (float)coeffs[4], (float)coeffs[5]);
     return cudaGetLastError();
 }
+
+// Per-face quality: Laplacian variance (proxy for blur) + mean brightness,
+// đọc kênh G của aligned CHW tensor (đã normalize về [-1,1]). Output 2 float
+// mỗi face: [blur_var, mean_brightness] trên thang [0,255].
+__global__ void face_quality_kernel(const float *aligned, float *out,
+                                    int batch_size) {
+    int face = blockIdx.x;
+    if (face >= batch_size) return;
+    int tid = threadIdx.x;
+
+    // Channel G nằm ở offset 1 * 112*112 trong CHW của face.
+    const float *g = aligned + face * FACE_TENSOR_FLOATS +
+                     1 * FACE_W * FACE_H;
+
+    __shared__ float s_sum[256];
+    __shared__ float s_lap2[256];
+
+    float local_sum = 0.0f;
+    float local_lap2 = 0.0f;
+
+    // Interior 110×110 = 12100 pixel (bỏ 1 pixel viền cho stencil 4-neighbor).
+    const int N_INTERIOR = 110 * 110;
+    for (int idx = tid; idx < N_INTERIOR; idx += 256) {
+        int yi = (idx / 110) + 1;
+        int xi = (idx % 110) + 1;
+
+        // Đưa về [0, 255]: orig = norm * 127.5 + 127.5
+        float c  = g[yi       * FACE_W + xi]     * 127.5f + 127.5f;
+        float up = g[(yi - 1) * FACE_W + xi]     * 127.5f + 127.5f;
+        float dn = g[(yi + 1) * FACE_W + xi]     * 127.5f + 127.5f;
+        float lf = g[yi       * FACE_W + xi - 1] * 127.5f + 127.5f;
+        float rt = g[yi       * FACE_W + xi + 1] * 127.5f + 127.5f;
+
+        float lap = 4.0f * c - up - dn - lf - rt;
+        local_sum  += c;
+        local_lap2 += lap * lap;
+    }
+
+    s_sum[tid] = local_sum;
+    s_lap2[tid] = local_lap2;
+    __syncthreads();
+
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid]  += s_sum[tid + s];
+            s_lap2[tid] += s_lap2[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float n_px = (float)N_INTERIOR;
+        float mean = s_sum[0] / n_px;
+        // Laplacian high-pass có E[L] ≈ 0, dùng E[L^2] làm variance approx.
+        float var = s_lap2[0] / n_px;
+        out[face * 2 + 0] = var;
+        out[face * 2 + 1] = mean;
+    }
+}
+
+extern "C" cudaError_t launch_face_quality_kernel(
+    const float *aligned, float *out, int batch_size, cudaStream_t stream) {
+    if (batch_size <= 0) return cudaSuccess;
+    dim3 block(256);
+    dim3 grid(batch_size);
+    face_quality_kernel<<<grid, block, 0, stream>>>(aligned, out, batch_size);
+    return cudaGetLastError();
+}

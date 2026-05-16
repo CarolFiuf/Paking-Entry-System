@@ -25,12 +25,39 @@ import logging
 import time
 import ctypes
 import os
+from dataclasses import dataclass, field
 from threading import Thread, Event, Lock
 from queue import Queue, Empty
 
 log = logging.getLogger("pipeline")
 
-_UNTRACKED_OBJECT_ID = 0xFFFFFFFFFFFFFFFF
+
+@dataclass
+class _ProbeStats:
+    """Counters cho probe debug. Reset sau mỗi lần log."""
+    last_log: float = field(default_factory=time.time)
+    face_frames: int = 0
+    face_all_obj: int = 0
+    face_uid2: int = 0
+    face_dets: int = 0
+    face_emb: int = 0
+    emb_read_err: int = 0
+
+    def reset(self):
+        self.last_log = time.time()
+        self.face_frames = 0
+        self.face_all_obj = 0
+        self.face_uid2 = 0
+        self.face_dets = 0
+        self.face_emb = 0
+        self.emb_read_err = 0
+
+    def log_summary(self):
+        log.info(f"face_probe: frames={self.face_frames} "
+                 f"all_obj={self.face_all_obj} uid2={self.face_uid2} "
+                 f"dets={self.face_dets} emb={self.face_emb} "
+                 f"err={self.emb_read_err}")
+
 _FACE_EMBED_META_DESC = "PARKING.FACE_EMBEDDING_META"
 _FACE_EMBED_META_TYPE = None
 
@@ -112,7 +139,7 @@ class DeepStreamPipeline:
         self._plate_frame = None
         self._plate_detections = []
         self._face_frame = None
-        self._face_data = []         # list[dict{bbox, conf, embedding, landmarks}]
+        self._face_data = []         # list[dict{bbox, conf, embedding, quality}]
 
         self._frame_seq = 0
         self._frame_event = Event()
@@ -126,15 +153,10 @@ class DeepStreamPipeline:
         self._probe_fps = 0.0
         self._probe_t0 = time.time()
 
-        # Stats cho debug (Probe B)
-        self._dbg_last_log = time.time()
-        self._dbg_n_face_frames = 0
-        self._dbg_n_face_all_obj = 0
-        self._dbg_n_face_uid2 = 0
-        self._dbg_n_face_dets = 0
-        self._dbg_n_face_emb = 0
-        self._dbg_n_face_lmk = 0
-        self._dbg_emb_read_err = 0
+        # Stats cho debug (Probe B). Bật/tắt qua deepstream.debug_probe.
+        self._debug_probe = bool(
+            cfg.get("deepstream", {}).get("debug_probe", False))
+        self._stats = _ProbeStats()
 
         self._plate_pipeline = None
         self._face_pipeline = None
@@ -313,6 +335,10 @@ class DeepStreamPipeline:
         embedder.set_property("net-height", self._net_w)
         embedder.set_property("input-object-min-width", 32)
         embedder.set_property("input-object-min-height", 32)
+        embedder.set_property("min-quality",
+            float(ds_cfg.get("face_embed_min_quality", 0.0)))
+        embedder.set_property("blur-threshold",
+            float(self.cfg.get("face", {}).get("blur_threshold", 10.0)))
         return embedder
 
     def _make_element(self, factory: str, name: str, pipeline=None):
@@ -428,7 +454,7 @@ class DeepStreamPipeline:
             self._probe_count = 0
             self._probe_t0 = now
 
-        # Early-skip
+        # Early-skip ngay trước get_nvds_buf_surface.
         self._probe_counter += 1
         if self._skip_n > 1 and self._probe_counter % self._skip_n != 0:
             return Gst.PadProbeReturn.OK
@@ -442,89 +468,10 @@ class DeepStreamPipeline:
             except StopIteration:
                 break
 
-            source_id = frame_meta.source_id
-            is_plate_frame = (
-                stream_kind == "plate" or
-                (stream_kind is None and source_id == self._plate_source_id))
-            is_face_frame = (
-                stream_kind == "face" or
-                (stream_kind is None and source_id == self._face_source_id))
-
-            surface = pyds.get_nvds_buf_surface(hash(buf),
-                                                frame_meta.batch_id)
-            frame_rgba = np.array(surface, copy=True, order='C')
-            frame = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
-
-            plate_dets = []
-            face_data = []
-            total_obj = 0
-            uid2_post = 0
-
-            l_obj = frame_meta.obj_meta_list
-            while l_obj is not None:
-                try:
-                    obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-                except StopIteration:
-                    break
-                total_obj += 1
-                uid = obj_meta.unique_component_id
-                rect = obj_meta.rect_params
-                bbox = (int(rect.left), int(rect.top),
-                        int(rect.left + rect.width),
-                        int(rect.top + rect.height))
-
-                if is_plate_frame and uid == self._plate_gie_uid:
-                    plate_dets.append({
-                        "bbox": bbox,
-                        "conf": float(obj_meta.confidence),
-                    })
-                elif is_face_frame and uid == self._face_gie_uid:
-                    uid2_post += 1
-                    face_data.append(
-                        self._extract_face_meta(obj_meta, bbox, frame.shape))
-
-                try:
-                    l_obj = l_obj.next
-                except StopIteration:
-                    break
-
-            with self._lock:
-                if is_plate_frame:
-                    self._plate_frame = frame
-                    self._plate_detections = plate_dets
-                    self._frame_seq += 1
-                    self._frame_event.set()
-                elif is_face_frame:
-                    self._face_frame = frame
-                    self._face_data = face_data
-                    self._frame_seq += 1
-                    self._frame_event.set()
-
-            # Debug stats
-            if is_face_frame:
-                self._dbg_n_face_frames += 1
-                self._dbg_n_face_all_obj += total_obj
-                self._dbg_n_face_uid2 += uid2_post
-                self._dbg_n_face_dets += len(face_data)
-                self._dbg_n_face_emb += sum(
-                    1 for f in face_data if f.get("embedding") is not None)
-                self._dbg_n_face_lmk += sum(
-                    1 for f in face_data if f.get("landmarks") is not None)
-                if now - self._dbg_last_log >= 5.0:
-                    log.info(f"face_dbg: frames={self._dbg_n_face_frames} "
-                             f"all_obj={self._dbg_n_face_all_obj} "
-                             f"uid2={self._dbg_n_face_uid2} "
-                             f"dets={self._dbg_n_face_dets} "
-                             f"emb={self._dbg_n_face_emb} "
-                             f"lmk={self._dbg_n_face_lmk}")
-                    self._dbg_last_log = now
-                    self._dbg_n_face_frames = 0
-                    self._dbg_n_face_all_obj = 0
-                    self._dbg_n_face_uid2 = 0
-                    self._dbg_n_face_dets = 0
-                    self._dbg_n_face_emb = 0
-                    self._dbg_n_face_lmk = 0
-                    self._dbg_emb_read_err = 0
+            if stream_kind == "plate":
+                self._handle_plate_frame(buf, frame_meta)
+            elif stream_kind == "face":
+                self._handle_face_frame(buf, frame_meta, now)
 
             try:
                 l_frame = l_frame.next
@@ -532,6 +479,89 @@ class DeepStreamPipeline:
                 break
 
         return Gst.PadProbeReturn.OK
+
+    def _materialize_bgr(self, buf, batch_id):
+        """RGBA NVMM → BGR np.array. CPU copy + cvtColor, gọi chỗ thật sự cần."""
+        surface = pyds.get_nvds_buf_surface(hash(buf), batch_id)
+        return cv2.cvtColor(np.array(surface, copy=True, order='C'),
+                            cv2.COLOR_RGBA2BGR)
+
+    def _collect_plate_dets(self, frame_meta):
+        dets = []
+        l_obj = frame_meta.obj_meta_list
+        while l_obj is not None:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
+            if obj_meta.unique_component_id == self._plate_gie_uid:
+                rect = obj_meta.rect_params
+                bbox = (int(rect.left), int(rect.top),
+                        int(rect.left + rect.width),
+                        int(rect.top + rect.height))
+                dets.append({"bbox": bbox,
+                             "conf": float(obj_meta.confidence)})
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+        return dets
+
+    def _collect_face_data(self, frame_meta, frame_shape):
+        face_data = []
+        total_obj = 0
+        uid_match = 0
+        l_obj = frame_meta.obj_meta_list
+        while l_obj is not None:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
+            total_obj += 1
+            if obj_meta.unique_component_id == self._face_gie_uid:
+                uid_match += 1
+                rect = obj_meta.rect_params
+                bbox = (int(rect.left), int(rect.top),
+                        int(rect.left + rect.width),
+                        int(rect.top + rect.height))
+                face_data.append(
+                    self._extract_face_meta(obj_meta, bbox, frame_shape))
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+        return face_data, total_obj, uid_match
+
+    def _handle_plate_frame(self, buf, frame_meta):
+        frame = self._materialize_bgr(buf, frame_meta.batch_id)
+        plate_dets = self._collect_plate_dets(frame_meta)
+        with self._lock:
+            self._plate_frame = frame
+            self._plate_detections = plate_dets
+            self._frame_seq += 1
+            self._frame_event.set()
+
+    def _handle_face_frame(self, buf, frame_meta, now):
+        frame = self._materialize_bgr(buf, frame_meta.batch_id)
+        face_data, total_obj, uid_match = self._collect_face_data(
+            frame_meta, frame.shape)
+        with self._lock:
+            self._face_frame = frame
+            self._face_data = face_data
+            self._frame_seq += 1
+            self._frame_event.set()
+
+        if self._debug_probe:
+            s = self._stats
+            s.face_frames += 1
+            s.face_all_obj += total_obj
+            s.face_uid2 += uid_match
+            s.face_dets += len(face_data)
+            s.face_emb += sum(
+                1 for f in face_data if f.get("embedding") is not None)
+            if now - s.last_log >= 5.0:
+                s.log_summary()
+                s.reset()
 
     @staticmethod
     def _clip_bbox(bbox: tuple, frame_shape) -> tuple:
@@ -550,8 +580,10 @@ class DeepStreamPipeline:
     def _read_face_embed_meta(self, obj_meta):
         """
         Đọc PARKING.FACE_EMBEDDING_META do plugin gst-nvdsfaceembed attach
-        vào obj_meta. Plugin đã L2-normalize embedding và cung cấp landmarks
-        + bbox đã decode từ SCRFD tensor.
+        vào obj_meta. Plugin đã L2-normalize embedding, decode bbox từ
+        landmarks, và (v2+) tính quality score trên aligned tensor.
+
+        Returns: (embedding | None, face_bbox | None, quality | None)
         """
         meta_type = _get_face_embed_meta_type()
         l_user = obj_meta.obj_user_meta_list
@@ -569,18 +601,21 @@ class DeepStreamPipeline:
                         return None, None, None
                     emb = np.ctypeslib.as_array(meta.embedding,
                                                 shape=(512,)).copy()
-                    lm = np.ctypeslib.as_array(meta.landmarks,
-                                               shape=(10,)).copy()
                     face_bbox = None
+                    quality = None
                     if meta.version >= 2:
                         b = np.ctypeslib.as_array(meta.bbox,
                                                   shape=(4,)).copy()
                         if np.all(np.isfinite(b)) and b[2] > b[0] and b[3] > b[1]:
                             face_bbox = tuple(int(round(v)) for v in b)
-                    return emb, lm.reshape(5, 2), face_bbox
+                        q = float(meta.quality)
+                        # Plugin sets 0.0 nếu chưa compute (back-compat).
+                        if np.isfinite(q) and q > 0.0:
+                            quality = q
+                    return emb, face_bbox, quality
                 except Exception as e:
-                    self._dbg_emb_read_err += 1
-                    if self._dbg_emb_read_err <= 3:
+                    self._stats.emb_read_err += 1
+                    if self._stats.emb_read_err <= 3:
                         log.warning(f"face embed meta read err: {e}")
                     return None, None, None
 
@@ -593,24 +628,21 @@ class DeepStreamPipeline:
     def _extract_face_meta(self, obj_meta, bbox: tuple,
                            frame_shape=None) -> dict:
         """
-        Trích face data từ obj_meta: ưu tiên bbox + landmarks + embedding
-        do plugin gst-nvdsfaceembed attach. Fallback bbox = PGIE rect_params.
+        Trích face data từ obj_meta. Plugin attach embedding + (v2) bbox
+        decode từ landmarks + quality. PGIE rect_params làm fallback bbox.
+        Landmarks/track_id không expose lên Python (parser + plugin đã filter).
         """
-        emb, landmarks, face_bbox = self._read_face_embed_meta(obj_meta)
+        emb, face_bbox, quality = self._read_face_embed_meta(obj_meta)
 
-        oid = obj_meta.object_id
-        track_id = int(oid) if oid != _UNTRACKED_OBJECT_ID else None
         final_bbox = bbox
         clipped_face_bbox = self._clip_bbox(face_bbox, frame_shape)
         if clipped_face_bbox is not None:
             final_bbox = clipped_face_bbox
         return {
             "bbox": final_bbox,
-            "detector_bbox": bbox,
             "conf": float(obj_meta.confidence),
-            "track_id": track_id,
             "embedding": emb,
-            "landmarks": landmarks,
+            "quality": quality,
         }
     
     @property
@@ -675,7 +707,7 @@ class DeepStreamPipeline:
             return self._face_frame
 
     def get_face_data(self):
-        """Lấy face frame + face_data list (mỗi face: bbox/conf/track_id/emb/lmk)."""
+        """Lấy face frame + face_data list (mỗi face: bbox/conf/embedding/quality)."""
         with self._lock:
             return self._face_frame, list(self._face_data)
 
