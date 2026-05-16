@@ -2,7 +2,7 @@
 pipeline.py — Video Pipeline
 DeepStream GPU pipeline (nếu có pyds) hoặc fallback GStreamer + OpenCV.
 
-DeepStream chain (default split mode):
+DeepStream chain (split mode):
   plate_src → decode → nvstreammux(batch=1) → nvinfer(plate, uid=1)
             → nvconv RGBA → fakesink
 
@@ -13,7 +13,7 @@ DeepStream chain (default split mode):
 Probe B exports:
   - plate pipeline: plate frame + plate detections (uid=1)
   - face pipeline: face frame + face data list (uid=2 obj +
-                   embedding/landmarks when nvdsfaceembed succeeds)
+                   embedding/landmarks/bbox từ nvdsfaceembed user meta)
 
 Fallback mode (no pyds):
   RTMP → GStreamer NVDEC → OpenCV → Python inference (StreamReader class).
@@ -28,68 +28,11 @@ import os
 from threading import Thread, Event, Lock
 from queue import Queue, Empty
 
-# Landmarks/embeddings được decode + attach trong native DeepStream elements;
-# Python probe chỉ đọc metadata cuối pipeline.
-HAS_FACE_HELPERS = True
-
 log = logging.getLogger("pipeline")
 
 _UNTRACKED_OBJECT_ID = 0xFFFFFFFFFFFFFFFF
-_NVDS_ROI_META = 29
 _FACE_EMBED_META_DESC = "PARKING.FACE_EMBEDDING_META"
 _FACE_EMBED_META_TYPE = None
-
-
-class _NvOSDColorParams(ctypes.Structure):
-    _fields_ = [
-        ("red", ctypes.c_double),
-        ("green", ctypes.c_double),
-        ("blue", ctypes.c_double),
-        ("alpha", ctypes.c_double),
-    ]
-
-
-class _NvOSDRectParams(ctypes.Structure):
-    _fields_ = [
-        ("left", ctypes.c_float),
-        ("top", ctypes.c_float),
-        ("width", ctypes.c_float),
-        ("height", ctypes.c_float),
-        ("border_width", ctypes.c_uint),
-        ("border_color", _NvOSDColorParams),
-        ("has_bg_color", ctypes.c_uint),
-        ("reserved", ctypes.c_uint),
-        ("bg_color", _NvOSDColorParams),
-        ("has_color_info", ctypes.c_int),
-        ("color_id", ctypes.c_int),
-    ]
-
-
-class _GList(ctypes.Structure):
-    pass
-
-
-_GList._fields_ = [
-    ("data", ctypes.c_void_p),
-    ("next", ctypes.POINTER(_GList)),
-    ("prev", ctypes.POINTER(_GList)),
-]
-
-
-class _NvDsRoiMeta(ctypes.Structure):
-    _fields_ = [
-        ("roi", _NvOSDRectParams),
-        ("roi_polygon", ctypes.c_uint * 16),
-        ("converted_buffer", ctypes.c_void_p),
-        ("frame_meta", ctypes.c_void_p),
-        ("scale_ratio_x", ctypes.c_double),
-        ("scale_ratio_y", ctypes.c_double),
-        ("offset_left", ctypes.c_double),
-        ("offset_top", ctypes.c_double),
-        ("classifier_meta_list", ctypes.c_void_p),
-        ("roi_user_meta_list", ctypes.POINTER(_GList)),
-        ("object_meta", ctypes.c_void_p),
-    ]
 
 
 class _FaceEmbeddingMeta(ctypes.Structure):
@@ -163,15 +106,6 @@ class DeepStreamPipeline:
         self._plate_gie_uid = 1
         self._face_gie_uid = 2
 
-        self._face_chain = bool(
-            self._face_enabled and ds_cfg.get("face_chain_enabled", False))
-        self._face_embed_backend = str(
-            ds_cfg.get("face_embed_backend", "direct_sgie")).lower()
-        self._face_tracker_enabled = bool(
-            ds_cfg.get("face_tracker_enabled", False))
-        self._face_align = bool(ds_cfg.get("face_align_enabled", False))
-        self._read_face_embeddings = bool(
-            ds_cfg.get("read_face_embeddings", True))
         self._net_w = 640    # SCRFD input size, hardcoded khớp face_det_config
 
         # Kết quả mới nhất từ Probe B
@@ -179,7 +113,6 @@ class DeepStreamPipeline:
         self._plate_detections = []
         self._face_frame = None
         self._face_data = []         # list[dict{bbox, conf, embedding, landmarks}]
-        self._face_detector_cache = {}
 
         self._frame_seq = 0
         self._frame_event = Event()
@@ -198,31 +131,15 @@ class DeepStreamPipeline:
         self._dbg_n_face_frames = 0
         self._dbg_n_face_all_obj = 0
         self._dbg_n_face_uid2 = 0
-        self._dbg_n_face_pre = 0
         self._dbg_n_face_dets = 0
         self._dbg_n_face_emb = 0
         self._dbg_n_face_lmk = 0
-        self._dbg_n_roi_meta = 0
-        self._dbg_n_roi_emb = 0
-        self._dbg_n_roi_err = 0
-        self._dbg_n_obj_roi_meta = 0
-        self._dbg_n_obj_roi_emb = 0
-        self._dbg_n_cls_meta = 0
-        self._dbg_n_cls_labels = 0
-        self._dbg_cls_uids = {}
-        self._dbg_frame_user_types = {}
-        self._dbg_frame_tensor_uids = {}
-        self._dbg_obj_user_types = {}
-        self._dbg_obj_tensor_uids = {}
         self._dbg_emb_read_err = 0
-        self._dbg_emb_null_ptr = 0
+
         self._plate_pipeline = None
         self._face_pipeline = None
         self._pipelines = []
         self._pgie_face = None
-        self._tracker = None
-        self._sgie_face = None
-        self._face_preproc = None
         self._face_embedder = None
 
         self._build_split_pipelines(plate_src, face_src)
@@ -342,63 +259,9 @@ class DeepStreamPipeline:
                               mux=mux, name_prefix="face",
                               flip_method=face_flip, pipeline=pipeline)
 
-        link_order = [mux]
-        if self._face_chain and HAS_FACE_HELPERS:
-            pgie_face = self._make_element("nvinfer", "face_det", pipeline)
-            pgie_face.set_property("config-file-path",
-                                   ds_cfg["face_det_config"])
-            self._pgie_face = pgie_face
-            link_order.append(pgie_face)
-
-            if self._face_tracker_enabled:
-                tracker = self._make_element("nvtracker", "face_tracker",
-                                             pipeline)
-                tracker.set_property(
-                    "ll-lib-file",
-                    "/opt/nvidia/deepstream/deepstream/lib/"
-                    "libnvds_nvmultiobjecttracker.so")
-                tracker.set_property("ll-config-file",
-                                     ds_cfg["tracker_config"])
-                tracker.set_property("tracker-width", 640)
-                tracker.set_property("tracker-height", 384)
-                self._tracker = tracker
-                link_order.append(tracker)
-
-            if self._face_align:
-                preproc = self._make_element("nvdspreprocess",
-                                             "face_preprocess", pipeline)
-                preproc.set_property("config-file",
-                                     ds_cfg["face_preprocess_config"])
-                self._face_preproc = preproc
-                sgie_face = self._make_element("nvinfer", "face_embed",
-                                               pipeline)
-                sgie_face.set_property("config-file-path",
-                                       ds_cfg["face_embed_config"])
-                self._sgie_face = sgie_face
-                link_order += [preproc, sgie_face]
-                chain = "PGIE_face"
-                if self._tracker:
-                    chain += " → tracker"
-                chain += " → nvdspreprocess(align) → SGIE_embed"
-                log.info(f"Face chain: {chain}")
-            elif self._face_embed_backend in ("aligned_trt", "custom_trt"):
-                chain = "PGIE_face"
-                if self._tracker:
-                    chain += " → tracker"
-                chain += " → nvdsfaceembed(aligned TensorRT ArcFace)"
-                log.info(f"Face chain: {chain}")
-            else:
-                sgie_face = self._make_element("nvinfer", "face_embed",
-                                               pipeline)
-                sgie_face.set_property("config-file-path",
-                                       ds_cfg["face_embed_config"])
-                self._sgie_face = sgie_face
-                link_order.append(sgie_face)
-                log.warning("face_align_enabled=false: SGIE_embed uses "
-                            "nvinfer object crop/resize (no landmark align)")
-        elif self._face_chain and not HAS_FACE_HELPERS:
-            log.warning("face_chain_enabled=true nhưng face_meta_helpers "
-                        "import fail — disable face chain")
+        pgie_face = self._make_element("nvinfer", "face_det", pipeline)
+        pgie_face.set_property("config-file-path", ds_cfg["face_det_config"])
+        self._pgie_face = pgie_face
 
         nvconv = self._make_element("nvvideoconvert", "face_nvconv_out",
                                     pipeline)
@@ -406,33 +269,21 @@ class DeepStreamPipeline:
                                         pipeline)
         capsfilter.set_property(
             "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"))
-        link_order += [nvconv, capsfilter]
 
-        if (self._face_chain and HAS_FACE_HELPERS and
-                self._face_embed_backend in ("aligned_trt", "custom_trt") and
-                not self._face_align):
-            embedder = self._make_face_embedder(pipeline, ds_cfg)
-            self._face_embedder = embedder
-            link_order.append(embedder)
+        embedder = self._make_face_embedder(pipeline, ds_cfg)
+        self._face_embedder = embedder
 
         sink = self._make_element("fakesink", "face_sink", pipeline)
         sink.set_property("sync", 0)
         sink.set_property("async", 0)
-        link_order.append(sink)
 
-        self._link_many(link_order)
-
-        if self._pgie_face and self._tracker:
-            face_det_src_pad = self._pgie_face.get_static_pad("src")
-            if face_det_src_pad:
-                face_det_src_pad.add_probe(
-                    Gst.PadProbeType.BUFFER,
-                    self._probe_face_detector_boxes, None)
+        self._link_many([mux, pgie_face, nvconv, capsfilter, embedder, sink])
 
         sink.get_static_pad("sink").add_probe(
             Gst.PadProbeType.BUFFER, self._probe_callback, "face")
         self._attach_bus(pipeline)
-        log.info("Face pipeline: src → mux(batch=1) → face_det → embed → sink")
+        log.info("Face pipeline: src → mux(batch=1) → face_det → "
+                 "nvdsfaceembed(aligned TRT ArcFace) → sink")
 
     def _make_face_embedder(self, pipeline, ds_cfg):
         embedder = self._make_element("nvdsfaceembed", "face_embed_aligned",
@@ -560,80 +411,6 @@ class DeepStreamPipeline:
             log.debug(f"[{name_prefix}] Ignoring non-video pad: {pad_name}")
 
     # ────────────────────────────────────────────────────────────────
-    # Probe A: face detector output, trước tracker. Chỉ copy bbox/conf plain
-    # Python để dashboard không phụ thuộc bbox post-tracker.
-    # ────────────────────────────────────────────────────────────────
-    def _probe_face_detector_boxes(self, pad, info, user_data):
-        buf = info.get_buffer()
-        if not buf:
-            return Gst.PadProbeReturn.OK
-
-        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
-        if not batch_meta:
-            return Gst.PadProbeReturn.OK
-
-        updates = {}
-        l_frame = batch_meta.frame_meta_list
-        while l_frame is not None:
-            try:
-                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-            except StopIteration:
-                break
-
-            if frame_meta.source_id == self._face_source_id:
-                dets = []
-                l_obj = frame_meta.obj_meta_list
-                while l_obj is not None:
-                    try:
-                        obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-                    except StopIteration:
-                        break
-
-                    if obj_meta.unique_component_id == self._face_gie_uid:
-                        rect = obj_meta.rect_params
-                        bbox = (int(rect.left), int(rect.top),
-                                int(rect.left + rect.width),
-                                int(rect.top + rect.height))
-                        dets.append({
-                            "bbox": bbox,
-                            "conf": float(obj_meta.confidence),
-                            "track_id": None,
-                            "embedding": None,
-                            "landmarks": None,
-                            "source": "detector",
-                        })
-
-                    try:
-                        l_obj = l_obj.next
-                    except StopIteration:
-                        break
-
-                updates[(int(frame_meta.source_id),
-                         int(frame_meta.frame_num))] = dets
-
-            try:
-                l_frame = l_frame.next
-            except StopIteration:
-                break
-
-        if updates:
-            with self._lock:
-                self._face_detector_cache.update(updates)
-                # Keep cache bounded for live streams.
-                while len(self._face_detector_cache) > 60:
-                    first_key = next(iter(self._face_detector_cache))
-                    self._face_detector_cache.pop(first_key, None)
-
-        return Gst.PadProbeReturn.OK
-
-    def _consume_face_detector_boxes(self, source_id: int,
-                                     frame_num: int) -> list:
-        key = (int(source_id), int(frame_num))
-        with self._lock:
-            dets = self._face_detector_cache.pop(key, [])
-        return list(dets)
-
-    # ────────────────────────────────────────────────────────────────
     # Probe B: chạy ở fakesink. Tách frame + dữ liệu theo source_id +
     # obj_meta.unique_component_id.
     # ────────────────────────────────────────────────────────────────
@@ -680,15 +457,6 @@ class DeepStreamPipeline:
 
             plate_dets = []
             face_data = []
-            detector_face_data = (
-                self._consume_face_detector_boxes(
-                    source_id, frame_meta.frame_num)
-                if is_face_frame else []
-            )
-            roi_embeddings = (
-                self._extract_face_roi_embeddings(frame_meta)
-                if is_face_frame else []
-            )
             total_obj = 0
             uid2_post = 0
 
@@ -712,10 +480,8 @@ class DeepStreamPipeline:
                     })
                 elif is_face_frame and uid == self._face_gie_uid:
                     uid2_post += 1
-                    fd = self._extract_face_meta(
-                        obj_meta, bbox, roi_embeddings, frame.shape)
-                    fd["source"] = "tracker" if self._tracker else "detector"
-                    face_data.append(fd)
+                    face_data.append(
+                        self._extract_face_meta(obj_meta, bbox, frame.shape))
 
                 try:
                     l_obj = l_obj.next
@@ -730,7 +496,7 @@ class DeepStreamPipeline:
                     self._frame_event.set()
                 elif is_face_frame:
                     self._face_frame = frame
-                    self._face_data = detector_face_data + face_data
+                    self._face_data = face_data
                     self._frame_seq += 1
                     self._frame_event.set()
 
@@ -739,8 +505,7 @@ class DeepStreamPipeline:
                 self._dbg_n_face_frames += 1
                 self._dbg_n_face_all_obj += total_obj
                 self._dbg_n_face_uid2 += uid2_post
-                self._dbg_n_face_pre += len(detector_face_data)
-                self._dbg_n_face_dets += len(detector_face_data) + len(face_data)
+                self._dbg_n_face_dets += len(face_data)
                 self._dbg_n_face_emb += sum(
                     1 for f in face_data if f.get("embedding") is not None)
                 self._dbg_n_face_lmk += sum(
@@ -749,7 +514,6 @@ class DeepStreamPipeline:
                     log.info(f"face_dbg: frames={self._dbg_n_face_frames} "
                              f"all_obj={self._dbg_n_face_all_obj} "
                              f"uid2={self._dbg_n_face_uid2} "
-                             f"pre={self._dbg_n_face_pre} "
                              f"dets={self._dbg_n_face_dets} "
                              f"emb={self._dbg_n_face_emb} "
                              f"lmk={self._dbg_n_face_lmk}")
@@ -757,24 +521,10 @@ class DeepStreamPipeline:
                     self._dbg_n_face_frames = 0
                     self._dbg_n_face_all_obj = 0
                     self._dbg_n_face_uid2 = 0
-                    self._dbg_n_face_pre = 0
                     self._dbg_n_face_dets = 0
                     self._dbg_n_face_emb = 0
                     self._dbg_n_face_lmk = 0
-                    self._dbg_n_roi_meta = 0
-                    self._dbg_n_roi_emb = 0
-                    self._dbg_n_roi_err = 0
-                    self._dbg_n_obj_roi_meta = 0
-                    self._dbg_n_obj_roi_emb = 0
-                    self._dbg_n_cls_meta = 0
-                    self._dbg_n_cls_labels = 0
-                    self._dbg_cls_uids = {}
-                    self._dbg_frame_user_types = {}
-                    self._dbg_frame_tensor_uids = {}
-                    self._dbg_obj_user_types = {}
-                    self._dbg_obj_tensor_uids = {}
                     self._dbg_emb_read_err = 0
-                    self._dbg_emb_null_ptr = 0
 
             try:
                 l_frame = l_frame.next
@@ -782,17 +532,6 @@ class DeepStreamPipeline:
                 break
 
         return Gst.PadProbeReturn.OK
-
-    @staticmethod
-    def _bbox_iou(a: tuple, b: tuple) -> float:
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-        return inter / (area_a + area_b - inter + 1e-6)
 
     @staticmethod
     def _clip_bbox(bbox: tuple, frame_shape) -> tuple:
@@ -808,66 +547,12 @@ class DeepStreamPipeline:
             return None
         return (x1, y1, x2, y2)
 
-    def _read_embedding_tensor_meta(self, tensor_meta):
-        if tensor_meta.unique_id != 3 or tensor_meta.num_output_layers <= 0:
-            return None
-        try:
-            host_buf = tensor_meta.out_buf_ptrs_host[0]
-        except TypeError:
-            # Some pyds builds expose a single-output host pointer as a
-            # PyCapsule instead of an indexable array.
-            host_buf = tensor_meta.out_buf_ptrs_host
-        ptr = pyds.get_ptr(host_buf)
-        if not ptr:
-            self._dbg_emb_null_ptr += 1
-            return None
-        arr = np.ctypeslib.as_array(
-            ctypes.cast(ptr, ctypes.POINTER(ctypes.c_float)),
-            shape=(512,)
-        ).copy()
-        n = np.linalg.norm(arr)
-        return arr / n if n > 1e-6 else arr
-
-    def _read_embedding_classifier_meta(self, obj_meta):
-        l_cls = obj_meta.classifier_meta_list
-        while l_cls is not None:
-            try:
-                cls = pyds.NvDsClassifierMeta.cast(l_cls.data)
-            except StopIteration:
-                break
-
-            uid = int(cls.unique_component_id)
-            self._dbg_cls_uids[uid] = self._dbg_cls_uids.get(uid, 0) + 1
-            if cls.unique_component_id == 3:
-                self._dbg_n_cls_meta += 1
-                emb = np.zeros((512,), dtype=np.float32)
-                seen = 0
-                l_label = cls.label_info_list
-                while l_label is not None:
-                    try:
-                        label = pyds.NvDsLabelInfo.cast(l_label.data)
-                    except StopIteration:
-                        break
-                    idx = int(label.label_id)
-                    if 0 <= idx < 512:
-                        emb[idx] = float(label.result_prob)
-                        seen += 1
-                        self._dbg_n_cls_labels += 1
-                    try:
-                        l_label = l_label.next
-                    except StopIteration:
-                        break
-                if seen == 512:
-                    n = np.linalg.norm(emb)
-                    return emb / n if n > 1e-6 else emb
-
-            try:
-                l_cls = l_cls.next
-            except StopIteration:
-                break
-        return None
-
-    def _read_custom_face_embedding_meta(self, obj_meta):
+    def _read_face_embed_meta(self, obj_meta):
+        """
+        Đọc PARKING.FACE_EMBEDDING_META do plugin gst-nvdsfaceembed attach
+        vào obj_meta. Plugin đã L2-normalize embedding và cung cấp landmarks
+        + bbox đã decode từ SCRFD tensor.
+        """
         meta_type = _get_face_embed_meta_type()
         l_user = obj_meta.obj_user_meta_list
         while l_user is not None:
@@ -878,15 +563,12 @@ class DeepStreamPipeline:
 
             if u.base_meta.meta_type == meta_type:
                 try:
-                    ptr = self._pyds_ptr(u.user_meta_data)
+                    ptr = pyds.get_ptr(u.user_meta_data)
                     meta = _FaceEmbeddingMeta.from_address(ptr)
                     if meta.version not in (1, 2) or meta.dims != 512:
                         return None, None, None
                     emb = np.ctypeslib.as_array(meta.embedding,
                                                 shape=(512,)).copy()
-                    n = np.linalg.norm(emb)
-                    if n > 1e-6:
-                        emb = emb / n
                     lm = np.ctypeslib.as_array(meta.landmarks,
                                                shape=(10,)).copy()
                     face_bbox = None
@@ -899,7 +581,7 @@ class DeepStreamPipeline:
                 except Exception as e:
                     self._dbg_emb_read_err += 1
                     if self._dbg_emb_read_err <= 3:
-                        log.warning(f"custom emb read err: {e}")
+                        log.warning(f"face embed meta read err: {e}")
                     return None, None, None
 
             try:
@@ -908,161 +590,14 @@ class DeepStreamPipeline:
                 break
         return None, None, None
 
-    @staticmethod
-    def _pyds_ptr(value) -> int:
-        try:
-            return pyds.get_ptr(value)
-        except Exception:
-            return int(value)
-
-    def _extract_face_roi_embeddings(self, frame_meta) -> list:
-        """
-        Read SGIE uid=3 embeddings attached by nvinfer as NVDS_ROI_META when
-        input-tensor-from-meta=1. pyds does not expose NvDsRoiMeta, so this
-        uses the DeepStream C struct layout from nvds_roi_meta.h.
-        """
-        if not self._read_face_embeddings:
-            return []
-
-        out = []
-        l_user = frame_meta.frame_user_meta_list
-        while l_user is not None:
-            try:
-                u = pyds.NvDsUserMeta.cast(l_user.data)
-            except StopIteration:
-                break
-
-            try:
-                mt = int(u.base_meta.meta_type)
-            except Exception:
-                mt = u.base_meta.meta_type
-            self._dbg_frame_user_types[mt] = (
-                self._dbg_frame_user_types.get(mt, 0) + 1)
-            if u.base_meta.meta_type == pyds.NVDSINFER_TENSOR_OUTPUT_META:
-                try:
-                    t = pyds.NvDsInferTensorMeta.cast(u.user_meta_data)
-                    uid = int(t.unique_id)
-                    self._dbg_frame_tensor_uids[uid] = (
-                        self._dbg_frame_tensor_uids.get(uid, 0) + 1)
-                except Exception:
-                    pass
-
-            if mt == _NVDS_ROI_META:
-                self._dbg_n_roi_meta += 1
-                try:
-                    roi_ptr = self._pyds_ptr(u.user_meta_data)
-                    bbox, emb = self._read_embedding_from_roi_ptr(roi_ptr)
-                    if emb is not None:
-                        self._dbg_n_roi_emb += 1
-                        out.append({"bbox": bbox, "embedding": emb})
-                except Exception as e:
-                    self._dbg_n_roi_err += 1
-                    log.debug(f"roi embedding read err: {e}")
-
-            try:
-                l_user = l_user.next
-            except StopIteration:
-                break
-
-        return out
-
-    def _read_embedding_from_roi_ptr(self, roi_ptr: int):
-        roi = _NvDsRoiMeta.from_address(roi_ptr)
-        r = roi.roi
-        bbox = (int(r.left), int(r.top),
-                int(r.left + r.width), int(r.top + r.height))
-
-        # Critical safety guard: Gst-nvinfer's ROI meta release function
-        # deletes roi.object_meta. In object-mode nvdspreprocess this pointer
-        # is non-owning, so clear it after SGIE attaches ROI meta.
-        roi.object_meta = None
-
-        if not self._read_face_embeddings:
-            return bbox, None
-
-        emb = None
-        l_roi = roi.roi_user_meta_list
-        while bool(l_roi):
-            ru = pyds.NvDsUserMeta.cast(l_roi.contents.data)
-            if ru.base_meta.meta_type == pyds.NVDSINFER_TENSOR_OUTPUT_META:
-                t = pyds.NvDsInferTensorMeta.cast(ru.user_meta_data)
-                emb = self._read_embedding_tensor_meta(t)
-                if emb is not None:
-                    break
-            l_roi = l_roi.contents.next
-        return bbox, emb
-
     def _extract_face_meta(self, obj_meta, bbox: tuple,
-                           roi_embeddings: list = None,
                            frame_shape=None) -> dict:
-        """Đọc embedding (SGIE uid=3 tensor meta)."""
-        emb, landmarks, face_bbox = self._read_custom_face_embedding_meta(
-            obj_meta)
-        if emb is None:
-            emb = self._read_embedding_classifier_meta(obj_meta)
+        """
+        Trích face data từ obj_meta: ưu tiên bbox + landmarks + embedding
+        do plugin gst-nvdsfaceembed attach. Fallback bbox = PGIE rect_params.
+        """
+        emb, landmarks, face_bbox = self._read_face_embed_meta(obj_meta)
 
-        l_user = obj_meta.obj_user_meta_list
-        while l_user is not None:
-            try:
-                u = pyds.NvDsUserMeta.cast(l_user.data)
-            except StopIteration:
-                break
-
-            mt = u.base_meta.meta_type
-            try:
-                mt_dbg = int(mt)
-            except Exception:
-                mt_dbg = mt
-            self._dbg_obj_user_types[mt_dbg] = (
-                self._dbg_obj_user_types.get(mt_dbg, 0) + 1)
-            if mt == pyds.NVDSINFER_TENSOR_OUTPUT_META:
-                try:
-                    t = pyds.NvDsInferTensorMeta.cast(u.user_meta_data)
-                    uid = int(t.unique_id)
-                    self._dbg_obj_tensor_uids[uid] = (
-                        self._dbg_obj_tensor_uids.get(uid, 0) + 1)
-                    emb = self._read_embedding_tensor_meta(t)
-                except Exception as e:
-                    self._dbg_emb_read_err += 1
-                    if self._dbg_emb_read_err <= 3:
-                        log.warning(f"emb read err: {e}")
-                    else:
-                        log.debug(f"emb read err: {e}")
-            else:
-                try:
-                    mt_i = int(mt)
-                except Exception:
-                    mt_i = mt
-                if mt_i == _NVDS_ROI_META:
-                    self._dbg_n_obj_roi_meta += 1
-                    try:
-                        roi_ptr = self._pyds_ptr(u.user_meta_data)
-                        _, roi_emb = self._read_embedding_from_roi_ptr(
-                            roi_ptr)
-                        if roi_emb is not None:
-                            emb = roi_emb
-                            self._dbg_n_obj_roi_emb += 1
-                    except Exception as e:
-                        self._dbg_n_roi_err += 1
-                        log.debug(f"obj roi embedding read err: {e}")
-
-            try:
-                l_user = l_user.next
-            except StopIteration:
-                break
-
-        if emb is None and roi_embeddings:
-            best = None
-            best_iou = 0.0
-            for item in roi_embeddings:
-                v = self._bbox_iou(bbox, item["bbox"])
-                if v > best_iou:
-                    best_iou = v
-                    best = item
-            if best is not None and best_iou >= 0.3:
-                emb = best["embedding"]
-
-        # pyds không expose UNTRACKED_OBJECT_ID; C header = 0xFFFFFFFFFFFFFFFF
         oid = obj_meta.object_id
         track_id = int(oid) if oid != _UNTRACKED_OBJECT_ID else None
         final_bbox = bbox

@@ -19,33 +19,16 @@ camera:
 # DeepStream pipeline (tắt = fallback GStreamer + Python inference)
 deepstream:
   enabled: true
-  # Set plate_enabled=false khi test riêng face chain. Khi chạy đủ hệ thống,
-  # bật lại true để tạo plate source + plate detector trong DeepStream graph.
-  plate_enabled: true
+  plate_enabled: false
   face_enabled: true
   plate_config: "./configs/plate_det_config.txt"
-  # Face chain: SCRFD det → ArcFace embed. NvDCF is disabled by default
-  # because it can drift on face boxes when visual tracking is unavailable.
-  face_chain_enabled: true
-  face_tracker_enabled: false
-  face_track_iou_threshold: 0.25  # used only if face_tracker_enabled=true
-  face_track_max_miss: 12         # legacy, kept for old configs
-  # aligned_trt = custom plugin tự decode landmarks, align NPP, chạy ArcFace TRT
-  # và attach embedding vào object meta. direct_sgie là fallback crop/resize.
-  face_embed_backend: "aligned_trt"
+  face_det_config: "./configs/face_det_config.txt"
+  # Face chain: SCRFD det → nvdsfaceembed (CUDA align + TensorRT ArcFace,
+  # embedding attached as PARKING.FACE_EMBEDDING_META on obj_meta).
   face_embed_engine: "./models/face_embed_arcface_fp16.engine"
   face_embed_batch_size: 16
   face_embed_align_on_gpu: true
   face_embed_allow_cpu_fallback: true
-  face_det_config: "./configs/face_det_config.txt"
-  face_embed_config: "./configs/face_embed_config.txt"
-  tracker_config: "./configs/tracker_nvdcf.yml"
-  # Legacy/debug only: nvdspreprocess → nvinfer path can double-free ROI meta.
-  face_align_enabled: false
-  face_preprocess_config: "./configs/face_preprocess_config.txt"
-  # Debug isolation: false = keep SGIE output tensor meta enabled but do not
-  # read embedding from Python Probe B.
-  read_face_embeddings: true
 
 plate_detector:
   model: "./models/plate_yolov8n.pt"
@@ -67,18 +50,12 @@ plate_ocr:
   use_gpu: true
 
 face:
+  # model_pack/det_size dùng cho InsightFace fallback khi DeepStream tắt.
   model_pack: "buffalo_sc"
   det_size: [640, 640]
   blur_threshold: 10.0
-  # DeepStream face path now uses the current validated embedding only.
-  multi_embedding: true              # legacy flag; no longer gates DS path
-  k_max: 5                           # bank cap cho entry
-  min_track_frames: 5                # min frames before track candidate-eligible
-  track_idle_drop_frames: 30         # Invariant 1: drop track idle > N frames (~1s @30fps)
-  plate_face_max_gap_frames: 30      # Invariant 2: fresh face required at commit
   min_quality: 0.4                   # per-frame quality gate
-  embedding_hold_frames: 30          # reuse latest embedding only while same face bbox remains visible
-  dedup_cos: 0.9                    # bank de-dup similarity
+  embedding_hold_frames: 30          # reuse latest embedding while same face bbox visible
 
 recognition:
   face_threshold: 0.3

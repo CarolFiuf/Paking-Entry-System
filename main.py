@@ -12,8 +12,7 @@ from threading import Thread
 
 from engine import PlateDetector, PlateOCRYolo, PlateOCR, FaceEngine
 from database import ParkingDB
-from pipeline import (HAS_DEEPSTREAM, HAS_FACE_HELPERS,
-                      DeepStreamPipeline, StreamReader)
+from pipeline import HAS_DEEPSTREAM, DeepStreamPipeline, StreamReader
 
 logging.basicConfig(
     level=logging.INFO,
@@ -185,12 +184,7 @@ class ParkingSystem:
             self.use_deepstream and ds_cfg.get("plate_enabled", True))
         self._ds_face_enabled = bool(
             self.use_deepstream and ds_cfg.get("face_enabled", True))
-        self._ds_face_chain = bool(
-            self.use_deepstream
-            and self._ds_face_enabled
-            and ds_cfg.get("face_chain_enabled", False)
-            and HAS_FACE_HELPERS
-        )
+        self._ds_face_chain = self._ds_face_enabled
         if not self.use_deepstream:
             pcfg = self.cfg["plate_detector"]
             self.plate_det = PlateDetector(

@@ -1,9 +1,9 @@
-#include <cstring>
 #include <algorithm>
 #include <cmath>
-#include <map>
 #include <vector>
+
 #include "nvdsinfer_custom_impl.h"
+#include "scrfd_decode.h"
 
 /**
  * SCRFD bbox parser (only) cho DeepStream nvinfer.
@@ -13,44 +13,13 @@
  *
  * Parser chỉ emit bbox sau khi lọc score + hình học landmark; nvdsfaceembed
  * decode lại landmarks từ frame_user_meta (output-tensor-meta=1) để align và
- * tạo embedding trên GPU.
+ * tạo embedding trên GPU. Logic decode/NMS dùng chung qua scrfd_decode.h.
  */
 
-static constexpr float MIN_CONF_THRESH = 0.50f;
-static constexpr float NMS_THRESH  = 0.4f;
-static constexpr int   NUM_ANCHORS = 2;
-
-struct Detection {
-    float x1, y1, x2, y2, conf;
-    float lm[5][2];
-};
-
-static float iou(const Detection& a, const Detection& b) {
-    float ix1 = std::max(a.x1, b.x1), iy1 = std::max(a.y1, b.y1);
-    float ix2 = std::min(a.x2, b.x2), iy2 = std::min(a.y2, b.y2);
-    float inter = std::max(0.f, ix2 - ix1) * std::max(0.f, iy2 - iy1);
-    float area_a = std::max(0.f, a.x2 - a.x1) * std::max(0.f, a.y2 - a.y1);
-    float area_b = std::max(0.f, b.x2 - b.x1) * std::max(0.f, b.y2 - b.y1);
-    return inter / (area_a + area_b - inter + 1e-6f);
-}
-
-static std::vector<Detection> nms(std::vector<Detection>& dets) {
-    std::sort(dets.begin(), dets.end(),
-              [](const Detection& a, const Detection& b) {
-                  return a.conf > b.conf;
-              });
-    std::vector<Detection> kept;
-    std::vector<bool> suppressed(dets.size(), false);
-    for (size_t i = 0; i < dets.size(); i++) {
-        if (suppressed[i]) continue;
-        kept.push_back(dets[i]);
-        for (size_t j = i + 1; j < dets.size(); j++) {
-            if (!suppressed[j] && iou(dets[i], dets[j]) > NMS_THRESH)
-                suppressed[j] = true;
-        }
-    }
-    return kept;
-}
+// Fallback nếu nvinfer config không khai báo pre-cluster-threshold (gần như
+// không bao giờ xảy ra với face_det_config.txt). Giá trị này khớp với
+// DEFAULT_DECODE_CONF_THRESH của plugin nvdsfaceembed để 2 bên đồng bộ.
+static constexpr float DEFAULT_CONF_THRESH = 0.30f;
 
 static int layer_total_elems(const NvDsInferLayerInfo& l) {
     int n = 1;
@@ -64,7 +33,7 @@ static int layer_last_dim(const NvDsInferLayerInfo& l) {
     return l.inferDims.d[l.inferDims.numDims - 1];
 }
 
-static bool valid_face_geometry(const Detection& d,
+static bool valid_face_geometry(const DecodedFace& d,
                                 float net_w, float net_h) {
     float w = d.x2 - d.x1;
     float h = d.y2 - d.y1;
@@ -126,16 +95,14 @@ extern "C" bool NvDsInferParseCustomScrfd(
     NvDsInferParseDetectionParams const& detectionParams,
     std::vector<NvDsInferParseObjectInfo>& objectList)
 {
-    float conf_thresh = MIN_CONF_THRESH;
-    if (!detectionParams.perClassPreclusterThreshold.empty()) {
-        conf_thresh = std::max(
-            conf_thresh, detectionParams.perClassPreclusterThreshold[0]);
-    }
+    // Lấy thẳng từ nvinfer config (pre-cluster-threshold). Plugin
+    // nvdsfaceembed cũng đọc giá trị này qua pipeline.py để đảm bảo
+    // decode hai bên dùng chung threshold.
+    float conf_thresh = detectionParams.perClassPreclusterThreshold.empty()
+        ? DEFAULT_CONF_THRESH
+        : detectionParams.perClassPreclusterThreshold[0];
 
-    std::map<int, const float*> score_by_anchors;
-    std::map<int, const float*> bbox_by_anchors;
-    std::map<int, const float*> kps_by_anchors;
-
+    ScrfdLayers layers;
     for (const auto& layer : outputLayersInfo) {
         if (!layer.buffer) continue;
         int last_dim = layer_last_dim(layer);
@@ -144,55 +111,23 @@ extern "C" bool NvDsInferParseCustomScrfd(
         int anchors  = total / last_dim;
 
         const float* buf = static_cast<const float*>(layer.buffer);
-        if (last_dim == 1)        score_by_anchors[anchors] = buf;
-        else if (last_dim == 4)   bbox_by_anchors[anchors]  = buf;
-        else if (last_dim == 10)  kps_by_anchors[anchors]   = buf;
+        if (last_dim == 1)        layers.scores[anchors] = buf;
+        else if (last_dim == 4)   layers.boxes[anchors]  = buf;
+        else if (last_dim == 10)  layers.kps[anchors]    = buf;
     }
 
-    const int strides[] = {8, 16, 32};
-    std::vector<Detection> all_dets;
+    std::vector<DecodedFace> raw;
+    scrfd_decode(layers, (int)networkInfo.width, (int)networkInfo.height,
+                 conf_thresh, raw);
 
-    for (int stride : strides) {
-        int feat = static_cast<int>(networkInfo.width) / stride;
-        int anchors = feat * feat * NUM_ANCHORS;
-
-        auto sit = score_by_anchors.find(anchors);
-        auto bit = bbox_by_anchors.find(anchors);
-        auto kit = kps_by_anchors.find(anchors);
-        if (sit == score_by_anchors.end() || bit == bbox_by_anchors.end() ||
-                kit == kps_by_anchors.end())
-            continue;
-
-        const float* score = sit->second;
-        const float* bbox  = bit->second;
-        const float* kps   = kit->second;
-
-        for (int i = 0; i < anchors; i++) {
-            float s = score[i];
-            if (s < conf_thresh) continue;
-            int loc = i / NUM_ANCHORS;
-            int y   = loc / feat;
-            int x   = loc % feat;
-            float cx = x * stride;
-            float cy = y * stride;
-            Detection d;
-            d.x1   = cx - bbox[i * 4 + 0] * stride;
-            d.y1   = cy - bbox[i * 4 + 1] * stride;
-            d.x2   = cx + bbox[i * 4 + 2] * stride;
-            d.y2   = cy + bbox[i * 4 + 3] * stride;
-            d.conf = s;
-            for (int p = 0; p < 5; p++) {
-                d.lm[p][0] = cx + kps[i * 10 + p * 2 + 0] * stride;
-                d.lm[p][1] = cy + kps[i * 10 + p * 2 + 1] * stride;
-            }
-            if (valid_face_geometry(d, networkInfo.width,
-                                    networkInfo.height)) {
-                all_dets.push_back(d);
-            }
-        }
+    std::vector<DecodedFace> valid;
+    valid.reserve(raw.size());
+    for (const auto& d : raw) {
+        if (valid_face_geometry(d, networkInfo.width, networkInfo.height))
+            valid.push_back(d);
     }
 
-    auto kept = nms(all_dets);
+    auto kept = scrfd_nms(valid);
 
     for (const auto& d : kept) {
         NvDsInferParseObjectInfo obj{};

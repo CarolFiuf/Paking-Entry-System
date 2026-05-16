@@ -22,6 +22,7 @@
 
 #include "face_align_solver.h"
 #include "nvds_face_embed_meta.h"
+#include "scrfd_decode.h"
 
 extern "C" cudaError_t launch_face_align_rgba_chw_kernel(
     const uint8_t *rgba, int src_w, int src_h, int src_pitch, float *dst,
@@ -41,9 +42,7 @@ static constexpr int FACE_H = 112;
 static constexpr int FACE_TENSOR_FLOATS = 3 * FACE_W * FACE_H;
 static constexpr int EMBED_DIMS = PARKING_FACE_EMBED_DIMS;
 static constexpr float LM_MARGIN_PX = 8.0f;
-static constexpr int DECODE_NUM_ANCHORS = 2;
 static constexpr float DEFAULT_DECODE_CONF_THRESH = 0.30f;
-static constexpr float DECODE_NMS_IOU = 0.4f;
 static constexpr float LANDMARK_MATCH_MIN_IOU = 0.10f;
 
 GST_DEBUG_CATEGORY_STATIC(gst_nvdsfaceembed_debug);
@@ -114,12 +113,6 @@ public:
 
 static TrtLogger g_trt_logger;
 
-struct DecodedFace {
-    float x1, y1, x2, y2;
-    float conf;
-    float lm[5][2];
-};
-
 struct FaceJob {
     NvDsFrameMeta *frame_meta;
     NvDsObjectMeta *obj_meta;
@@ -156,27 +149,13 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE_WITH_FEATURES(
         GST_CAPS_FEATURE_MEMORY_NVMM, "{ NV12, RGBA }")));
 
-static float face_iou(const DecodedFace &a, const DecodedFace &b) {
-    float ix1 = std::max(a.x1, b.x1);
-    float iy1 = std::max(a.y1, b.y1);
-    float ix2 = std::min(a.x2, b.x2);
-    float iy2 = std::min(a.y2, b.y2);
-    float inter = std::max(0.f, ix2 - ix1) * std::max(0.f, iy2 - iy1);
-    float area_a = std::max(0.f, a.x2 - a.x1) * std::max(0.f, a.y2 - a.y1);
-    float area_b = std::max(0.f, b.x2 - b.x1) * std::max(0.f, b.y2 - b.y1);
-    return inter / (area_a + area_b - inter + 1e-6f);
-}
-
 static void decode_scrfd_from_frame(NvDsFrameMeta *fm, int gie_uid, int net_w,
                                     int net_h, float conf_threshold,
                                     std::vector<DecodedFace> &out) {
     out.clear();
     if (!fm) return;
 
-    std::map<int, const float *> scores;
-    std::map<int, const float *> boxes;
-    std::map<int, const float *> kps;
-
+    ScrfdLayers layers;
     for (NvDsMetaList *l = fm->frame_user_meta_list; l; l = l->next) {
         NvDsUserMeta *um = (NvDsUserMeta *)l->data;
         if (!um || um->base_meta.meta_type != NVDSINFER_TENSOR_OUTPUT_META)
@@ -195,61 +174,15 @@ static void decode_scrfd_from_frame(NvDsFrameMeta *fm, int gie_uid, int net_w,
             int anchors = total / last;
             const float *buf = (const float *)tm->out_buf_ptrs_host[i];
             if (!buf) continue;
-            if (last == 1) scores[anchors] = buf;
-            else if (last == 4) boxes[anchors] = buf;
-            else if (last == 10) kps[anchors] = buf;
+            if (last == 1) layers.scores[anchors] = buf;
+            else if (last == 4) layers.boxes[anchors] = buf;
+            else if (last == 10) layers.kps[anchors] = buf;
         }
     }
 
-    const int strides[] = {8, 16, 32};
-    std::vector<DecodedFace> all;
-    for (int stride : strides) {
-        int feat = net_w / stride;
-        int anchors = feat * feat * DECODE_NUM_ANCHORS;
-        auto sit = scores.find(anchors);
-        auto bit = boxes.find(anchors);
-        auto kit = kps.find(anchors);
-        if (sit == scores.end() || bit == boxes.end() || kit == kps.end())
-            continue;
-        const float *S = sit->second;
-        const float *B = bit->second;
-        const float *K = kit->second;
-        for (int i = 0; i < anchors; i++) {
-            float score = S[i];
-            if (score < conf_threshold) continue;
-            int loc = i / DECODE_NUM_ANCHORS;
-            int y = loc / feat;
-            int x = loc % feat;
-            float cx = x * stride;
-            float cy = y * stride;
-            DecodedFace d{};
-            d.conf = score;
-            d.x1 = cx - B[i * 4 + 0] * stride;
-            d.y1 = cy - B[i * 4 + 1] * stride;
-            d.x2 = cx + B[i * 4 + 2] * stride;
-            d.y2 = cy + B[i * 4 + 3] * stride;
-            for (int p = 0; p < 5; p++) {
-                d.lm[p][0] = cx + K[i * 10 + p * 2 + 0] * stride;
-                d.lm[p][1] = cy + K[i * 10 + p * 2 + 1] * stride;
-            }
-            all.push_back(d);
-        }
-    }
-
-    std::sort(all.begin(), all.end(), [](const DecodedFace &a,
-                                         const DecodedFace &b) {
-        return a.conf > b.conf;
-    });
-
-    std::vector<bool> suppressed(all.size(), false);
-    for (size_t i = 0; i < all.size(); i++) {
-        if (suppressed[i]) continue;
-        out.push_back(all[i]);
-        for (size_t j = i + 1; j < all.size(); j++) {
-            if (!suppressed[j] && face_iou(all[i], all[j]) > DECODE_NMS_IOU)
-                suppressed[j] = true;
-        }
-    }
+    std::vector<DecodedFace> raw;
+    scrfd_decode(layers, net_w, net_h, conf_threshold, raw);
+    out = scrfd_nms(raw);
 }
 
 static void net_to_frame_lm(const DecodedFace &d, int net_w, int net_h,

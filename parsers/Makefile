@@ -1,13 +1,22 @@
 CXX     := g++
 DS_INC  := /opt/nvidia/deepstream/deepstream/sources/includes
 
-CXXFLAGS := -shared -fPIC -O2 -std=c++14 -Wall \
-            -I$(DS_INC) -I/usr/local/cuda/include
+CXXFLAGS := -fPIC -O2 -std=c++14 -Wall \
+            -I. -I$(DS_INC) -I/usr/local/cuda/include
 
-all: libnvds_scrfd_parser.so
+OBJS   := nvds_scrfd_parser.o scrfd_decode.o
+TARGET := libnvds_scrfd_parser.so
 
-libnvds_scrfd_parser.so: nvds_scrfd_parser.cpp
-	$(CXX) $(CXXFLAGS) $< -o $@
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CXX) -shared -o $@ $^
+
+nvds_scrfd_parser.o: nvds_scrfd_parser.cpp scrfd_decode.h
+	$(CXX) -c $(CXXFLAGS) $< -o $@
+
+scrfd_decode.o: scrfd_decode.cpp scrfd_decode.h
+	$(CXX) -c $(CXXFLAGS) $< -o $@
 
 clean:
-	rm -f libnvds_scrfd_parser.so
+	rm -f $(OBJS) $(TARGET)
