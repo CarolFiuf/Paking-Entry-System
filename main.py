@@ -815,6 +815,8 @@ class ParkingSystem:
                 # alive, but do not call entry/exit logic that requires both
                 # plate and face frames.
                 if not (self._ds_plate_enabled and self._ds_face_enabled):
+                    # Reset trước, tránh giữ bbox cũ khi frame mới không có mặt.
+                    self._last_result = {"ok": False}
                     if ff is not None and self._ds_face_enabled:
                         best = self._pick_display_face(face_data)
                         if best:

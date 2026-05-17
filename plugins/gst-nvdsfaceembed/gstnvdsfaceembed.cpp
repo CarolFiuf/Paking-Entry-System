@@ -44,9 +44,7 @@ static constexpr int FACE_W = 112;
 static constexpr int FACE_H = 112;
 static constexpr int FACE_TENSOR_FLOATS = 3 * FACE_W * FACE_H;
 static constexpr int EMBED_DIMS = PARKING_FACE_EMBED_DIMS;
-static constexpr float LM_MARGIN_PX = 8.0f;
 static constexpr float DEFAULT_DECODE_CONF_THRESH = 0.30f;
-static constexpr float LANDMARK_MATCH_MIN_IOU = 0.10f;
 
 GST_DEBUG_CATEGORY_STATIC(gst_nvdsfaceembed_debug);
 #define GST_CAT_DEFAULT gst_nvdsfaceembed_debug
@@ -209,63 +207,6 @@ static void net_to_frame_lm(const DecodedFace &d, int net_w, int net_h,
         out_lm[i][0] = (d.lm[i][0] - pad_x) / scale;
         out_lm[i][1] = (d.lm[i][1] - pad_y) / scale;
     }
-}
-
-static bool match_landmarks_for_obj(const std::vector<DecodedFace> &faces,
-                                    int net_w, int net_h, int frame_w,
-                                    int frame_h, const NvOSD_RectParams &rp,
-                                    float out_lm[5][2], float out_box[4]) {
-    if (faces.empty()) return false;
-
-    DecodedFace obj_box{};
-    obj_box.x1 = rp.left;
-    obj_box.y1 = rp.top;
-    obj_box.x2 = rp.left + rp.width;
-    obj_box.y2 = rp.top + rp.height;
-
-    float best_iou = 0.0f;
-    int best_idx = -1;
-    float best_lm[5][2];
-    float best_box[4];
-
-    for (size_t i = 0; i < faces.size(); i++) {
-        float box[4];
-        float lm[5][2];
-        net_to_frame_lm(faces[i], net_w, net_h, frame_w, frame_h, lm, box);
-        DecodedFace fb{};
-        fb.x1 = box[0]; fb.y1 = box[1];
-        fb.x2 = box[2]; fb.y2 = box[3];
-        float iou = face_iou(obj_box, fb);
-        if (iou > best_iou) {
-            best_iou = iou;
-            best_idx = (int)i;
-            std::memcpy(best_lm, lm, sizeof(best_lm));
-            std::memcpy(best_box, box, sizeof(best_box));
-        }
-    }
-
-    if (best_idx < 0 || best_iou < LANDMARK_MATCH_MIN_IOU) return false;
-    if (!std::isfinite(best_box[0]) || !std::isfinite(best_box[1]) ||
-        !std::isfinite(best_box[2]) || !std::isfinite(best_box[3]) ||
-        best_box[2] <= best_box[0] || best_box[3] <= best_box[1])
-        return false;
-
-    for (int i = 0; i < 5; i++) {
-        float x = best_lm[i][0];
-        float y = best_lm[i][1];
-        if (!std::isfinite(x) || !std::isfinite(y) ||
-            x < -LM_MARGIN_PX || x > frame_w + LM_MARGIN_PX ||
-            y < -LM_MARGIN_PX || y > frame_h + LM_MARGIN_PX) {
-            return false;
-        }
-        out_lm[i][0] = x;
-        out_lm[i][1] = y;
-    }
-    out_box[0] = std::max(0.0f, best_box[0]);
-    out_box[1] = std::max(0.0f, best_box[1]);
-    out_box[2] = std::min((float)frame_w, best_box[2]);
-    out_box[3] = std::min((float)frame_h, best_box[3]);
-    return true;
 }
 
 static bool align_face_cpu_rgba_to_slot(const guint8 *rgba, int width,
@@ -872,7 +813,6 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
     }
 
     std::vector<FaceJob> jobs;
-    std::map<NvDsFrameMeta *, std::vector<DecodedFace>> faces_by_frame;
 
     for (NvDsMetaList *lf = batch_meta->frame_meta_list; lf; lf = lf->next) {
         NvDsFrameMeta *fm = (NvDsFrameMeta *)lf->data;
@@ -880,16 +820,6 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
         if (self->source_id >= 0 && (gint)fm->source_id != self->source_id)
             continue;
         self->stat_frames++;
-
-        auto it = faces_by_frame.find(fm);
-        if (it == faces_by_frame.end()) {
-            std::vector<DecodedFace> faces;
-            decode_scrfd_from_frame(fm, self->face_gie_id,
-                                    (int)self->net_width,
-                                    (int)self->net_height,
-                                    self->decode_conf_threshold, faces);
-            it = faces_by_frame.emplace(fm, std::move(faces)).first;
-        }
 
         int frame_w = 0;
         int frame_h = 0;
@@ -904,29 +834,79 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
         if (frame_w <= 0 || frame_h <= 0)
             continue;
 
-        for (NvDsMetaList *lo = fm->obj_meta_list; lo; lo = lo->next) {
-            NvDsObjectMeta *om = (NvDsObjectMeta *)lo->data;
-            if (!om || (guint)om->unique_component_id != self->face_gie_id)
-                continue;
-            if (om->class_id != 0) continue;
-            self->stat_objs++;
-            if (om->rect_params.width < self->min_object_width ||
-                om->rect_params.height < self->min_object_height)
-                continue;
+        // Decode SCRFD đúng 1 lần / frame, sau đó tạo obj_meta + job align
+        // trong cùng vòng. Parser là no-op nên nvinfer không sinh obj_meta.
+        std::vector<DecodedFace> raw_faces;
+        decode_scrfd_from_frame(fm, self->face_gie_id,
+                                (int)self->net_width,
+                                (int)self->net_height,
+                                self->decode_conf_threshold, raw_faces);
 
+        std::vector<DecodedFace> valid_faces;
+        valid_faces.reserve(raw_faces.size());
+        for (const auto &d : raw_faces) {
+            self->stat_objs++;
+            if (valid_face_geometry(d, (float)self->net_width,
+                                    (float)self->net_height))
+                valid_faces.push_back(d);
+        }
+        auto kept_faces = scrfd_nms(valid_faces);
+
+        for (const auto &d : kept_faces) {
             float lm[5][2];
             float box[4];
-            if (!match_landmarks_for_obj(it->second, (int)self->net_width,
-                                         (int)self->net_height, frame_w,
-                                         frame_h, om->rect_params, lm, box))
+            net_to_frame_lm(d, (int)self->net_width, (int)self->net_height,
+                            frame_w, frame_h, lm, box);
+
+            float x1 = std::max(0.0f, box[0]);
+            float y1 = std::max(0.0f, box[1]);
+            float x2 = std::min((float)frame_w, box[2]);
+            float y2 = std::min((float)frame_h, box[3]);
+            if (!std::isfinite(x1) || !std::isfinite(y1) ||
+                !std::isfinite(x2) || !std::isfinite(y2))
                 continue;
+            float bw = x2 - x1;
+            float bh = y2 - y1;
+            if (bw < (float)self->min_object_width ||
+                bh < (float)self->min_object_height)
+                continue;
+
+            bool lm_in_frame = true;
+            for (int i = 0; i < 5; i++) {
+                if (!std::isfinite(lm[i][0]) || !std::isfinite(lm[i][1])) {
+                    lm_in_frame = false;
+                    break;
+                }
+            }
+            if (!lm_in_frame) continue;
+
+            NvDsObjectMeta *om = nvds_acquire_obj_meta_from_pool(batch_meta);
+            if (!om) continue;
+            om->unique_component_id = self->face_gie_id;
+            om->class_id = 0;
+            om->object_id = UNTRACKED_OBJECT_ID;
+            om->confidence = d.conf;
+            om->tracker_confidence = 0.0f;
+            om->rect_params.left = x1;
+            om->rect_params.top = y1;
+            om->rect_params.width = bw;
+            om->rect_params.height = bh;
+            om->rect_params.border_width = 0;
+            om->rect_params.has_bg_color = 0;
+            om->detector_bbox_info.org_bbox_coords.left = x1;
+            om->detector_bbox_info.org_bbox_coords.top = y1;
+            om->detector_bbox_info.org_bbox_coords.width = bw;
+            om->detector_bbox_info.org_bbox_coords.height = bh;
+            g_strlcpy(om->obj_label, "face", MAX_LABEL_SIZE);
+            nvds_add_obj_meta_to_frame(fm, om, nullptr);
 
             FaceJob job{};
             job.frame_meta = fm;
             job.obj_meta = om;
             job.batch_id = fm->batch_id;
+            float box_out[4] = {x1, y1, x2, y2};
             std::memcpy(job.lm, lm, sizeof(lm));
-            std::memcpy(job.bbox, box, sizeof(box));
+            std::memcpy(job.bbox, box_out, sizeof(box_out));
             jobs.push_back(job);
             self->stat_lm++;
         }
