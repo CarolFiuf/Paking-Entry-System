@@ -453,7 +453,7 @@ static bool run_trt(GstNvDsFaceEmbed *self, int batch_size) {
         GST_ERROR_OBJECT(self, "TensorRT setTensorAddress failed");
         return false;
     }
-    if (!self->context->enqueueV3(self->stream)) {
+    if (!self->context->enqueueV3(self->stream)) {2
         GST_ERROR_OBJECT(self, "TensorRT enqueueV3 failed");
         return false;
     }

@@ -135,19 +135,37 @@ class DeepStreamPipeline:
 
         self._net_w = 640    # SCRFD input size, hardcoded khớp face_det_config
 
-        # Kết quả mới nhất từ Probe B
-        self._plate_frame = None
+        # nvstreammux output size — bbox plugin sinh ra theo toạ độ này (surface
+        # size sau mux), KHÔNG phải source camera size. Giữ ở 1 chỗ để khớp
+        # _configure_mux + scale bbox về display frame.
+        self._mux_w = 1280
+        self._mux_h = 720
+
+        # Display frames (downscale 640×360 BGR) — appsink push, lock riêng để
+        # không cản probe meta. Web thread đọc, recognition KHÔNG đụng.
+        self._display_w = 640
+        self._display_h = 360
+        self._display_fps = 10
+        self._display_period_s = 1.0 / self._display_fps
+        # Pad probe throttle: lưu timestamp buffer cuối được pass qua, per
+        # branch. Drop nếu chưa đủ _display_period_s — tiết kiệm GPU
+        # nvvideoconvert downscale 2/3 frame.
+        self._disp_last_pass = {}
+        self._face_display_frame = None
+        self._plate_display_frame = None
+        self._display_lock = Lock()
+
+        # Meta state — probe push, main loop pull.
+        # _plate_full_frame chỉ set khi probe thấy plate detection (cần cho OCR
+        # crop). Khi không có plate, giữ None để tránh memcpy thừa.
         self._plate_detections = []
-        self._face_frame = None
+        self._plate_full_frame = None
+        self._plate_source_size = (0, 0)
         self._face_data = []         # list[dict{bbox, conf, embedding, quality}]
+        self._face_source_size = (0, 0)
 
         self._frame_seq = 0
-        self._frame_event = Event()
-
-        # Early-skip batch ngay trong probe, trước get_nvds_buf_surface
-        self._skip_n = max(
-            1, int(cfg.get("camera", {}).get("process_every_n", 1)))
-        self._probe_counter = 0
+        self._meta_event = Event()
 
         self._probe_count = 0
         self._probe_fps = 0.0
@@ -198,11 +216,10 @@ class DeepStreamPipeline:
             log.debug(f"Could not read face detector threshold: {e}")
         return default
 
-    @staticmethod
-    def _configure_mux(mux, batch_size: int = 1):
+    def _configure_mux(self, mux, batch_size: int = 1):
         mux.set_property("batch-size", batch_size)
-        mux.set_property("width", 1280)
-        mux.set_property("height", 720)
+        mux.set_property("width", self._mux_w)
+        mux.set_property("height", self._mux_h)
         mux.set_property("batched-push-timeout", 40000)
         mux.set_property("live-source", 1)
 
@@ -249,6 +266,8 @@ class DeepStreamPipeline:
 
         pgie_plate = self._make_element("nvinfer", "plate_det", pipeline)
         pgie_plate.set_property("config-file-path", ds_cfg["plate_config"])
+        self._apply_nvinfer_interval(pgie_plate, ds_cfg.get(
+            "plate_det_interval"), "plate")
 
         nvconv = self._make_element("nvvideoconvert", "plate_nvconv_out",
                                     pipeline)
@@ -257,15 +276,28 @@ class DeepStreamPipeline:
         capsfilter.set_property(
             "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"))
 
-        sink = self._make_element("fakesink", "plate_sink", pipeline)
-        sink.set_property("sync", 0)
-        sink.set_property("async", 0)
+        tee = self._make_element("tee", "plate_tee", pipeline)
+        self._link_many([mux, pgie_plate, nvconv, capsfilter, tee])
 
-        self._link_many([mux, pgie_plate, nvconv, capsfilter, sink])
-        sink.get_static_pad("sink").add_probe(
+        # Nhánh META: chỉ probe meta, plate full-res materialize on-demand
+        # khi có plate detection (cho OCR crop).
+        meta_queue = self._make_queue("plate_meta_queue", pipeline,
+                                      max_buffers=2)
+        meta_sink = self._make_element("fakesink", "plate_meta_sink", pipeline)
+        meta_sink.set_property("sync", 0)
+        meta_sink.set_property("async", 0)
+        self._link_tee_branch(tee, [meta_queue, meta_sink])
+        meta_sink.get_static_pad("sink").add_probe(
             Gst.PadProbeType.BUFFER, self._probe_callback, "plate")
+
+        # Nhánh DISPLAY: downscale GPU → cap 10 fps → appsink BGR cho web.
+        appsink = self._build_display_branch(
+            pipeline, tee, name_prefix="plate")
+        appsink.connect("new-sample", self._on_plate_appsink_sample)
+
         self._attach_bus(pipeline)
-        log.info("Plate pipeline: src → mux(batch=1) → plate_det → sink")
+        log.info("Plate pipeline: src → mux → plate_det → tee "
+                 "[meta_probe | display(640×360@10fps)]")
 
     def _build_face_pipeline(self, face_src: str):
         ds_cfg = self.cfg["deepstream"]
@@ -283,6 +315,8 @@ class DeepStreamPipeline:
 
         pgie_face = self._make_element("nvinfer", "face_det", pipeline)
         pgie_face.set_property("config-file-path", ds_cfg["face_det_config"])
+        self._apply_nvinfer_interval(pgie_face, ds_cfg.get(
+            "face_det_interval"), "face")
         self._pgie_face = pgie_face
 
         nvconv = self._make_element("nvvideoconvert", "face_nvconv_out",
@@ -295,17 +329,27 @@ class DeepStreamPipeline:
         embedder = self._make_face_embedder(pipeline, ds_cfg)
         self._face_embedder = embedder
 
-        sink = self._make_element("fakesink", "face_sink", pipeline)
-        sink.set_property("sync", 0)
-        sink.set_property("async", 0)
+        tee = self._make_element("tee", "face_tee", pipeline)
+        self._link_many([mux, pgie_face, nvconv, capsfilter, embedder, tee])
 
-        self._link_many([mux, pgie_face, nvconv, capsfilter, embedder, sink])
-
-        sink.get_static_pad("sink").add_probe(
+        # Nhánh META: probe đọc obj_meta + embedding, KHÔNG materialize BGR.
+        meta_queue = self._make_queue("face_meta_queue", pipeline,
+                                      max_buffers=2)
+        meta_sink = self._make_element("fakesink", "face_meta_sink", pipeline)
+        meta_sink.set_property("sync", 0)
+        meta_sink.set_property("async", 0)
+        self._link_tee_branch(tee, [meta_queue, meta_sink])
+        meta_sink.get_static_pad("sink").add_probe(
             Gst.PadProbeType.BUFFER, self._probe_callback, "face")
+
+        # Nhánh DISPLAY: downscale GPU → cap 10 fps → appsink BGR cho web.
+        appsink = self._build_display_branch(
+            pipeline, tee, name_prefix="face")
+        appsink.connect("new-sample", self._on_face_appsink_sample)
+
         self._attach_bus(pipeline)
-        log.info("Face pipeline: src → mux(batch=1) → face_det → "
-                 "nvdsfaceembed(aligned TRT ArcFace) → sink")
+        log.info("Face pipeline: src → mux → face_det → nvdsfaceembed → tee "
+                 "[meta_probe | display(640×360@10fps)]")
 
     def _make_face_embedder(self, pipeline, ds_cfg):
         embedder = self._make_element("nvdsfaceembed", "face_embed_aligned",
@@ -340,6 +384,149 @@ class DeepStreamPipeline:
         embedder.set_property("blur-threshold",
             float(self.cfg.get("face", {}).get("blur_threshold", 10.0)))
         return embedder
+
+    @staticmethod
+    def _apply_nvinfer_interval(nvinfer_elem, interval_cfg, label: str):
+        """Override nvinfer `interval` property nếu config khai báo.
+
+        interval=N → chạy 1 frame, skip N frame. None hoặc thiếu → giữ giá trị
+        trong .txt config (mặc định 0 = không skip). Tăng N để giảm GPU; đánh
+        đổi: tracker lâu commit hơn N+1 lần và rủi ro miss mặt nếu subject
+        chỉ xuất hiện trong frame skip.
+        """
+        if interval_cfg is None:
+            return
+        try:
+            interval = int(interval_cfg)
+        except (TypeError, ValueError):
+            log.warning(f"{label}_det_interval không phải int: {interval_cfg!r}")
+            return
+        if interval < 0:
+            return
+        nvinfer_elem.set_property("interval", interval)
+        log.info(f"{label}_det nvinfer interval={interval} "
+                 f"(infer 1/{interval+1} frame)")
+
+    def _make_queue(self, name: str, pipeline, max_buffers: int = 2,
+                    leaky: int = 2):
+        q = self._make_element("queue", name, pipeline)
+        q.set_property("max-size-buffers", max_buffers)
+        q.set_property("max-size-bytes", 0)
+        q.set_property("max-size-time", 0)
+        q.set_property("leaky", leaky)
+        return q
+
+    def _link_tee_branch(self, tee, elements: list) -> bool:
+        """Request 1 src pad từ tee và link vào element đầu của chuỗi."""
+        head = elements[0]
+        tee_src = tee.get_request_pad("src_%u")
+        head_sink = head.get_static_pad("sink")
+        if not tee_src or not head_sink:
+            log.error(f"Failed to get pads for tee → {head.get_name()}")
+            return False
+        if tee_src.link(head_sink) != Gst.PadLinkReturn.OK:
+            log.error(f"Failed to link tee → {head.get_name()}")
+            return False
+        return self._link_many(elements)
+
+    def _build_display_branch(self, pipeline, tee, name_prefix: str):
+        """
+        tee → queue → nvvideoconvert (NVMM RGBA → system mem BGRx 640×360)
+              → caps(BGRx) → videoconvert → caps(BGR)
+              → appsink(drop=1, max-buffers=1, emit-signals=1)
+
+        Throttle: appsink drop=1 + Python callback @ 10 Hz tự bỏ frame thừa.
+        """
+        q = self._make_queue(f"{name_prefix}_disp_queue", pipeline,
+                             max_buffers=2)
+        nvconv = self._make_element("nvvideoconvert",
+                                    f"{name_prefix}_disp_nvconv", pipeline)
+        caps_bgrx = self._make_element("capsfilter",
+                                       f"{name_prefix}_disp_caps_bgrx",
+                                       pipeline)
+        caps_bgrx.set_property(
+            "caps", Gst.Caps.from_string(
+                f"video/x-raw,format=BGRx,"
+                f"width={self._display_w},height={self._display_h}"))
+        vconv = self._make_element("videoconvert",
+                                   f"{name_prefix}_disp_videoconvert",
+                                   pipeline)
+        caps_bgr = self._make_element("capsfilter",
+                                      f"{name_prefix}_disp_caps_bgr",
+                                      pipeline)
+        caps_bgr.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw,format=BGR"))
+        appsink = self._make_element("appsink",
+                                     f"{name_prefix}_disp_appsink", pipeline)
+        appsink.set_property("emit-signals", True)
+        appsink.set_property("sync", False)
+        appsink.set_property("drop", True)
+        appsink.set_property("max-buffers", 1)
+        appsink.set_property("async", False)
+
+        self._link_tee_branch(tee, [q, nvconv, caps_bgrx, vconv,
+                                    caps_bgr, appsink])
+
+        # Throttle ngay sau queue (trước nvvideoconvert) → nvvideoconvert
+        # chỉ thấy ~display_fps buffer/giây, GPU downscale 1/3 work.
+        q.get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._display_throttle_probe,
+            name_prefix)
+        return appsink
+
+    def _display_throttle_probe(self, pad, info, name_prefix):
+        """Drop buffer trước nvvideoconvert nếu chưa đủ 1/display_fps giây
+        kể từ buffer được pass cuối — giữ display branch ở ~10 fps, tiết kiệm
+        GPU downscale work cho 20 fps còn lại."""
+        now = time.monotonic()
+        last = self._disp_last_pass.get(name_prefix, 0.0)
+        if now - last < self._display_period_s:
+            return Gst.PadProbeReturn.DROP
+        self._disp_last_pass[name_prefix] = now
+        return Gst.PadProbeReturn.OK
+
+    @staticmethod
+    def _pull_bgr_from_appsink(appsink):
+        """Helper: pull-sample → np.ndarray BGR copy (an toàn sau unmap)."""
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return None
+        buf = sample.get_buffer()
+        if buf is None:
+            return None
+        caps = sample.get_caps()
+        s = caps.get_structure(0)
+        ok, w = s.get_int("width")
+        ok2, h = s.get_int("height")
+        if not ok or not ok2:
+            return None
+        success, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return None
+        try:
+            arr = np.frombuffer(mapinfo.data, dtype=np.uint8)
+            if arr.size < h * w * 3:
+                return None
+            frame = arr[: h * w * 3].reshape(h, w, 3).copy()
+        finally:
+            buf.unmap(mapinfo)
+        return frame
+
+    def _on_face_appsink_sample(self, appsink):
+        frame = self._pull_bgr_from_appsink(appsink)
+        if frame is None:
+            return Gst.FlowReturn.OK
+        with self._display_lock:
+            self._face_display_frame = frame
+        return Gst.FlowReturn.OK
+
+    def _on_plate_appsink_sample(self, appsink):
+        frame = self._pull_bgr_from_appsink(appsink)
+        if frame is None:
+            return Gst.FlowReturn.OK
+        with self._display_lock:
+            self._plate_display_frame = frame
+        return Gst.FlowReturn.OK
 
     def _make_element(self, factory: str, name: str, pipeline=None):
         """Tạo GStreamer element, add vào pipeline."""
@@ -454,11 +641,6 @@ class DeepStreamPipeline:
             self._probe_count = 0
             self._probe_t0 = now
 
-        # Early-skip ngay trước get_nvds_buf_surface.
-        self._probe_counter += 1
-        if self._skip_n > 1 and self._probe_counter % self._skip_n != 0:
-            return Gst.PadProbeReturn.OK
-
         batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
         l_frame = batch_meta.frame_meta_list
 
@@ -469,9 +651,9 @@ class DeepStreamPipeline:
                 break
 
             if stream_kind == "plate":
-                self._handle_plate_frame(buf, frame_meta)
+                self._handle_plate_meta(buf, frame_meta)
             elif stream_kind == "face":
-                self._handle_face_frame(buf, frame_meta, now)
+                self._handle_face_meta(frame_meta, now)
 
             try:
                 l_frame = l_frame.next
@@ -481,10 +663,21 @@ class DeepStreamPipeline:
         return Gst.PadProbeReturn.OK
 
     def _materialize_bgr(self, buf, batch_id):
-        """RGBA NVMM → BGR np.array. CPU copy + cvtColor, gọi chỗ thật sự cần."""
+        """RGBA NVMM → BGR np.array. CPU copy + cvtColor. Chỉ gọi cho plate
+        khi có detection (cần frame full-res để OCR crop)."""
         surface = pyds.get_nvds_buf_surface(hash(buf), batch_id)
         return cv2.cvtColor(np.array(surface, copy=True, order='C'),
                             cv2.COLOR_RGBA2BGR)
+
+    def _frame_size_from_meta(self, frame_meta):
+        """
+        Bbox trong obj_meta theo toạ độ mux output (surface size sau
+        nvstreammux), KHÔNG phải source camera. Plugin nvdsfaceembed lấy
+        frame_w/h từ surface — giá trị này luôn là mux size. Dùng
+        source_frame_width/height của frame_meta sẽ sai khi camera native
+        khác mux config (vd camera 1080×608 nhưng mux 1280×720).
+        """
+        return (self._mux_w, self._mux_h)
 
     def _collect_plate_dets(self, frame_meta):
         dets = []
@@ -507,7 +700,7 @@ class DeepStreamPipeline:
                 break
         return dets
 
-    def _collect_face_data(self, frame_meta, frame_shape):
+    def _collect_face_data(self, frame_meta, frame_size):
         face_data = []
         total_obj = 0
         uid_match = 0
@@ -525,31 +718,37 @@ class DeepStreamPipeline:
                         int(rect.left + rect.width),
                         int(rect.top + rect.height))
                 face_data.append(
-                    self._extract_face_meta(obj_meta, bbox, frame_shape))
+                    self._extract_face_meta(obj_meta, bbox, frame_size))
             try:
                 l_obj = l_obj.next
             except StopIteration:
                 break
         return face_data, total_obj, uid_match
 
-    def _handle_plate_frame(self, buf, frame_meta):
-        frame = self._materialize_bgr(buf, frame_meta.batch_id)
+    def _handle_plate_meta(self, buf, frame_meta):
         plate_dets = self._collect_plate_dets(frame_meta)
+        # Chỉ materialize BGR khi có ít nhất 1 plate — OCR cần frame full-res.
+        # Còn lại để None để tránh ~5-10 ms cvtColor mỗi frame idle.
+        full_frame = None
+        if plate_dets:
+            full_frame = self._materialize_bgr(buf, frame_meta.batch_id)
+        size = self._frame_size_from_meta(frame_meta)
         with self._lock:
-            self._plate_frame = frame
             self._plate_detections = plate_dets
+            self._plate_full_frame = full_frame
+            self._plate_source_size = size
             self._frame_seq += 1
-            self._frame_event.set()
+            self._meta_event.set()
 
-    def _handle_face_frame(self, buf, frame_meta, now):
-        frame = self._materialize_bgr(buf, frame_meta.batch_id)
+    def _handle_face_meta(self, frame_meta, now):
+        size = self._frame_size_from_meta(frame_meta)
         face_data, total_obj, uid_match = self._collect_face_data(
-            frame_meta, frame.shape)
+            frame_meta, size)
         with self._lock:
-            self._face_frame = frame
             self._face_data = face_data
+            self._face_source_size = size
             self._frame_seq += 1
-            self._frame_event.set()
+            self._meta_event.set()
 
         if self._debug_probe:
             s = self._stats
@@ -564,10 +763,13 @@ class DeepStreamPipeline:
                 s.reset()
 
     @staticmethod
-    def _clip_bbox(bbox: tuple, frame_shape) -> tuple:
-        if bbox is None or frame_shape is None:
+    def _clip_bbox(bbox: tuple, frame_size) -> tuple:
+        """frame_size: (width, height) tuple."""
+        if bbox is None or frame_size is None:
             return bbox
-        h, w = frame_shape[:2]
+        w, h = frame_size
+        if w <= 0 or h <= 0:
+            return bbox
         x1, y1, x2, y2 = [int(round(v)) for v in bbox]
         x1 = max(0, min(w - 1, x1))
         y1 = max(0, min(h - 1, y1))
@@ -626,16 +828,16 @@ class DeepStreamPipeline:
         return None, None, None
 
     def _extract_face_meta(self, obj_meta, bbox: tuple,
-                           frame_shape=None) -> dict:
+                           frame_size=None) -> dict:
         """
         Trích face data từ obj_meta. Plugin attach embedding + (v2) bbox
         decode từ landmarks + quality. PGIE rect_params làm fallback bbox.
-        Landmarks/track_id không expose lên Python (parser + plugin đã filter).
+        frame_size: (width, height) — dùng để clip bbox về biên frame.
         """
         emb, face_bbox, quality = self._read_face_embed_meta(obj_meta)
 
         final_bbox = bbox
-        clipped_face_bbox = self._clip_bbox(face_bbox, frame_shape)
+        clipped_face_bbox = self._clip_bbox(face_bbox, frame_size)
         if clipped_face_bbox is not None:
             final_bbox = clipped_face_bbox
         return {
@@ -650,9 +852,9 @@ class DeepStreamPipeline:
         return round(self._probe_fps, 1)
     
     def wait_new_frame(self, timeout=0.5) -> bool:
-        """Block cho tới khi có frame mới từ probe."""
-        self._frame_event.clear()
-        return self._frame_event.wait(timeout=timeout)
+        """Block cho tới khi probe đẩy meta mới."""
+        self._meta_event.clear()
+        return self._meta_event.wait(timeout=timeout)
 
     def _on_bus_message(self, bus, message):
         """Log GStreamer bus messages — rất quan trọng để debug."""
@@ -696,26 +898,38 @@ class DeepStreamPipeline:
         self._loop_thread.start()
         log.info("DeepStream pipeline started")
 
-    def get_plate_data(self):
-        """Lấy plate frame + detections mới nhất."""
-        with self._lock:
-            return self._plate_frame, self._plate_detections
-
-    def get_face_frame(self):
-        """Lấy face frame mới nhất."""
-        with self._lock:
-            return self._face_frame
-
-    def get_face_data(self):
-        """Lấy face frame + face_data list (mỗi face: bbox/conf/embedding/quality)."""
-        with self._lock:
-            return self._face_frame, list(self._face_data)
-
     def get_all(self):
-        """Lấy plate + face frame + face data atomic."""
+        """
+        Snapshot cho main loop + web thread.
+
+        Trả dict:
+          plate_full: BGR full-res, chỉ set khi có plate detection (else None)
+          plate_dets: list detection của plate
+          plate_source_size: (w, h)
+          plate_display: BGR 640×360 (do appsink push), có thể None khi pipeline
+                         vừa khởi động hoặc plate disabled
+          face_data: list face dict {bbox, conf, embedding, quality}
+          face_source_size: (w, h)
+          face_display: BGR 640×360 (do appsink push), có thể None
+        """
         with self._lock:
-            return (self._plate_frame, self._plate_detections,
-                    self._face_frame, list(self._face_data))
+            plate_full = self._plate_full_frame
+            plate_dets = list(self._plate_detections)
+            plate_src = self._plate_source_size
+            face_data = list(self._face_data)
+            face_src = self._face_source_size
+        with self._display_lock:
+            plate_disp = self._plate_display_frame
+            face_disp = self._face_display_frame
+        return {
+            "plate_full": plate_full,
+            "plate_dets": plate_dets,
+            "plate_source_size": plate_src,
+            "plate_display": plate_disp,
+            "face_data": face_data,
+            "face_source_size": face_src,
+            "face_display": face_disp,
+        }
 
     def stop(self):
         self._stop.set()

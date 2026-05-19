@@ -467,8 +467,15 @@ class ParkingSystem:
         return frame_plate[max(0, y1 - my):min(h, y2 + my),
                            max(0, x1 - mx):min(w, x2 + mx)]
 
-    def _fill_display(self, result, frame_face, face_data):
-        """Set face_bbox/face_conf/face_crop cho dashboard event payload."""
+    def _fill_display(self, result, frame_face, face_data,
+                      face_source_size=None):
+        """
+        Set face_bbox/face_conf/face_crop cho dashboard event payload.
+
+        bbox luôn ở toạ độ source (full-res). Nếu frame_face là display frame
+        đã downscale (DS mode), face_source_size khác kích thước frame_face
+        nên cần scale bbox về toạ độ frame_face trước khi cắt.
+        """
         best_f = self._pick_display_face(face_data)
         if not best_f:
             return
@@ -478,6 +485,12 @@ class ParkingSystem:
             return
         bx1, by1, bx2, by2 = best_f["bbox"]
         fh, fw = frame_face.shape[:2]
+        if face_source_size and face_source_size[0] > 0:
+            src_w, src_h = face_source_size
+            sx = fw / src_w
+            sy = fh / src_h
+            bx1, by1, bx2, by2 = (int(bx1 * sx), int(by1 * sy),
+                                  int(bx2 * sx), int(by2 * sy))
         fc = frame_face[max(0, by1):min(fh, by2),
                         max(0, bx1):min(fw, bx2)]
         if fc.size > 0:
@@ -490,7 +503,8 @@ class ParkingSystem:
     # slots khi plate vote stable.
     # ──────────────────────────────────────────────
     def process_entry(self, frame_plate, plate_dets,
-                      frame_face, face_data=None) -> dict:
+                      frame_face, face_data=None,
+                      face_source_size=None) -> dict:
         result = {"ok": False, "plate": "", "face_conf": 0,
                   "plate_bbox": None, "face_bbox": None}
 
@@ -527,7 +541,8 @@ class ParkingSystem:
         # Quality fill + push vào tracker mỗi frame có face_data.
         face_data = self._ensure_quality(face_data, frame_face)
         if face_data:
-            self._fill_display(result, frame_face, face_data)
+            self._fill_display(result, frame_face, face_data,
+                               face_source_size=face_source_size)
             self.tracker.update_batch(face_data)
 
         # Không có plate ⇒ chỉ accumulate tracker, không commit.
@@ -535,6 +550,8 @@ class ParkingSystem:
             return result
         best_p = max(plate_dets, key=lambda p: p["conf"])
         result["plate_bbox"] = best_p["bbox"]
+        if frame_plate is None:
+            return result
         crop = self._crop_plate(frame_plate, best_p["bbox"])
         if crop.size == 0:
             return result
@@ -587,7 +604,8 @@ class ParkingSystem:
         return result
 
     def process_exit(self, frame_face, frame_plate,
-                     plate_dets=None, face_data=None) -> dict:
+                     plate_dets=None, face_data=None,
+                     face_source_size=None) -> dict:
         result = {"ok": False, "plate": "", "sim": 0.0,
                   "face_bbox": None, "plate_bbox": None}
 
@@ -604,10 +622,13 @@ class ParkingSystem:
 
         face_data = self._ensure_quality(face_data, frame_face)
         if face_data:
-            self._fill_display(result, frame_face, face_data)
+            self._fill_display(result, frame_face, face_data,
+                               face_source_size=face_source_size)
             self.tracker.update_batch(face_data)
 
         if not plate_dets:
+            return result
+        if frame_plate is None:
             return result
         best_p = max(plate_dets, key=lambda p: p["conf"])
         result["plate_bbox"] = best_p["bbox"]
@@ -695,38 +716,78 @@ class ParkingSystem:
         return frame
 
     # ── ANNOTATE FRAMES CHO WEB ──
-    def _annotate_plate(self, frame, result):
+    # Annotation kích thước hiển thị thực = display_frame_w × browser_scale.
+    # Để không phụ thuộc browser stretch, scale các hằng số (border, font,
+    # padding) theo width frame so với 1280px chuẩn cũ.
+    _ANNOT_REF_W = 1280
+
+    @classmethod
+    def _annot_style(cls, frame_w):
+        s = max(0.5, frame_w / cls._ANNOT_REF_W)
+        return {
+            "border": max(1, int(round(2 * s))),
+            "pad_h":  max(14, int(round(28 * s))),
+            "char_w_face":  max(7, int(round(12 * s))),
+            "char_w_plate": max(10, int(round(16 * s))),
+            "font_scale_face":  0.6 * s,
+            "font_scale_plate": 0.7 * s,
+            "text_thick": max(1, int(round(2 * s))),
+        }
+
+    @staticmethod
+    def _scale_bbox(bbox, frame_shape, source_size):
+        """bbox đang ở source coord → scale về kích thước frame."""
+        x1, y1, x2, y2 = bbox
+        if not source_size or source_size[0] <= 0 or source_size[1] <= 0:
+            return int(x1), int(y1), int(x2), int(y2)
+        src_w, src_h = source_size
+        fh, fw = frame_shape[:2]
+        if (src_w, src_h) == (fw, fh):
+            return int(x1), int(y1), int(x2), int(y2)
+        sx = fw / src_w
+        sy = fh / src_h
+        return int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+
+    def _annotate_plate(self, frame, result, source_size=None):
         if not result.get("plate_bbox"):
             return frame
         vis = frame.copy()
-        x1, y1, x2, y2 = result["plate_bbox"]
+        st = self._annot_style(vis.shape[1])
+        x1, y1, x2, y2 = self._scale_bbox(result["plate_bbox"],
+                                          vis.shape, source_size)
         color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, st["border"])
         plate = result.get("plate", "")
         if plate:
-            cv2.rectangle(vis, (x1, y1-28), (x1+len(plate)*16, y1),
+            cv2.rectangle(vis, (x1, y1 - st["pad_h"]),
+                          (x1 + len(plate) * st["char_w_plate"], y1),
                           (0, 0, 0), -1)
-            cv2.putText(vis, plate, (x1+4, y1-8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.putText(vis, plate, (x1 + 4, y1 - int(st["pad_h"] * 0.3)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        st["font_scale_plate"], color, st["text_thick"])
         return vis
 
-    def _annotate_face(self, frame, result):
+    def _annotate_face(self, frame, result, source_size=None):
         if not result.get("face_bbox"):
             return frame
         vis = frame.copy()
-        x1, y1, x2, y2 = result["face_bbox"]
+        st = self._annot_style(vis.shape[1])
+        x1, y1, x2, y2 = self._scale_bbox(result["face_bbox"],
+                                          vis.shape, source_size)
         color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, st["border"])
         label = ""
         if result.get("ok") and result.get("sim"):
             label = f"MATCH {result['sim']:.2f}"
         elif result.get("face_conf"):
             label = f"face {result['face_conf']:.2f}"
         if label:
-            cv2.rectangle(vis, (x1, y1-28), (x1+len(label)*12, y1),
+            cv2.rectangle(vis, (x1, y1 - st["pad_h"]),
+                          (x1 + len(label) * st["char_w_face"], y1),
                           (0, 0, 0), -1)
-            cv2.putText(vis, label, (x1+4, y1-8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(vis, label, (x1 + 4, y1 - int(st["pad_h"] * 0.3)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        st["font_scale_face"], color, st["text_thick"])
         return vis
     
     def _web_update_loop(self, cam_plate, cam_face, interval: float = 0.1):
@@ -754,14 +815,22 @@ class ParkingSystem:
         log.info("Web update thread started (DeepStream mode)")
         while self.running:
             t0 = time.time()
-            fp, _, ff, _ = ds.get_all()
+            snap = ds.get_all()
+            plate_disp = snap["plate_display"]
+            face_disp = snap["face_display"]
+            plate_src = snap["plate_source_size"]
+            face_src = snap["face_source_size"]
             try:
-                if fp is not None:
+                if plate_disp is not None:
                     update_frame("plate",
-                                 self._annotate_plate(fp, self._last_result))
-                if ff is not None:
+                                 self._annotate_plate(plate_disp,
+                                                      self._last_result,
+                                                      source_size=plate_src))
+                if face_disp is not None:
                     update_frame("face",
-                                 self._annotate_face(ff, self._last_result))
+                                 self._annotate_face(face_disp,
+                                                     self._last_result,
+                                                     source_size=face_src))
             except Exception:
                 pass
             elapsed = time.time() - t0
@@ -792,21 +861,31 @@ class ParkingSystem:
                 if not ds.wait_new_frame(timeout=0.5):
                     continue
 
-                fp, plate_dets, ff, face_data = ds.get_all()
-                self.state["plate_cam_ok"] = fp is not None
-                self.state["face_cam_ok"] = ff is not None
+                snap = ds.get_all()
+                fp_full = snap["plate_full"]
+                plate_dets = snap["plate_dets"]
+                face_data = snap["face_data"]
+                face_disp = snap["face_display"]
+                face_src_sz = snap["face_source_size"]
+                plate_src_sz = snap["plate_source_size"]
+
+                # "Cam ok" = pipeline đã probe ít nhất 1 frame (source_size>0).
+                plate_seen = plate_src_sz[0] > 0
+                face_seen = face_src_sz[0] > 0
+                self.state["plate_cam_ok"] = plate_seen
+                self.state["face_cam_ok"] = face_seen
                 frame_idx += 1
 
-                plate_ready = (not self._ds_plate_enabled) or fp is not None
-                face_ready = (not self._ds_face_enabled) or ff is not None
+                plate_ready = (not self._ds_plate_enabled) or plate_seen
+                face_ready = (not self._ds_face_enabled) or face_seen
 
                 if not plate_ready or not face_ready:
                     time.sleep(0.01)
                     if frame_idx % 300 == 0:
                         plate_state = ("DISABLED" if not self._ds_plate_enabled
-                                       else ("OK" if fp is not None else "NONE"))
+                                       else ("OK" if plate_seen else "NONE"))
                         face_state = ("DISABLED" if not self._ds_face_enabled
-                                      else ("OK" if ff is not None else "NONE"))
+                                      else ("OK" if face_seen else "NONE"))
                         log.warning(f"Waiting frames... "
                                     f"plate={plate_state} face={face_state}")
                     continue
@@ -817,7 +896,7 @@ class ParkingSystem:
                 if not (self._ds_plate_enabled and self._ds_face_enabled):
                     # Reset trước, tránh giữ bbox cũ khi frame mới không có mặt.
                     self._last_result = {"ok": False}
-                    if ff is not None and self._ds_face_enabled:
+                    if self._ds_face_enabled:
                         best = self._pick_display_face(face_data)
                         if best:
                             self._last_result = {
@@ -845,12 +924,14 @@ class ParkingSystem:
                     result = {"ok": False}
                 elif mode == "entry":
                     result = self.process_entry(
-                        fp, plate_dets, ff,
-                        face_data=face_data if self._ds_face_enabled else None)
+                        fp_full, plate_dets, face_disp,
+                        face_data=face_data if self._ds_face_enabled else None,
+                        face_source_size=face_src_sz)
                 else:
                     result = self.process_exit(
-                        ff, fp, plate_dets,
-                        face_data=face_data if self._ds_face_enabled else None)
+                        face_disp, fp_full, plate_dets,
+                        face_data=face_data if self._ds_face_enabled else None,
+                        face_source_size=face_src_sz)
 
                 self._last_result = result
 
@@ -867,7 +948,9 @@ class ParkingSystem:
                     n_fps, t_fps = 0, now
 
                 if show:
-                    self._show_dual(fp, ff, result, mode)
+                    plate_disp = snap["plate_display"]
+                    if plate_disp is not None and face_disp is not None:
+                        self._show_dual(plate_disp, face_disp, result, mode)
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
                         break

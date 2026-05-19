@@ -11,7 +11,8 @@ camera:
   plate: "rtmp://192.168.118.108/live/plate"
   face: "rtmp://192.168.118.108/live/face"
   hw_decode: true
-  process_every_n: 1
+  process_every_n: 1     # Chỉ áp dụng cho fallback path (DS path dùng
+                         # deepstream.face_det_interval / plate_det_interval).
   reconnect_sec: 3
   face_rotate: -1        # cv2 code 0/1/2/3, -1 = chưa setup (chạy setup_rotation.py)
   face_rotate_nv: 0    # nvvidconv flip-method tương ứng (auto-write bởi setup script)
@@ -34,6 +35,11 @@ deepstream:
   face_embed_min_quality: 0.0
   # Bật log thống kê probe mỗi 5s (face_frames/dets/emb/err).
   debug_probe: true
+  # nvinfer interval=N → chạy 1 frame, skip N frame. 0 = không skip (full
+  # quality, default). Tăng để giảm GPU; rủi ro miss mặt xuất hiện <1/(N+1)
+  # khung hình. Không khai báo = giữ giá trị trong .txt config (mặc định 0).
+  # face_det_interval: 0
+  # plate_det_interval: 0
 
 plate_detector:
   model: "./models/plate_yolov8n.pt"
