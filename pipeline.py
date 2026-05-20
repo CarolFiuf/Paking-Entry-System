@@ -146,10 +146,10 @@ class DeepStreamPipeline:
         self._display_w = 640
         self._display_h = 360
         self._display_fps = 10
-        self._display_period_s = 1.0 / self._display_fps
-        # Pad probe throttle: lưu timestamp buffer cuối được pass qua, per
-        # branch. Drop nếu chưa đủ _display_period_s — tiết kiệm GPU
-        # nvvideoconvert downscale 2/3 frame.
+        # Throttle theo stream-time (buf.pts, ns) thay vì wall-clock — file
+        # replay/benchmark cũng cap đúng display_fps trên giây-video. Fallback
+        # wall-clock khi buffer không có PTS.
+        self._display_period_ns = int(Gst.SECOND / self._display_fps)
         self._disp_last_pass = {}
         self._face_display_frame = None
         self._plate_display_frame = None
@@ -198,23 +198,6 @@ class DeepStreamPipeline:
             Gst.Registry.get().scan_path(plugin_dir)
         except Exception as e:
             log.debug(f"Local plugin scan skipped: {e}")
-
-    @staticmethod
-    def _read_nvinfer_precluster_threshold(config_path: str,
-                                           default: float = 0.65) -> float:
-        """Keep nvdsfaceembed landmark decode threshold synced with PGIE."""
-        try:
-            path = os.path.abspath(config_path)
-            with open(path, "r", encoding="utf-8") as f:
-                for raw in f:
-                    line = raw.split("#", 1)[0].strip()
-                    if not line.startswith("pre-cluster-threshold"):
-                        continue
-                    _, value = line.split("=", 1)
-                    return float(value.strip())
-        except Exception as e:
-            log.debug(f"Could not read face detector threshold: {e}")
-        return default
 
     def _configure_mux(self, mux, batch_size: int = 1):
         mux.set_property("batch-size", batch_size)
@@ -370,11 +353,11 @@ class DeepStreamPipeline:
         embedder.set_property(
             "allow-cpu-fallback",
             bool(ds_cfg.get("face_embed_allow_cpu_fallback", True)))
+        # Source of truth duy nhất: config.yaml.
+        # Nếu thiếu, dùng plugin C default (0.30f).
         decode_thr = ds_cfg.get("face_embed_decode_conf_threshold")
-        if decode_thr is None:
-            decode_thr = self._read_nvinfer_precluster_threshold(
-                ds_cfg["face_det_config"], 0.50)
-        embedder.set_property("decode-conf-threshold", float(decode_thr))
+        if decode_thr is not None:
+            embedder.set_property("decode-conf-threshold", float(decode_thr))
         embedder.set_property("net-width", self._net_w)
         embedder.set_property("net-height", self._net_w)
         embedder.set_property("input-object-min-width", 32)
@@ -475,14 +458,25 @@ class DeepStreamPipeline:
         return appsink
 
     def _display_throttle_probe(self, pad, info, name_prefix):
-        """Drop buffer trước nvvideoconvert nếu chưa đủ 1/display_fps giây
-        kể từ buffer được pass cuối — giữ display branch ở ~10 fps, tiết kiệm
-        GPU downscale work cho 20 fps còn lại."""
-        now = time.monotonic()
-        last = self._disp_last_pass.get(name_prefix, 0.0)
-        if now - last < self._display_period_s:
+        """Drop buffer trước nvvideoconvert nếu chưa đủ 1/display_fps stream-
+        time kể từ buffer được pass cuối — giữ display branch ở ~display_fps,
+        tiết kiệm GPU downscale work.
+
+        Dùng buf.pts (nanosecond) thay vì wall-clock: file replay / benchmark
+        cũng cap theo video time, không phụ thuộc decode speed. Fallback
+        wall-clock khi PTS chưa hợp lệ (vd source không stamp time)."""
+        buf = info.get_buffer()
+        if buf is None:
+            return Gst.PadProbeReturn.OK
+        pts = buf.pts
+        if pts == Gst.CLOCK_TIME_NONE:
+            now_ns = int(time.monotonic() * Gst.SECOND)
+        else:
+            now_ns = int(pts)
+        last = self._disp_last_pass.get(name_prefix, 0)
+        if now_ns - last < self._display_period_ns:
             return Gst.PadProbeReturn.DROP
-        self._disp_last_pass[name_prefix] = now
+        self._disp_last_pass[name_prefix] = now_ns
         return Gst.PadProbeReturn.OK
 
     @staticmethod

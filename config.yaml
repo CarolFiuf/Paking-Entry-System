@@ -33,6 +33,10 @@ deepstream:
   # nvdsfaceembed v2+: plugin tự tính blur+brightness quality. Set 0.0 để
   # disable plugin-side skip (vẫn fill meta.quality nếu < min_quality).
   face_embed_min_quality: 0.0
+  # SCRFD anchor score threshold. Plugin tự decode + NMS (parser là no-op),
+  # giá trị này là source of truth duy nhất — pre-cluster-threshold trong
+  # face_det_config.txt KHÔNG dùng nữa.
+  face_embed_decode_conf_threshold: 0.50
   # Bật log thống kê probe mỗi 5s (face_frames/dets/emb/err).
   debug_probe: true
   # nvinfer interval=N → chạy 1 frame, skip N frame. 0 = không skip (full

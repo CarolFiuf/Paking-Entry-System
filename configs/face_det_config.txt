@@ -56,8 +56,10 @@ custom-lib-path=/home/somethink/parking_system/parsers/libnvds_scrfd_parser.so
 # operate-on-gie-id không set vì process-mode=1
 
 [class-attrs-all]
-# Parser lấy ngưỡng này, sau đó lọc thêm hình học landmark và NMS.
-# 0.50 giữ recall tốt hơn; chặn false positive ở downstream bằng yêu cầu
-# phải có landmark + embedding trước khi publish lên dashboard/main.
+# KHÔNG dùng cho SCRFD decode nữa. Parser callback NvDsInferParseCustomScrfd
+# là no-op (xem parsers/nvds_scrfd_parser.cpp); toàn bộ SCRFD decode + NMS
+# do plugin gst-nvdsfaceembed thực hiện. Threshold thực tế lấy từ
+# deepstream.face_embed_decode_conf_threshold trong config.yaml.
+# Dòng dưới giữ chỉ để thoả nvinfer config schema (giá trị bị bỏ qua).
 pre-cluster-threshold=0.50
 nms-iou-threshold=1.0

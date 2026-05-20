@@ -372,8 +372,8 @@ class ParkingSystem:
         self._last_result = {"ok": False}
 
         # ── Thread pool cho parallel OCR + face inference ──
-        self._executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="infer")
+        # Lazy: chỉ tạo khi fallback path cần (DS mode không dùng).
+        self._executor = None
 
         self._cached_stats = self.db.stats()
         self._face_rotate = self.cfg.get("camera", {}).get("face_rotate", -1)
@@ -384,6 +384,13 @@ class ParkingSystem:
         }
 
         self.running = False
+
+    def _get_executor(self):
+        """Lazy ThreadPoolExecutor: tạo lần đầu fallback path gọi tới."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="infer")
+        return self._executor
 
     def _load_face_engine(self):
         """Lazy-load InsightFace only for fallback / non-DS face path."""
@@ -521,9 +528,9 @@ class ParkingSystem:
             if plate_dets and frame_plate is not None:
                 best_p = max(plate_dets, key=lambda p: p["conf"])
                 crop = self._crop_plate(frame_plate, best_p["bbox"])
-                fut_ocr = self._executor.submit(self._run_ocr, crop) \
+                fut_ocr = self._get_executor().submit(self._run_ocr, crop) \
                     if crop.size > 0 else None
-            fut_face = self._executor.submit(self._run_face, frame_face)
+            fut_face = self._get_executor().submit(self._run_face, frame_face)
             face_data, dt_face = fut_face.result()
             if fut_ocr is not None:
                 ocr_result = fut_ocr.result()
@@ -1105,7 +1112,8 @@ class ParkingSystem:
                 self._run_fallback(mode, show)
         finally:
             self.running = False
-            self._executor.shutdown(wait=False)
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
             self.db.close()
             cv2.destroyAllWindows()
             log.info(f"Done. {self.db.stats()}")
