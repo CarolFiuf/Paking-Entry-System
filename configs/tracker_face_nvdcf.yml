@@ -1,0 +1,52 @@
+%YAML:1.0
+# NvDCF tracker config — face cam parking system
+# Base: config_tracker_NvDCF_perf.yml của DS 7.x; chỉ điều chỉnh các tham số
+# có lý do face-specific (HOG bật, focus offset lên trên, maxTargets giảm).
+
+BaseConfig:
+  minDetectorConfidence: 0.40
+
+TargetManagement:
+  enableBboxUnClipping: 1
+  preserveStreamUpdateOrder: 0
+  maxTargetsPerStream: 16
+  minIouDiff4NewTarget: 0.40
+  minTrackerConfidence: 0.30
+  probationAge: 2
+  maxShadowTrackingAge: 30
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  checkClassMatch: 1
+  minMatchingScore4Overall: 0.30
+  minMatchingScore4SizeSimilarity: 0.30
+  minMatchingScore4Iou: 0.10
+  minMatchingScore4VisualSimilarity: 0.30
+  matchingScoreWeight4VisualSimilarity: 0.60
+  matchingScoreWeight4SizeSimilarity: 0.20
+  matchingScoreWeight4Iou: 0.20
+  tentativeDetectorConfidence: 0.20
+  minMatchingScore4TentativeIou: 0.50
+
+StateEstimator:
+  stateEstimatorType: 1
+  processNoiseVar4Loc: 1.51
+  processNoiseVar4Size: 1.32
+  processNoiseVar4Vel: 0.03
+  measurementNoiseVar4Detector: 3.03
+  measurementNoiseVar4Tracker: 8.15
+
+VisualTracker:
+  visualTrackerType: 1
+  useColorNames: 1
+  useHog: 1                          # bật HOG: face có gradient feature mạnh
+  featureImgSizeLevel: 2
+  featureFocusOffsetFactor_y: -0.20  # focus visual lệch lên vùng mắt/trán
+  filterLr: 0.075
+  filterChannelWeightsLr: 0.10
+  gaussianSigma: 0.75

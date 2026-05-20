@@ -45,6 +45,19 @@ deepstream:
   # face_det_interval: 0
   # plate_det_interval: 0
 
+  # nvtracker (NvDCF) giữa SCRFD và nvdsfaceembed. Gán object_id ổn định
+  # qua frame → bỏ logic cosine-sim trong Python, cho phép interval-skip ở
+  # plugin embed mà không mất identity continuity.
+  face_tracker_config: "./configs/tracker_face_nvdcf.yml"
+  face_tracker_width: 960
+  face_tracker_height: 544
+  # face_embed_interval=N → plugin chỉ embed lại mỗi N+1 frame cho cùng
+  # track. Property đã có trong plugin nhưng KHÔNG hiệu lực ở kiến trúc
+  # hiện tại (tracker đặt SAU embedder → object_id chưa có lúc plugin chạy
+  # → mọi obj_meta đều UNTRACKED → fallback embed-everything). Để bật thật
+  # sự cần tách plugin thành nvdsfacedet + nvdsfaceembed (Hướng B). Giữ 0.
+  face_embed_interval: 0
+
 plate_detector:
   model: "./models/plate_yolov8n.pt"
   engine: "./models/plate_yolov8n.engine"
@@ -74,12 +87,13 @@ face:
 recognition:
   face_threshold: 0.3
   plate_vote_frames: 5
-  # IdentityTracker (multi-slot, mutual-exclusion).
+  # IdentityTracker — session-level embedding aggregator (sau khi có
+  # nvtracker, identity continuity qua frame do DS lo, không còn cosine
+  # sim / IoU bridge ở tầng Python).
   max_identities: 3                  # xe chở 2 người + dự phòng
-  identity_split_thr: 0.45           # cos sim ngưỡng cùng identity
   min_seed_quality: 0.3              # quality min để seed slot mới
   identity_min_hits: 2               # số frame min trước khi slot được commit
-  identity_iou_bridge: 0.5           # IoU bridge khi pose change làm sim thấp
+  identity_stale_frames: 60          # dọn slot nếu track không xuất hiện N frame
   plate_regex: "^\\d{2}[A-Z]\\d?-?\\d{3,5}\\.?\\d{0,2}$"
 
 database:

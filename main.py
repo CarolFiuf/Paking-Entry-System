@@ -128,135 +128,80 @@ class PlateVoter:
 
 class IdentityTracker:
     """
-    Multi-identity tracker với mutual exclusion trong cùng frame: 2 face khác
-    nhau ⇒ 2 người khác nhau. Mỗi slot giữ embedding sample có quality cao
-    nhất từng thấy (best-of-N).
+    Session-level face embedding aggregator. Identity continuity qua frame
+    do nvtracker (NvDCF) cung cấp qua `object_id`; class này chỉ gom embedding
+    theo track_id trong suốt 1 session (từ khi face xuất hiện đến khi plate
+    vote stable).
 
-    update_batch(faces) cho 1 frame:
-      A. Lọc face có quality.
-      B. Tính ma trận sim K×M (K face × M slot).
-      C. Greedy assignment theo sim giảm dần: mỗi slot ≤ 1 face/frame,
-         mỗi face ≤ 1 slot. Best-of-N replace.
-      D. Face chưa gán → seed slot mới, trừ khi giống slot đã claim
-         (cùng người bị double-detect).
+    Vai trò:
+      - Best-of-N: giữ embedding quality cao nhất mỗi track.
+      - min_hits gate: bỏ qua track ephemeral (1-2 frame rồi mất).
+      - max_slots cap: tối đa N identity/xe (xe máy chở 2 + dự phòng).
+      - Snapshot atomic khi commit: drain slot đã committed → list embedding.
 
-    Bridge bbox/IoU thay vai trò tracker visual khi face quay đi 1-2 frame:
-    nếu face có IoU cao với last_bbox của slot, vẫn được gán dù sim thấp.
+    update_batch(faces):
+      - Mỗi face có `object_id` từ nvtracker; lookup slot theo ID.
+      - Nếu có embedding mới và quality cao hơn → replace best (best-of-N).
+      - Track không xuất hiện > stale_frames → dọn slot.
     """
 
-    def __init__(self, max_slots=3, split_thr=0.45,
-                 min_seed_quality=0.3, min_hits=2,
-                 iou_bridge=0.5):
+    def __init__(self, max_slots=3, min_seed_quality=0.3, min_hits=2,
+                 stale_frames=60):
         self.max_slots = max_slots
-        self.split_thr = split_thr
         self.min_seed_quality = min_seed_quality
         self.min_hits = min_hits
-        self.iou_bridge = iou_bridge
-        self._slots = []  # list[dict{embedding, conf, quality, hits, bbox}]
-
-    @staticmethod
-    def _cos(a, b):
-        # Embedding đã L2-normalized ⇒ dot product = cosine.
-        return float(np.dot(a, b))
-
-    @staticmethod
-    def _iou(a, b):
-        if not a or not b:
-            return 0.0
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-        return inter / (area_a + area_b - inter + 1e-6)
+        self.stale_frames = stale_frames
+        self._slots = {}        # track_id → dict{embedding, quality, ...}
+        self._frame_idx = 0
 
     def update_batch(self, faces):
-        cand = [f for f in faces
-                if f.get("quality") is not None
-                and f.get("embedding") is not None]
-        if not cand:
-            return
-
-        cand_embs = [np.asarray(f["embedding"], dtype=np.float32)
-                     for f in cand]
-
-        # B. Sim matrix K×M
-        if self._slots:
-            sims = np.array([
-                [self._cos(e, s["embedding"]) for s in self._slots]
-                for e in cand_embs
-            ])
-        else:
-            sims = np.zeros((len(cand), 0))
-
-        # C. Greedy mutual-exclusion assignment theo similarity
-        claimed_face = set()
-        claimed_slot = set()
-        pairs = sorted(
-            ((float(sims[i, j]), i, j)
-             for i in range(len(cand)) for j in range(len(self._slots))),
-            reverse=True
-        )
-        for sim, i, j in pairs:
-            if sim < self.split_thr:
-                break
-            if i in claimed_face or j in claimed_slot:
+        self._frame_idx += 1
+        for f in faces:
+            tid = f.get("object_id")
+            if tid is None:
+                # nvtracker chưa kịp commit track — skip frame, đợi frame sau.
                 continue
-            self._replace_if_better(j, cand[i], cand_embs[i])
-            claimed_face.add(i)
-            claimed_slot.add(j)
-
-        # C'. Bridge IoU cho face/slot chưa claim — vá khi face quay đi.
-        if self._slots:
-            for i, f in enumerate(cand):
-                if i in claimed_face:
+            slot = self._slots.get(tid)
+            if slot is None:
+                # Seed slot mới: cần embedding hợp lệ + quality đạt ngưỡng + còn chỗ.
+                if len(self._slots) >= self.max_slots:
                     continue
-                best_iou = 0.0
-                best_j = -1
-                for j, slot in enumerate(self._slots):
-                    if j in claimed_slot:
-                        continue
-                    iou = self._iou(f.get("bbox"), slot.get("bbox"))
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_j = j
-                if best_j >= 0 and best_iou >= self.iou_bridge:
-                    self._replace_if_better(best_j, f, cand_embs[i])
-                    claimed_face.add(i)
-                    claimed_slot.add(best_j)
+                if f.get("embedding") is None or f.get("quality") is None:
+                    continue
+                if f["quality"] < self.min_seed_quality:
+                    continue
+                self._slots[tid] = {
+                    "embedding": np.asarray(f["embedding"], dtype=np.float32),
+                    "quality":   float(f["quality"]),
+                    "conf":      float(f["conf"]),
+                    "bbox":      f.get("bbox"),
+                    "hits":      1,
+                    "last_seen": self._frame_idx,
+                }
+            else:
+                # Track đã có slot — count hits luôn, kể cả frame plugin skip.
+                slot["hits"] += 1
+                slot["last_seen"] = self._frame_idx
+                slot["bbox"] = f.get("bbox") or slot["bbox"]
+                # Best-of-N: chỉ cập nhật embedding khi có cái mới quality cao hơn.
+                if (f.get("embedding") is not None
+                        and f.get("quality") is not None
+                        and f["quality"] > slot["quality"]):
+                    slot["embedding"] = np.asarray(
+                        f["embedding"], dtype=np.float32)
+                    slot["quality"]   = float(f["quality"])
+                    slot["conf"]      = float(f["conf"])
 
-        # D. Seed face chưa gán
-        for i, f in enumerate(cand):
-            if i in claimed_face:
-                continue
-            if claimed_slot and any(
-                    float(sims[i, j]) >= self.split_thr
-                    for j in claimed_slot):
-                continue
-            if (len(self._slots) < self.max_slots
-                    and f["quality"] >= self.min_seed_quality):
-                self._slots.append({
-                    "embedding": cand_embs[i],
-                    "conf": float(f["conf"]),
-                    "quality": float(f["quality"]),
-                    "bbox": f.get("bbox"),
-                    "hits": 1,
-                })
-
-    def _replace_if_better(self, slot_idx, face, emb):
-        slot = self._slots[slot_idx]
-        slot["hits"] += 1
-        slot["bbox"] = face.get("bbox") or slot["bbox"]
-        if face["quality"] > slot["quality"]:
-            slot["embedding"] = emb
-            slot["conf"] = float(face["conf"])
-            slot["quality"] = float(face["quality"])
+        # Dọn track không còn xuất hiện quá lâu — tránh slot bám mãi.
+        if self.stale_frames > 0 and self._slots:
+            stale = [tid for tid, s in self._slots.items()
+                     if self._frame_idx - s["last_seen"] > self.stale_frames]
+            for tid in stale:
+                del self._slots[tid]
 
     def committed(self):
         """Slot đủ điều kiện commit (hits ≥ min_hits)."""
-        return [s for s in self._slots if s["hits"] >= self.min_hits]
+        return [s for s in self._slots.values() if s["hits"] >= self.min_hits]
 
     def best_committed(self):
         """Slot quality cao nhất trong committed, dùng cho display + exit query."""
@@ -265,11 +210,11 @@ class IdentityTracker:
 
     @property
     def ready(self):
-        return any(s["hits"] >= self.min_hits for s in self._slots)
+        return any(s["hits"] >= self.min_hits for s in self._slots.values())
 
     @property
     def slots(self):
-        return list(self._slots)
+        return list(self._slots.values())
 
     def clear(self):
         self._slots.clear()
@@ -354,12 +299,15 @@ class ParkingSystem:
         self._face_min_quality = float(fcfg_full.get("min_quality", 0.3))
         self.tracker = IdentityTracker(
             max_slots=rcfg.get("max_identities", 3),
-            split_thr=rcfg.get("identity_split_thr", 0.45),
             min_seed_quality=rcfg.get("min_seed_quality",
                                       self._face_min_quality),
             min_hits=rcfg.get("identity_min_hits", 2),
-            iou_bridge=rcfg.get("identity_iou_bridge", 0.5),
+            stale_frames=rcfg.get("identity_stale_frames", 60),
         )
+
+        # Fallback path không có nvtracker → tự gán object_id qua IoU.
+        self._fallback_prev_tracks = []   # [(bbox, track_id), ...]
+        self._fallback_next_id = 0
 
         # ── Web state (shared reference với web.py) ──
         self.state = {
@@ -441,23 +389,52 @@ class ParkingSystem:
         dt = (time.time() - t0) * 1000
         return raw_text, ocr_conf, plate, dt
 
+    def _assign_fallback_track_id(self, bbox):
+        """
+        Gán object_id tổng hợp cho fallback path (không có nvtracker).
+        Match với prev frame bằng IoU > 0.5 → reuse ID; khác → ID mới.
+        Đủ cho test/dev mode; production luôn dùng DS path + NvDCF.
+        """
+        x1, y1, x2, y2 = bbox
+        best_id, best_iou = None, 0.0
+        for prev_bbox, prev_id in self._fallback_prev_tracks:
+            ax1, ay1, ax2, ay2 = prev_bbox
+            ix1 = max(x1, ax1); iy1 = max(y1, ay1)
+            ix2 = min(x2, ax2); iy2 = min(y2, ay2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            area_a = max(0, x2 - x1) * max(0, y2 - y1)
+            area_b = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+            iou = inter / (area_a + area_b - inter + 1e-6)
+            if iou > best_iou:
+                best_iou = iou
+                best_id = prev_id
+        if best_id is not None and best_iou >= 0.5:
+            return best_id
+        self._fallback_next_id += 1
+        return self._fallback_next_id
+
     def _run_face(self, frame_face):
         """
-        Fallback non-DS face inference: chạy InsightFace, attach quality cho
-        mỗi face, trả về list face_dict tương thích DS path.
+        Fallback non-DS face inference: chạy InsightFace, attach quality +
+        synthetic object_id (IoU matching vs frame trước) cho mỗi face.
         Returns: (face_data: list[dict], dt_ms)
         """
         t0 = time.time()
         faces = self._load_face_engine()(frame_face)
         out = []
+        new_prev = []
         for f in faces:
             _, q = FaceEngine.quality(frame_face, f["bbox"], self.blur_thr)
+            tid = self._assign_fallback_track_id(f["bbox"])
+            new_prev.append((f["bbox"], tid))
             out.append({
                 "bbox": f["bbox"],
                 "conf": f["conf"],
                 "embedding": f["embedding"],
                 "quality": q,
+                "object_id": tid,
             })
+        self._fallback_prev_tracks = new_prev
         dt = (time.time() - t0) * 1000
         return out, dt
 
@@ -486,6 +463,14 @@ class ParkingSystem:
         best_f = self._pick_display_face(face_data)
         if not best_f:
             return
+        # Tất cả face để vẽ trên dashboard (bbox + conf + object_id để debug).
+        result["face_bboxes"] = [
+            {"bbox": f["bbox"],
+             "conf": float(f.get("conf", 0.0)),
+             "object_id": f.get("object_id")}
+            for f in face_data if f.get("bbox") is not None
+        ]
+        # Face "chính" — dùng cho crop + label MATCH + commit logic.
         result["face_bbox"] = best_f["bbox"]
         result["face_conf"] = float(best_f.get("conf", 0.0))
         if frame_face is None:
@@ -547,10 +532,12 @@ class ParkingSystem:
 
         # Quality fill + push vào tracker mỗi frame có face_data.
         face_data = self._ensure_quality(face_data, frame_face)
+        # Luôn gọi update_batch (kể cả empty) để _frame_idx tick → stale
+        # purge hoạt động khi tất cả face đã rời frame.
+        self.tracker.update_batch(face_data or [])
         if face_data:
             self._fill_display(result, frame_face, face_data,
                                face_source_size=face_source_size)
-            self.tracker.update_batch(face_data)
 
         # Không có plate ⇒ chỉ accumulate tracker, không commit.
         if not plate_dets:
@@ -628,10 +615,12 @@ class ParkingSystem:
             self.state["timing"] = {}
 
         face_data = self._ensure_quality(face_data, frame_face)
+        # Luôn gọi update_batch (kể cả empty) để _frame_idx tick → stale
+        # purge hoạt động khi tất cả face đã rời frame.
+        self.tracker.update_batch(face_data or [])
         if face_data:
             self._fill_display(result, frame_face, face_data,
                                face_source_size=face_source_size)
-            self.tracker.update_batch(face_data)
 
         if not plate_dets:
             return result
@@ -775,26 +764,48 @@ class ParkingSystem:
         return vis
 
     def _annotate_face(self, frame, result, source_size=None):
-        if not result.get("face_bbox"):
+        faces = result.get("face_bboxes")
+        primary = result.get("face_bbox")
+        if not faces and not primary:
             return frame
         vis = frame.copy()
         st = self._annot_style(vis.shape[1])
-        x1, y1, x2, y2 = self._scale_bbox(result["face_bbox"],
-                                          vis.shape, source_size)
-        color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, st["border"])
-        label = ""
-        if result.get("ok") and result.get("sim"):
-            label = f"MATCH {result['sim']:.2f}"
-        elif result.get("face_conf"):
-            label = f"face {result['face_conf']:.2f}"
-        if label:
-            cv2.rectangle(vis, (x1, y1 - st["pad_h"]),
-                          (x1 + len(label) * st["char_w_face"], y1),
-                          (0, 0, 0), -1)
-            cv2.putText(vis, label, (x1 + 4, y1 - int(st["pad_h"] * 0.3)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        st["font_scale_face"], color, st["text_thick"])
+
+        # Vẽ tất cả face — bbox phụ màu vàng mỏng để dễ phân biệt với primary.
+        if faces:
+            for f in faces:
+                bbox = f.get("bbox")
+                if bbox is None or bbox == primary:
+                    continue
+                x1, y1, x2, y2 = self._scale_bbox(bbox, vis.shape, source_size)
+                cv2.rectangle(vis, (x1, y1), (x2, y2),
+                              (0, 200, 200), max(1, st["border"] - 1))
+                tid = f.get("object_id")
+                if tid is not None:
+                    cv2.putText(vis, f"#{tid}",
+                                (x1 + 2, y1 + st["pad_h"] - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                st["font_scale_face"] * 0.8,
+                                (0, 200, 200), 1)
+
+        # Face primary (best) — vẽ đậm hơn + label conf/MATCH.
+        if primary:
+            x1, y1, x2, y2 = self._scale_bbox(primary, vis.shape, source_size)
+            color = (0, 255, 0) if result.get("ok") else (0, 255, 255)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, st["border"])
+            label = ""
+            if result.get("ok") and result.get("sim"):
+                label = f"MATCH {result['sim']:.2f}"
+            elif result.get("face_conf"):
+                label = f"face {result['face_conf']:.2f}"
+            if label:
+                cv2.rectangle(vis, (x1, y1 - st["pad_h"]),
+                              (x1 + len(label) * st["char_w_face"], y1),
+                              (0, 0, 0), -1)
+                cv2.putText(vis, label,
+                            (x1 + 4, y1 - int(st["pad_h"] * 0.3)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            st["font_scale_face"], color, st["text_thick"])
         return vis
     
     def _web_update_loop(self, cam_plate, cam_face, interval: float = 0.1):
@@ -903,14 +914,21 @@ class ParkingSystem:
                 if not (self._ds_plate_enabled and self._ds_face_enabled):
                     # Reset trước, tránh giữ bbox cũ khi frame mới không có mặt.
                     self._last_result = {"ok": False}
-                    if self._ds_face_enabled:
+                    if self._ds_face_enabled and face_data:
                         best = self._pick_display_face(face_data)
-                        if best:
-                            self._last_result = {
-                                "ok": False,
-                                "face_bbox": best.get("bbox"),
-                                "face_conf": best.get("conf", 0.0),
-                            }
+                        self._last_result = {
+                            "ok": False,
+                            "face_bbox": best.get("bbox") if best else None,
+                            "face_conf": float(best.get("conf", 0.0))
+                                if best else 0.0,
+                            "face_bboxes": [
+                                {"bbox": f["bbox"],
+                                 "conf": float(f.get("conf", 0.0)),
+                                 "object_id": f.get("object_id")}
+                                for f in face_data
+                                if f.get("bbox") is not None
+                            ],
+                        }
 
                     n_fps += 1
                     now = time.time()

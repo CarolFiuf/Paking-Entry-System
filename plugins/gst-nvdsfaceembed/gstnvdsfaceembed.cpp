@@ -5,6 +5,7 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda.h>
@@ -96,6 +97,15 @@ struct _GstNvDsFaceEmbed {
     guint64 stat_gpu;
     guint64 stat_cpu;
     guint64 stat_gpu_fallback;
+    guint64 stat_interval_skips;
+
+    // interval = N → skip embed cho 1 track nếu nó vừa được embed trong N
+    // frame gần đây (yêu cầu nvtracker upstream gán object_id ổn định).
+    // 0 = embed mọi frame như cũ. last_embed_frame map track_id → frame_idx
+    // tại lần embed gần nhất; được purge định kỳ trong transform_ip.
+    guint interval;
+    guint64 frame_counter;
+    std::unordered_map<guint64, guint64> *last_embed_frame;
 };
 
 struct _GstNvDsFaceEmbedClass {
@@ -144,7 +154,8 @@ enum {
     PROP_ALIGN_ON_GPU,
     PROP_ALLOW_CPU_FALLBACK,
     PROP_MIN_QUALITY,
-    PROP_BLUR_THRESHOLD
+    PROP_BLUR_THRESHOLD,
+    PROP_INTERVAL
 };
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
@@ -453,7 +464,7 @@ static bool run_trt(GstNvDsFaceEmbed *self, int batch_size) {
         GST_ERROR_OBJECT(self, "TensorRT setTensorAddress failed");
         return false;
     }
-    if (!self->context->enqueueV3(self->stream)) {2
+    if (!self->context->enqueueV3(self->stream)) {
         GST_ERROR_OBJECT(self, "TensorRT enqueueV3 failed");
         return false;
     }
@@ -564,13 +575,23 @@ static gboolean gst_nvdsfaceembed_start(GstBaseTransform *btrans) {
         (gchar *)PARKING_FACE_EMBED_META_DESC);
     if (!load_engine(self)) return FALSE;
 
+    // Map track_id → last embed frame_counter cho interval skip.
+    // GObject zero-init the struct nên alloc bằng new ở start để tránh
+    // gọi constructor trên memory chưa init.
+    if (!self->last_embed_frame) {
+        self->last_embed_frame = new std::unordered_map<guint64, guint64>();
+    }
+    self->frame_counter = 0;
+    self->stat_interval_skips = 0;
+
     GST_INFO_OBJECT(self, "started engine=%s face-gie-id=%u source-id=%d "
                     "batch=%u decode-conf=%.2f align-on-gpu=%d "
-                    "cpu-fallback=%d meta-type=%d",
+                    "cpu-fallback=%d meta-type=%d interval=%u",
                     self->engine_file, self->face_gie_id, self->source_id,
                     self->max_batch_size, self->decode_conf_threshold,
                     self->align_on_gpu ? 1 : 0,
-                    self->allow_cpu_fallback ? 1 : 0, self->embed_meta_type);
+                    self->allow_cpu_fallback ? 1 : 0, self->embed_meta_type,
+                    self->interval);
     return TRUE;
 }
 
@@ -609,6 +630,10 @@ static gboolean gst_nvdsfaceembed_stop(GstBaseTransform *btrans) {
     if (self->stream) {
         cudaStreamDestroy(self->stream);
         self->stream = nullptr;
+    }
+    if (self->last_embed_frame) {
+        delete self->last_embed_frame;
+        self->last_embed_frame = nullptr;
     }
     return TRUE;
 }
@@ -698,6 +723,14 @@ static bool process_jobs_chunk_cpu(GstNvDsFaceEmbed *self,
         float bh = job.bbox[3] - job.bbox[1];
         float quality = compute_quality_score(blur_var, mean_b, bw, bh,
                                               self->blur_threshold);
+        // Cap rate embed cho track theo interval — đánh dấu đã embed ngay
+        // cả khi quality không pass (tránh spam ArcFace frame kế tiếp).
+        // Khi object_id chưa có (kiến trúc hiện tại) đây là no-op.
+        if (self->last_embed_frame &&
+            job.obj_meta->object_id != UNTRACKED_OBJECT_ID) {
+            (*self->last_embed_frame)[(guint64)job.obj_meta->object_id] =
+                self->frame_counter;
+        }
         if (quality < self->min_quality) continue;
         attach_embedding_meta(self, batch_meta, job.obj_meta, emb, job.lm,
                               job.bbox, quality);
@@ -770,6 +803,11 @@ static bool process_jobs_chunk_gpu(GstNvDsFaceEmbed *self,
         float bh = job.bbox[3] - job.bbox[1];
         float quality = compute_quality_score(blur_var, mean_b, bw, bh,
                                               self->blur_threshold);
+        if (self->last_embed_frame &&
+            job.obj_meta->object_id != UNTRACKED_OBJECT_ID) {
+            (*self->last_embed_frame)[(guint64)job.obj_meta->object_id] =
+                self->frame_counter;
+        }
         if (quality < self->min_quality) continue;
         attach_embedding_meta(self, batch_meta, job.obj_meta, emb, job.lm,
                               job.bbox, quality);
@@ -810,6 +848,26 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
     if (!surface) {
         gst_buffer_unmap(buf, &map);
         return GST_FLOW_OK;
+    }
+
+    // Frame counter cho interval skip + purge map định kỳ. Ở pipeline hiện
+    // tại tracker đặt SAU plugin nên object_id luôn UNTRACKED khi plugin
+    // chạy → skip logic không kích hoạt (safe no-op). Khi tách plugin
+    // facedet+embed sau này, tracker sẽ chèn object_id trước, skip work.
+    self->frame_counter++;
+    if (self->last_embed_frame &&
+        self->interval > 0 &&
+        (self->frame_counter & 0xFF) == 0) {
+        const guint64 ttl = 300;
+        guint64 cutoff = self->frame_counter > ttl
+            ? self->frame_counter - ttl : 0;
+        for (auto it = self->last_embed_frame->begin();
+             it != self->last_embed_frame->end(); ) {
+            if (it->second < cutoff)
+                it = self->last_embed_frame->erase(it);
+            else
+                ++it;
+        }
     }
 
     std::vector<FaceJob> jobs;
@@ -900,6 +958,21 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
             g_strlcpy(om->obj_label, "face", MAX_LABEL_SIZE);
             nvds_add_obj_meta_to_frame(fm, om, nullptr);
 
+            // Interval skip: nếu plugin chạy SAU tracker (kiến trúc tương
+            // lai), object_id sẽ có sẵn → skip embed cho track đã embed gần
+            // đây. Ở kiến trúc hiện tại object_id luôn UNTRACKED ngay sau
+            // khi plugin tạo, nên if này không vào — embed mọi face.
+            if (self->interval > 0 && self->last_embed_frame &&
+                om->object_id != UNTRACKED_OBJECT_ID) {
+                guint64 tid = (guint64)om->object_id;
+                auto it = self->last_embed_frame->find(tid);
+                if (it != self->last_embed_frame->end() &&
+                    self->frame_counter - it->second <= self->interval) {
+                    self->stat_interval_skips++;
+                    continue;  // skip job — sẽ không có embedding meta
+                }
+            }
+
             FaceJob job{};
             job.frame_meta = fm;
             job.obj_meta = om;
@@ -925,9 +998,10 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
     self->call_count++;
     if (self->debug_interval > 0 &&
         self->call_count % self->debug_interval == 0) {
-        GST_INFO_OBJECT(self, "stats frames=%lu objs=%lu lm=%lu emb=%lu",
+        GST_INFO_OBJECT(self, "stats frames=%lu objs=%lu lm=%lu emb=%lu "
+                        "interval_skips=%lu",
                         self->stat_frames, self->stat_objs, self->stat_lm,
-                        self->stat_emb);
+                        self->stat_emb, self->stat_interval_skips);
         GST_INFO_OBJECT(self, "align backend gpu=%lu cpu=%lu fallback=%lu",
                         self->stat_gpu, self->stat_cpu,
                         self->stat_gpu_fallback);
@@ -938,6 +1012,7 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
         self->stat_gpu = 0;
         self->stat_cpu = 0;
         self->stat_gpu_fallback = 0;
+        self->stat_interval_skips = 0;
     }
     return GST_FLOW_OK;
 }
@@ -995,6 +1070,9 @@ static void gst_nvdsfaceembed_set_property(GObject *object, guint prop_id,
             break;
         case PROP_BLUR_THRESHOLD:
             self->blur_threshold = (gfloat)g_value_get_double(value);
+            break;
+        case PROP_INTERVAL:
+            self->interval = g_value_get_uint(value);
             break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -1055,6 +1133,9 @@ static void gst_nvdsfaceembed_get_property(GObject *object, guint prop_id,
         case PROP_BLUR_THRESHOLD:
             g_value_set_double(value, self->blur_threshold);
             break;
+        case PROP_INTERVAL:
+            g_value_set_uint(value, self->interval);
+            break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
             break;
@@ -1089,6 +1170,11 @@ static void gst_nvdsfaceembed_init(GstNvDsFaceEmbed *self) {
     self->min_quality = 0.0f;
     // Match Python FaceEngine.quality.blur_thr default.
     self->blur_threshold = 10.0f;
+    // interval=0 = embed mọi frame (giữ behavior cũ khi không có nvtracker).
+    self->interval = 0;
+    self->frame_counter = 0;
+    self->last_embed_frame = nullptr;       // alloc trong start
+    self->stat_interval_skips = 0;
     self->engine_file = g_strdup(
         "/home/somethink/parking_system/models/face_embed_arcface_fp16.engine");
 }
@@ -1213,6 +1299,16 @@ static void gst_nvdsfaceembed_class_init(GstNvDsFaceEmbedClass *klass) {
                             0.0, 10000.0, 10.0,
                             (GParamFlags)(G_PARAM_READWRITE |
                                           G_PARAM_STATIC_STRINGS)));
+    g_object_class_install_property(
+        gobject_class, PROP_INTERVAL,
+        g_param_spec_uint("interval", "Embed interval per track",
+                          "Skip embedding for a tracked face if it was "
+                          "embedded within the last N frames "
+                          "(requires nvtracker upstream). 0 = embed every "
+                          "frame as before.",
+                          0, 1000, 0,
+                          (GParamFlags)(G_PARAM_READWRITE |
+                                        G_PARAM_STATIC_STRINGS)));
 
     gst_element_class_add_pad_template(
         element_class, gst_static_pad_template_get(&src_template));

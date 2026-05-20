@@ -42,6 +42,13 @@ class _ProbeStats:
     face_dets: int = 0
     face_emb: int = 0
     emb_read_err: int = 0
+    # Track ID stats: tổng số face có object_id != None, set track_id thấy
+    # qua chu kỳ, đếm frame có ≥2 face (multi-person).
+    face_tracked: int = 0
+    face_untracked: int = 0
+    multi_face_frames: int = 0
+    track_ids: set = field(default_factory=set)
+    track_hits: dict = field(default_factory=dict)   # track_id → frame count
 
     def reset(self):
         self.last_log = time.time()
@@ -51,15 +58,32 @@ class _ProbeStats:
         self.face_dets = 0
         self.face_emb = 0
         self.emb_read_err = 0
+        self.face_tracked = 0
+        self.face_untracked = 0
+        self.multi_face_frames = 0
+        self.track_ids = set()
+        self.track_hits = {}
 
     def log_summary(self):
+        # Top 5 track theo số frame xuất hiện — phản ánh stability.
+        top = sorted(self.track_hits.items(),
+                     key=lambda kv: kv[1], reverse=True)[:5]
+        top_str = ", ".join(f"#{t}:{n}" for t, n in top) or "—"
         log.info(f"face_probe: frames={self.face_frames} "
                  f"all_obj={self.face_all_obj} uid2={self.face_uid2} "
                  f"dets={self.face_dets} emb={self.face_emb} "
                  f"err={self.emb_read_err}")
+        log.info(f"face_track: tracked={self.face_tracked} "
+                 f"untracked={self.face_untracked} "
+                 f"unique_ids={len(self.track_ids)} "
+                 f"multi_face_frames={self.multi_face_frames} "
+                 f"top={top_str}")
 
 _FACE_EMBED_META_DESC = "PARKING.FACE_EMBEDDING_META"
 _FACE_EMBED_META_TYPE = None
+
+# nvtracker dùng UINT64_MAX cho object chưa được gán track_id.
+_UNTRACKED_OBJECT_ID = (1 << 64) - 1
 
 
 class _FaceEmbeddingMeta(ctypes.Structure):
@@ -181,6 +205,7 @@ class DeepStreamPipeline:
         self._pipelines = []
         self._pgie_face = None
         self._face_embedder = None
+        self._face_tracker = None
 
         self._build_split_pipelines(plate_src, face_src)
 
@@ -312,8 +337,17 @@ class DeepStreamPipeline:
         embedder = self._make_face_embedder(pipeline, ds_cfg)
         self._face_embedder = embedder
 
+        # nvtracker SAU embedder: parser SCRFD là stub, plugin tự tạo
+        # obj_meta + embedding user_meta → tracker chỉ cần gán object_id
+        # in-place lên obj_meta (user_meta được preserve). Trade-off: plugin
+        # interval skip không có hiệu lực ở vị trí này (object_id chưa biết
+        # lúc plugin chạy); muốn enable cần tách plugin thành facedet+embed.
+        tracker = self._make_face_tracker(pipeline, ds_cfg)
+        self._face_tracker = tracker
+
         tee = self._make_element("tee", "face_tee", pipeline)
-        self._link_many([mux, pgie_face, nvconv, capsfilter, embedder, tee])
+        self._link_many([mux, pgie_face, nvconv, capsfilter,
+                         embedder, tracker, tee])
 
         # Nhánh META: probe đọc obj_meta + embedding, KHÔNG materialize BGR.
         meta_queue = self._make_queue("face_meta_queue", pipeline,
@@ -331,8 +365,37 @@ class DeepStreamPipeline:
         appsink.connect("new-sample", self._on_face_appsink_sample)
 
         self._attach_bus(pipeline)
-        log.info("Face pipeline: src → mux → face_det → nvdsfaceembed → tee "
-                 "[meta_probe | display(640×360@10fps)]")
+        log.info("Face pipeline: src → mux → face_det → nvtracker → "
+                 "nvdsfaceembed → tee [meta_probe | display(640×360@10fps)]")
+
+    def _make_face_tracker(self, pipeline, ds_cfg):
+        """nvtracker đặt SAU nvdsfaceembed — gán object_id lên obj_meta đã
+        có sẵn (SCRFD parser stub nên obj_meta do plugin tạo). Tracker chỉ
+        đọc bbox + pixel source để track, không đụng đến embedding user_meta.
+
+        Mặc định NvDCF (visual feature) thay vì IOU vì face cam parking thường
+        có driver+passenger sát nhau và face hay bị che tạm (cúi xuống mở
+        khoá xe). NvDCF chống ID-switch tốt hơn ~5-10× với cost 1-2 ms/frame.
+        """
+        tracker = self._make_element("nvtracker", "face_tracker", pipeline)
+        tracker.set_property(
+            "ll-lib-file",
+            "/opt/nvidia/deepstream/deepstream/lib/"
+            "libnvds_nvmultiobjecttracker.so")
+        tracker.set_property(
+            "ll-config-file",
+            os.path.abspath(ds_cfg.get(
+                "face_tracker_config",
+                "./configs/tracker_face_nvdcf.yml")))
+        # NvDCF cần đủ pixel cho HOG; 960x544 ổn cho Orin Nano + 1-3 face.
+        tracker.set_property(
+            "tracker-width", int(ds_cfg.get("face_tracker_width", 960)))
+        tracker.set_property(
+            "tracker-height", int(ds_cfg.get("face_tracker_height", 544)))
+        tracker.set_property("compute-hw", 1)            # GPU
+        tracker.set_property("gpu-id", 0)
+        tracker.set_property("display-tracking-id", 0)
+        return tracker
 
     def _make_face_embedder(self, pipeline, ds_cfg):
         embedder = self._make_element("nvdsfaceembed", "face_embed_aligned",
@@ -366,6 +429,19 @@ class DeepStreamPipeline:
             float(ds_cfg.get("face_embed_min_quality", 0.0)))
         embedder.set_property("blur-threshold",
             float(self.cfg.get("face", {}).get("blur_threshold", 10.0)))
+        # interval=N → mỗi track chỉ embed lại sau N frame kể từ lần embed
+        # gần nhất. Yêu cầu nvtracker upstream gán object_id ổn định.
+        embed_interval = ds_cfg.get("face_embed_interval")
+        if embed_interval is not None:
+            try:
+                iv = int(embed_interval)
+                if iv >= 0:
+                    embedder.set_property("interval", iv)
+                    log.info(f"nvdsfaceembed interval={iv} "
+                             f"(embed 1/{iv+1} frame mỗi track)")
+            except (TypeError, ValueError):
+                log.warning(f"face_embed_interval không phải int: "
+                            f"{embed_interval!r}")
         return embedder
 
     @staticmethod
@@ -752,6 +828,15 @@ class DeepStreamPipeline:
             s.face_dets += len(face_data)
             s.face_emb += sum(
                 1 for f in face_data if f.get("embedding") is not None)
+            tids_this_frame = [f.get("object_id") for f in face_data]
+            tracked_now = [t for t in tids_this_frame if t is not None]
+            s.face_tracked += len(tracked_now)
+            s.face_untracked += len(tids_this_frame) - len(tracked_now)
+            for t in tracked_now:
+                s.track_ids.add(t)
+                s.track_hits[t] = s.track_hits.get(t, 0) + 1
+            if len(face_data) >= 2:
+                s.multi_face_frames += 1
             if now - s.last_log >= 5.0:
                 s.log_summary()
                 s.reset()
@@ -834,11 +919,18 @@ class DeepStreamPipeline:
         clipped_face_bbox = self._clip_bbox(face_bbox, frame_size)
         if clipped_face_bbox is not None:
             final_bbox = clipped_face_bbox
+
+        # nvtracker gán object_id; UNTRACKED khi chưa kịp commit track.
+        tid = int(obj_meta.object_id)
+        if tid == _UNTRACKED_OBJECT_ID:
+            tid = None
+
         return {
             "bbox": final_bbox,
             "conf": float(obj_meta.confidence),
             "embedding": emb,
             "quality": quality,
+            "object_id": tid,
         }
     
     @property
