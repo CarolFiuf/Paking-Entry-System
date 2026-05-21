@@ -26,7 +26,7 @@ import time
 import ctypes
 import os
 from dataclasses import dataclass, field
-from threading import Thread, Event, Lock
+from threading import Thread, Event, Lock, Condition
 from queue import Queue, Empty
 
 log = logging.getLogger("pipeline")
@@ -85,6 +85,12 @@ _FACE_EMBED_META_TYPE = None
 # nvtracker dùng UINT64_MAX cho object chưa được gán track_id.
 _UNTRACKED_OBJECT_ID = (1 << 64) - 1
 
+# Char class map của plate OCR YOLO: 0-9 + A-Z.
+_OCR_CLASS_CHARS = [str(i) for i in range(10)] + \
+    [chr(c) for c in range(ord('A'), ord('Z') + 1)]
+# Plate VN dài nhất: XXYN-NNNNN = 9 ký tự (vd 99B1-25739).
+_MAX_PLATE_CHARS = 9
+
 
 class _FaceEmbeddingMeta(ctypes.Structure):
     _fields_ = [
@@ -105,6 +111,100 @@ def _get_face_embed_meta_type():
         _FACE_EMBED_META_TYPE = pyds.nvds_get_user_meta_type(
             _FACE_EMBED_META_DESC)
     return _FACE_EMBED_META_TYPE
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Plate OCR post-process — port từ engine.PlateOCRYolo._sort_chars +
+# enforce_plate_format. Đặt module-level để dùng được trong combine probe
+# và unit test mà không cần import engine.py (engine kéo theo cv2/insightface).
+# ───────────────────────────────────────────────────────────────────────
+_LETTER_TO_DIGIT = {
+    'D': '0', 'O': '0', 'Q': '0',
+    'I': '1', 'L': '1', 'T': '1',
+    'Z': '2', 'A': '4', 'S': '5',
+    'G': '6', 'B': '8',
+}
+_DIGIT_TO_LETTER = {
+    '0': 'D', '1': 'I', '2': 'Z', '4': 'A',
+    '5': 'S', '6': 'G', '7': 'T', '8': 'B', '9': 'G',
+}
+
+
+def _enforce_plate_format(text: str) -> str:
+    """Ép format biển VN: pos 0,1=số, pos 2=chữ, 4 char cuối=số.
+    Char ngoài map giữ nguyên — validator regex bên ngoài reject sau.
+    """
+    if len(text) < 3:
+        return text
+    chars = list(text)
+    for i in (0, 1):
+        if not chars[i].isdigit():
+            chars[i] = _LETTER_TO_DIGIT.get(chars[i], chars[i])
+    if not chars[2].isalpha():
+        chars[2] = _DIGIT_TO_LETTER.get(chars[2], chars[2])
+    if len(chars) >= 4:
+        for i in range(len(chars) - 4, len(chars)):
+            if not chars[i].isdigit():
+                chars[i] = _LETTER_TO_DIGIT.get(chars[i], chars[i])
+    # Chỉ áp dụng cho biển 9 ký tự (XXYN-NNNNN hoặc XXYY-NNNNN): pos 2 là chữ
+    # → ép char[-7] thành letter nếu YOLO đọc nhầm thành digit. Với 7-8 ký tự,
+    # char[-7] rơi vào vị trí số (pos 0/1) — KHÔNG ép.
+    if len(chars) >= 9 and chars[-7].isdigit():
+        chars[-7] = _DIGIT_TO_LETTER.get(chars[-7], chars[-7])
+    return ''.join(chars)
+
+
+def _sort_chars_for_plate(chars: list) -> list:
+    """Sort chars (dict có cx/cy/h) cho biển 1 dòng (kể cả nghiêng) hoặc 2
+    dòng. Pipeline: fit trendline khử tilt → residuals → max-gap split với
+    bimodality gate theo median height → sanity check overlap x.
+    """
+    ordered = sorted(chars, key=lambda c: c["cx"])
+    if len(ordered) < 4:
+        return ordered
+
+    xs = np.array([c["cx"] for c in ordered], dtype=np.float32)
+    ys = np.array([c["cy"] for c in ordered], dtype=np.float32)
+    x_var = float(((xs - xs.mean()) ** 2).sum())
+    if x_var > 1e-6:
+        slope, intercept = np.polyfit(xs, ys, 1)
+        residuals = ys - (slope * xs + intercept)
+    else:
+        residuals = ys - ys.mean()
+
+    heights = [c["h"] for c in ordered if c["h"] > 0]
+    median_h = float(np.median(heights)) if heights else 1.0
+
+    order = np.argsort(residuals)
+    sorted_r = residuals[order]
+    gaps = np.diff(sorted_r)
+    if len(gaps) == 0:
+        return ordered
+    k = int(np.argmax(gaps))
+    max_gap = float(gaps[k])
+
+    if max_gap < 0.6 * median_h:
+        return ordered
+
+    upper = [ordered[i] for i in order[:k + 1]]
+    lower = [ordered[i] for i in order[k + 1:]]
+    if len(upper) < 2 or len(lower) < 2:
+        return ordered
+
+    upper_x_min = min(c["cx"] for c in upper)
+    upper_x_max = max(c["cx"] for c in upper)
+    lower_x_min = min(c["cx"] for c in lower)
+    lower_x_max = max(c["cx"] for c in lower)
+    if upper_x_max < lower_x_min or lower_x_max < upper_x_min:
+        return ordered
+
+    upper.sort(key=lambda c: c["cx"])
+    lower.sort(key=lambda c: c["cx"])
+    upper_y = sum(c["cy"] for c in upper) / len(upper)
+    lower_y = sum(c["cy"] for c in lower) / len(lower)
+    if upper_y > lower_y:
+        upper, lower = lower, upper
+    return upper + lower
 
 # ──────────────────────────────────────────────
 # Thử import DeepStream Python bindings
@@ -156,6 +256,7 @@ class DeepStreamPipeline:
         self._face_source_id = 0
         self._plate_gie_uid = 1
         self._face_gie_uid = 2
+        self._ocr_sgie_uid = 3      # plate_ocr_config.txt: gie-unique-id=3
 
         self._net_w = 640    # SCRFD input size, hardcoded khớp face_det_config
 
@@ -180,16 +281,27 @@ class DeepStreamPipeline:
         self._display_lock = Lock()
 
         # Meta state — probe push, main loop pull.
-        # _plate_full_frame chỉ set khi probe thấy plate detection (cần cho OCR
-        # crop). Khi không có plate, giữ None để tránh memcpy thừa.
+        # OCR đã chạy trong DS SGIE; plate thumbnail cho dashboard cắt từ
+        # plate_display 640×360 (appsink). Không materialize BGR full-res
+        # trong probe để giảm memcpy + cvtColor ra khỏi streaming thread.
         self._plate_detections = []
-        self._plate_full_frame = None
         self._plate_source_size = (0, 0)
         self._face_data = []         # list[dict{bbox, conf, embedding, quality}]
         self._face_source_size = (0, 0)
+        # Monotonic counter tick mỗi lần face probe ăn 1 frame face thật. Đính
+        # vào mỗi face dict + expose qua get_all() → IdentityTracker dedup khi
+        # main loop đọc snapshot stale (vd wake từ plate event nhưng face cam
+        # chưa fire frame mới). Stale purge + hits đếm theo frame face thật.
+        self._face_stamp = 0
 
         self._frame_seq = 0
-        self._meta_event = Event()
+        # 2 cờ pending riêng + 1 Condition để main loop block-wait OR. Probe
+        # face/plate chỉ set cờ tương ứng → wait_new_frame trả về tuple
+        # (plate_fresh, face_fresh) để main biết cam nào fire. Tránh phải xử
+        # lý nhánh stale bên consumer như cũ.
+        self._cond = Condition()
+        self._plate_pending = False
+        self._face_pending = False
 
         self._probe_count = 0
         self._probe_fps = 0.0
@@ -206,6 +318,12 @@ class DeepStreamPipeline:
         self._pgie_face = None
         self._face_embedder = None
         self._face_tracker = None
+
+        # OCR text từ combine probe (SGIE src pad) → meta probe (fakesink).
+        # Hai probe chạy ở thread khác nhau do queue giữa tee → fakesink ⇒
+        # cần lock. Key theo buf.pts; meta probe pop sau khi consume.
+        self._plate_text_by_pts = {}
+        self._ocr_text_lock = Lock()
 
         self._build_split_pipelines(plate_src, face_src)
 
@@ -277,6 +395,13 @@ class DeepStreamPipeline:
         self._apply_nvinfer_interval(pgie_plate, ds_cfg.get(
             "plate_det_interval"), "plate")
 
+        # SGIE OCR: process-mode=2, chạy crop plate qua YOLO 36-class char det.
+        # Output là char obj_meta (uid=3) gắn parent=plate obj_meta — combine
+        # probe gom + sort + format thành 1 string user_meta trên plate.
+        sgie_ocr = self._make_element("nvinfer", "plate_ocr_sgie", pipeline)
+        sgie_ocr.set_property("config-file-path",
+                              ds_cfg["plate_ocr_config"])
+
         nvconv = self._make_element("nvvideoconvert", "plate_nvconv_out",
                                     pipeline)
         capsfilter = self._make_element("capsfilter", "plate_caps_rgba",
@@ -285,7 +410,14 @@ class DeepStreamPipeline:
             "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"))
 
         tee = self._make_element("tee", "plate_tee", pipeline)
-        self._link_many([mux, pgie_plate, nvconv, capsfilter, tee])
+        self._link_many([mux, pgie_plate, sgie_ocr,
+                         nvconv, capsfilter, tee])
+
+        # Combine probe trên src của SGIE — chạy SAU khi SGIE attach char
+        # obj_meta xong, nhưng TRƯỚC nhánh tee (probe meta downstream cần
+        # đọc PARKING.PLATE_TEXT_META đã gắn lên plate).
+        sgie_ocr.get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._plate_ocr_combine_probe, None)
 
         # Nhánh META: chỉ probe meta, plate full-res materialize on-demand
         # khi có plate detection (cho OCR crop).
@@ -304,8 +436,8 @@ class DeepStreamPipeline:
         appsink.connect("new-sample", self._on_plate_appsink_sample)
 
         self._attach_bus(pipeline)
-        log.info("Plate pipeline: src → mux → plate_det → tee "
-                 "[meta_probe | display(640×360@10fps)]")
+        log.info("Plate pipeline: src → mux → plate_det → plate_ocr_sgie "
+                 "→ tee [meta_probe | display(640×360@10fps)]")
 
     def _build_face_pipeline(self, face_src: str):
         ds_cfg = self.cfg["deepstream"]
@@ -732,13 +864,6 @@ class DeepStreamPipeline:
 
         return Gst.PadProbeReturn.OK
 
-    def _materialize_bgr(self, buf, batch_id):
-        """RGBA NVMM → BGR np.array. CPU copy + cvtColor. Chỉ gọi cho plate
-        khi có detection (cần frame full-res để OCR crop)."""
-        surface = pyds.get_nvds_buf_surface(hash(buf), batch_id)
-        return cv2.cvtColor(np.array(surface, copy=True, order='C'),
-                            cv2.COLOR_RGBA2BGR)
-
     def _frame_size_from_meta(self, frame_meta):
         """
         Bbox trong obj_meta theo toạ độ mux output (surface size sau
@@ -750,6 +875,10 @@ class DeepStreamPipeline:
         return (self._mux_w, self._mux_h)
 
     def _collect_plate_dets(self, frame_meta):
+        """Chỉ lấy obj_meta của plate detector (uid=1), bỏ qua char obj_meta
+        (uid=3) do SGIE OCR tạo — chúng đã được gom thành text user_meta ở
+        combine probe.
+        """
         dets = []
         l_obj = frame_meta.obj_meta_list
         while l_obj is not None:
@@ -762,15 +891,19 @@ class DeepStreamPipeline:
                 bbox = (int(rect.left), int(rect.top),
                         int(rect.left + rect.width),
                         int(rect.top + rect.height))
-                dets.append({"bbox": bbox,
-                             "conf": float(obj_meta.confidence)})
+                dets.append({
+                    "bbox": bbox,
+                    "conf": float(obj_meta.confidence),
+                    "text": "",
+                    "text_conf": 0.0,
+                })
             try:
                 l_obj = l_obj.next
             except StopIteration:
                 break
         return dets
 
-    def _collect_face_data(self, frame_meta, frame_size):
+    def _collect_face_data(self, frame_meta, frame_size, frame_stamp):
         face_data = []
         total_obj = 0
         uid_match = 0
@@ -788,7 +921,8 @@ class DeepStreamPipeline:
                         int(rect.left + rect.width),
                         int(rect.top + rect.height))
                 face_data.append(
-                    self._extract_face_meta(obj_meta, bbox, frame_size))
+                    self._extract_face_meta(obj_meta, bbox, frame_size,
+                                            frame_stamp))
             try:
                 l_obj = l_obj.next
             except StopIteration:
@@ -797,28 +931,40 @@ class DeepStreamPipeline:
 
     def _handle_plate_meta(self, buf, frame_meta):
         plate_dets = self._collect_plate_dets(frame_meta)
-        # Chỉ materialize BGR khi có ít nhất 1 plate — OCR cần frame full-res.
-        # Còn lại để None để tránh ~5-10 ms cvtColor mỗi frame idle.
-        full_frame = None
+
+        # Gắn OCR text từ combine probe — cùng GstBuffer (key theo pts).
+        # 1 plate per frame ⇒ gán cho det confidence cao nhất.
         if plate_dets:
-            full_frame = self._materialize_bgr(buf, frame_meta.batch_id)
+            pts = buf.pts
+            with self._ocr_text_lock:
+                text_entry = self._plate_text_by_pts.pop(pts, None)
+            if text_entry:
+                text, conf = text_entry
+                best = max(plate_dets, key=lambda d: d["conf"])
+                best["text"] = text
+                best["text_conf"] = conf
+
         size = self._frame_size_from_meta(frame_meta)
         with self._lock:
             self._plate_detections = plate_dets
-            self._plate_full_frame = full_frame
             self._plate_source_size = size
             self._frame_seq += 1
-            self._meta_event.set()
+        with self._cond:
+            self._plate_pending = True
+            self._cond.notify_all()
 
     def _handle_face_meta(self, frame_meta, now):
         size = self._frame_size_from_meta(frame_meta)
+        self._face_stamp += 1
         face_data, total_obj, uid_match = self._collect_face_data(
-            frame_meta, size)
+            frame_meta, size, self._face_stamp)
         with self._lock:
             self._face_data = face_data
             self._face_source_size = size
             self._frame_seq += 1
-            self._meta_event.set()
+        with self._cond:
+            self._face_pending = True
+            self._cond.notify_all()
 
         if self._debug_probe:
             s = self._stats
@@ -907,11 +1053,13 @@ class DeepStreamPipeline:
         return None, None, None
 
     def _extract_face_meta(self, obj_meta, bbox: tuple,
-                           frame_size=None) -> dict:
+                           frame_size=None, frame_stamp=None) -> dict:
         """
         Trích face data từ obj_meta. Plugin attach embedding + (v2) bbox
         decode từ landmarks + quality. PGIE rect_params làm fallback bbox.
         frame_size: (width, height) — dùng để clip bbox về biên frame.
+        frame_stamp: counter monotonic của face probe; IdentityTracker dùng
+            để dedup snapshot stale.
         """
         emb, face_bbox, quality = self._read_face_embed_meta(obj_meta)
 
@@ -931,16 +1079,109 @@ class DeepStreamPipeline:
             "embedding": emb,
             "quality": quality,
             "object_id": tid,
+            "frame_stamp": frame_stamp,
         }
     
+    # ────────────────────────────────────────────────────────────────
+    # Plate OCR combine: gom 36-class char obj_meta của SGIE thành 1 string.
+    # Chạy trên src pad của SGIE (trước tee) — sau combine, char obj_meta
+    # children vẫn nằm trong obj_meta_list nhưng main probe ignore qua filter
+    # unique_component_id = plate_gie_uid.
+    # ────────────────────────────────────────────────────────────────
+    def _plate_ocr_combine_probe(self, pad, info, _):
+        buf = info.get_buffer()
+        if not buf:
+            return Gst.PadProbeReturn.OK
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
+        if batch_meta is None:
+            return Gst.PadProbeReturn.OK
+        pts = buf.pts
+        l_frame = batch_meta.frame_meta_list
+        while l_frame is not None:
+            try:
+                fm = pyds.NvDsFrameMeta.cast(l_frame.data)
+            except StopIteration:
+                break
+            text, conf = self._combine_frame_chars(fm)
+            if text:
+                with self._ocr_text_lock:
+                    self._plate_text_by_pts[pts] = (text, conf)
+                    # Bound dict size — drop oldest entries nếu meta probe
+                    # không kịp consume (vd display branch slow).
+                    if len(self._plate_text_by_pts) > 32:
+                        oldest_key = next(iter(self._plate_text_by_pts))
+                        self._plate_text_by_pts.pop(oldest_key, None)
+            try:
+                l_frame = l_frame.next
+            except StopIteration:
+                break
+        return Gst.PadProbeReturn.OK
+
+    def _combine_frame_chars(self, frame_meta):
+        """Gom char obj_meta thuộc cùng plate trong 1 frame, sort + format
+        thành chuỗi biển số chuẩn VN.
+
+        Constraint: max 1 plate per frame ⇒ gom tất cả char (uid=ocr_sgie)
+        không phân biệt parent, sort + format luôn.
+        """
+        chars = []
+        l_obj = frame_meta.obj_meta_list
+        while l_obj is not None:
+            try:
+                om = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
+            if om.unique_component_id == self._ocr_sgie_uid:
+                cls_id = int(om.class_id)
+                if 0 <= cls_id < len(_OCR_CLASS_CHARS):
+                    r = om.rect_params
+                    chars.append({
+                        "char": _OCR_CLASS_CHARS[cls_id],
+                        "conf": float(om.confidence),
+                        "cx": r.left + r.width * 0.5,
+                        "cy": r.top + r.height * 0.5,
+                        "h": r.height,
+                    })
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+
+        if not chars:
+            return None, 0.0
+        if len(chars) > _MAX_PLATE_CHARS:
+            chars.sort(key=lambda c: c["conf"], reverse=True)
+            chars = chars[:_MAX_PLATE_CHARS]
+
+        sorted_chars = _sort_chars_for_plate(chars)
+        text = "".join(c["char"] for c in sorted_chars)
+        text = _enforce_plate_format(text)
+        if not text:
+            return None, 0.0
+        avg_conf = sum(c["conf"] for c in sorted_chars) / len(sorted_chars)
+        return text, avg_conf
+
     @property
     def stream_fps(self):
         return round(self._probe_fps, 1)
     
-    def wait_new_frame(self, timeout=0.5) -> bool:
-        """Block cho tới khi probe đẩy meta mới."""
-        self._meta_event.clear()
-        return self._meta_event.wait(timeout=timeout)
+    def wait_new_frame(self, timeout=0.5) -> tuple:
+        """
+        Block đến khi ít nhất 1 trong 2 probe (plate/face) fire.
+
+        Returns (plate_fresh, face_fresh): cờ cho biết cam nào có frame mới
+        kể từ lần wait trước. Cả 2 đều False nếu timeout (caller có thể loop
+        tiếp). Sau khi return, 2 cờ pending được reset → lần wait sau chỉ
+        thấy probe fire mới.
+        """
+        with self._cond:
+            if not (self._plate_pending or self._face_pending):
+                self._cond.wait(timeout=timeout)
+            plate_fresh = self._plate_pending
+            face_fresh = self._face_pending
+            self._plate_pending = False
+            self._face_pending = False
+        return plate_fresh, face_fresh
 
     def _on_bus_message(self, bus, message):
         """Log GStreamer bus messages — rất quan trọng để debug."""
@@ -989,9 +1230,8 @@ class DeepStreamPipeline:
         Snapshot cho main loop + web thread.
 
         Trả dict:
-          plate_full: BGR full-res, chỉ set khi có plate detection (else None)
-          plate_dets: list detection của plate
-          plate_source_size: (w, h)
+          plate_dets: list detection của plate (bbox toạ độ mux 1280×720)
+          plate_source_size: (w, h) — toạ độ bbox của plate_dets
           plate_display: BGR 640×360 (do appsink push), có thể None khi pipeline
                          vừa khởi động hoặc plate disabled
           face_data: list face dict {bbox, conf, embedding, quality}
@@ -999,26 +1239,29 @@ class DeepStreamPipeline:
           face_display: BGR 640×360 (do appsink push), có thể None
         """
         with self._lock:
-            plate_full = self._plate_full_frame
             plate_dets = list(self._plate_detections)
             plate_src = self._plate_source_size
             face_data = list(self._face_data)
             face_src = self._face_source_size
+            face_stamp = self._face_stamp
         with self._display_lock:
             plate_disp = self._plate_display_frame
             face_disp = self._face_display_frame
         return {
-            "plate_full": plate_full,
             "plate_dets": plate_dets,
             "plate_source_size": plate_src,
             "plate_display": plate_disp,
             "face_data": face_data,
             "face_source_size": face_src,
             "face_display": face_disp,
+            "face_stamp": face_stamp,
         }
 
     def stop(self):
         self._stop.set()
+        # Wake bất kỳ main loop nào đang block trong wait_new_frame.
+        with self._cond:
+            self._cond.notify_all()
         for pipeline in self._pipelines:
             pipeline.set_state(Gst.State.NULL)
         if hasattr(self, "_loop"):

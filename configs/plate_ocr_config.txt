@@ -1,0 +1,71 @@
+# nvinfer config — YOLOv8n Plate Char OCR (SGIE)
+# Chạy trên crop từ plate detector (PGIE uid=1).
+# Output: 36 char obj_meta (class 0-35: '0'-'9' + 'A'-'Z') gắn với parent
+# là plate obj_meta. Combine probe trong pipeline.py sẽ gom chars → string
+# → attach NvDsUserMeta(PARKING.PLATE_TEXT_META) lên plate.
+#
+# Model: plate_ocr_yolov8n.engine (FP16)
+# Input : images [1, 3, 320, 320]
+# Output: output0 [1, 40, 2100] = [4 + 36, N_anchors]
+
+[property]
+gpu-id=0
+net-scale-factor=0.003921569
+# 1/255 — match training preprocess (YOLO ultralytics)
+
+offsets=0;0;0
+model-color-format=0
+# 0=RGB, match plate detector + ultralytics export
+
+model-engine-file=/home/somethink/parking_system/models/plate_ocr_yolov8n.engine
+onnx-file=/home/somethink/parking_system/models/plate_ocr_yolov8n.onnx
+
+batch-size=1
+# Plate camera tối đa 1 plate/frame ⇒ SGIE batch=1 đủ.
+
+network-mode=2
+# 2=FP16
+
+network-type=0
+# 0=detector (decode 36-class bbox, không phải classifier)
+
+process-mode=2
+# 2=SGIE — chạy trên object crop của PGIE.
+
+operate-on-gie-id=1
+# Chỉ xử lý object từ plate detector (uid=1).
+
+operate-on-class-ids=0
+# Plate detector chỉ có 1 class (license_plate = 0).
+
+interval=0
+# OCR mỗi frame có plate (PGIE plate_det cũng interval=0 ⇒ liên tục).
+
+gie-unique-id=3
+# uid riêng để probe phân biệt char obj_meta vs plate obj_meta.
+
+num-detected-classes=36
+# 36 class: 0-9 + A-Z.
+
+cluster-mode=2
+# 2=NMS. Parser đã NMS nội bộ; cluster-mode=2 áp thêm 1 lớp NMS chuẩn DS.
+
+maintain-aspect-ratio=1
+symmetric-padding=1
+# Letterbox preserve aspect — quan trọng cho geometry ký tự.
+
+infer-dims=3;320;320
+
+input-object-min-width=60
+input-object-min-height=20
+# Bỏ plate quá nhỏ (xe quá xa) — không đủ resolution để OCR ổn.
+
+output-blob-names=output0
+parse-bbox-func-name=NvDsInferParseYoloV8PlateOCR
+custom-lib-path=/home/somethink/parking_system/parsers/libnvds_plate_ocr_parser.so
+output-tensor-meta=0
+# Parser dùng layerInfo trực tiếp, không cần raw tensor.
+
+[class-attrs-all]
+pre-cluster-threshold=0.3
+nms-iou-threshold=0.45

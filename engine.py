@@ -45,9 +45,10 @@ def enforce_plate_format(text: str) -> str:
         for i in range(len(chars) - 4, len(chars)):
             if not chars[i].isdigit():
                 chars[i] = _LETTER_TO_DIGIT.get(chars[i], chars[i])
-    # Tối đa 6 số liên tiếp tính từ cuối (format dài nhất: XXYN-NNNNN = 6 số đuôi).
-    # Nếu char thứ 7 từ cuối lên vẫn là digit → ép thành letter (vị trí kỳ vọng là chữ).
-    if len(chars) >= 7 and chars[-7].isdigit():
+    # Chỉ áp dụng cho biển 9 ký tự (XXYN-NNNNN hoặc XXYY-NNNNN): pos 2 là chữ
+    # → ép char[-7] (= chars[2]) thành letter nếu YOLO đọc nhầm thành digit.
+    # Với 7-8 ký tự, char[-7] rơi vào vị trí số (pos 0 hoặc 1) → KHÔNG ép.
+    if len(chars) >= 9 and chars[-7].isdigit():
         chars[-7] = _DIGIT_TO_LETTER.get(chars[-7], chars[-7])
     return ''.join(chars)
 

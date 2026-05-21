@@ -153,8 +153,32 @@ class IdentityTracker:
         self.stale_frames = stale_frames
         self._slots = {}        # track_id → dict{embedding, quality, ...}
         self._frame_idx = 0
+        # Stamp của face frame thật cuối cùng đã ingest. Dùng để bỏ qua
+        # snapshot stale khi main loop wake từ camera khác (xem process_entry).
+        self._last_face_stamp = None
 
-    def update_batch(self, faces):
+    def update_batch(self, faces, frame_stamp=None):
+        """
+        faces: list face dict; mỗi dict có thể chứa `frame_stamp` (DS path).
+        frame_stamp: stamp ở mức batch (caller pass thẳng cho trường hợp
+            face_data=[] — không có face dict để đính). Nếu None, suy ra từ
+            face dict đầu tiên có stamp.
+
+        Hành vi: nếu stamp đã thấy ở lần update_batch trước → return không
+        side-effect. Vẫn tick `_frame_idx` chỉ khi đây là frame face thật mới,
+        nên stale_frames đếm theo frame face chứ không theo wake-up.
+        """
+        if frame_stamp is None and faces:
+            for f in faces:
+                s = f.get("frame_stamp")
+                if s is not None:
+                    frame_stamp = s
+                    break
+        if frame_stamp is not None and frame_stamp == self._last_face_stamp:
+            return
+        if frame_stamp is not None:
+            self._last_face_stamp = frame_stamp
+
         self._frame_idx += 1
         for f in faces:
             tid = f.get("object_id")
@@ -259,6 +283,12 @@ class ParkingSystem:
         if self.use_deepstream and not self._ds_plate_enabled:
             ocr_backend = "disabled"
             log.info("Plate OCR skipped (DeepStream plate disabled)")
+        elif self._ds_plate_enabled:
+            # SGIE plate_ocr (DS) đã chạy YOLO char-det trên GPU; combine probe
+            # gom char → string trong pipeline.py. Python OCR không cần load.
+            ocr_backend = "deepstream-sgie"
+            log.info("Plate OCR via DeepStream SGIE "
+                     "(Python OCR model not loaded)")
         elif ocr_backend == "yolo":
             self.plate_ocr = PlateOCRYolo(
                 model_path=ocr_cfg["model"],
@@ -308,6 +338,10 @@ class ParkingSystem:
         # Fallback path không có nvtracker → tự gán object_id qua IoU.
         self._fallback_prev_tracks = []   # [(bbox, track_id), ...]
         self._fallback_next_id = 0
+        # Stamp tăng mỗi lần _run_face chạy → đính vào face dict cho symmetric
+        # với DS path. Fallback không có vấn đề stale-snapshot nhưng giữ field
+        # để IdentityTracker dedup hoạt động đồng nhất.
+        self._fallback_face_stamp = 0
 
         # ── Web state (shared reference với web.py) ──
         self.state = {
@@ -421,6 +455,8 @@ class ParkingSystem:
         """
         t0 = time.time()
         faces = self._load_face_engine()(frame_face)
+        self._fallback_face_stamp += 1
+        stamp = self._fallback_face_stamp
         out = []
         new_prev = []
         for f in faces:
@@ -433,6 +469,7 @@ class ParkingSystem:
                 "embedding": f["embedding"],
                 "quality": q,
                 "object_id": tid,
+                "frame_stamp": stamp,
             })
         self._fallback_prev_tracks = new_prev
         dt = (time.time() - t0) * 1000
@@ -442,9 +479,19 @@ class ParkingSystem:
     # Plate crop + display helpers
     # ──────────────────────────────────────────────
     @staticmethod
-    def _crop_plate(frame_plate, bbox):
-        x1, y1, x2, y2 = bbox
+    def _crop_plate(frame_plate, bbox, source_size=None):
+        """Crop plate thumbnail. Nếu source_size khác kích thước frame
+        (DS path: bbox ở toạ độ mux 1280×720, frame là display 640×360),
+        scale bbox về toạ độ frame trước khi crop."""
         h, w = frame_plate.shape[:2]
+        x1, y1, x2, y2 = bbox
+        if source_size and source_size[0] > 0 and source_size[1] > 0:
+            src_w, src_h = source_size
+            if (src_w, src_h) != (w, h):
+                sx = w / src_w
+                sy = h / src_h
+                x1, y1, x2, y2 = (int(x1 * sx), int(y1 * sy),
+                                  int(x2 * sx), int(y2 * sy))
         box_w, box_h = x2 - x1, y2 - y1
         mx = max(10, int(box_w * 0.08))
         my = max(8, int(box_h * 0.12))
@@ -496,7 +543,10 @@ class ParkingSystem:
     # ──────────────────────────────────────────────
     def process_entry(self, frame_plate, plate_dets,
                       frame_face, face_data=None,
-                      face_source_size=None) -> dict:
+                      face_source_size=None,
+                      plate_source_size=None,
+                      face_stamp=None,
+                      plate_fresh=True, face_fresh=True) -> dict:
         result = {"ok": False, "plate": "", "face_conf": 0,
                   "plate_bbox": None, "face_bbox": None}
 
@@ -512,7 +562,8 @@ class ParkingSystem:
             fut_ocr = None
             if plate_dets and frame_plate is not None:
                 best_p = max(plate_dets, key=lambda p: p["conf"])
-                crop = self._crop_plate(frame_plate, best_p["bbox"])
+                crop = self._crop_plate(frame_plate, best_p["bbox"],
+                                        source_size=plate_source_size)
                 fut_ocr = self._get_executor().submit(self._run_ocr, crop) \
                     if crop.size > 0 else None
             fut_face = self._get_executor().submit(self._run_face, frame_face)
@@ -530,35 +581,55 @@ class ParkingSystem:
             ocr_result = None
             self.state["timing"] = {}
 
-        # Quality fill + push vào tracker mỗi frame có face_data.
+        # Quality fill + push vào tracker CHỈ khi face cam có frame mới.
+        # Snapshot stale (plate-only wake) → giữ nguyên state tracker, dùng
+        # face_data cũ cho display để không flicker bbox.
         face_data = self._ensure_quality(face_data, frame_face)
-        # Luôn gọi update_batch (kể cả empty) để _frame_idx tick → stale
-        # purge hoạt động khi tất cả face đã rời frame.
-        self.tracker.update_batch(face_data or [])
+        if face_fresh:
+            self.tracker.update_batch(face_data or [], frame_stamp=face_stamp)
         if face_data:
             self._fill_display(result, frame_face, face_data,
                                face_source_size=face_source_size)
 
-        # Không có plate ⇒ chỉ accumulate tracker, không commit.
-        if not plate_dets:
-            return result
-        best_p = max(plate_dets, key=lambda p: p["conf"])
-        result["plate_bbox"] = best_p["bbox"]
-        if frame_plate is None:
-            return result
-        crop = self._crop_plate(frame_plate, best_p["bbox"])
-        if crop.size == 0:
-            return result
-        result["plate_crop"] = crop.copy()
+        # Plate display (bbox) luôn fill nếu có detection — dù plate stale,
+        # vẫn vẽ bbox cũ để không flicker giữa các plate wake.
+        best_p = max(plate_dets, key=lambda p: p["conf"]) if plate_dets else None
+        if best_p is not None:
+            result["plate_bbox"] = best_p["bbox"]
 
-        # OCR: dùng kết quả parallel nếu fallback đã chạy, không thì serial.
-        if ocr_result is not None:
+        # Vote / OCR / commit CHỈ khi plate fresh + có detection. Stale wake
+        # (face-only) không được vote lại vì sẽ inflate plate_voter buffer.
+        if not plate_fresh or best_p is None:
+            return result
+
+        # Crop chỉ cần cho display emit (plate_crop trong WebSocket payload).
+        # DS path: frame_plate là display 640×360 — _crop_plate scale bbox từ
+        # toạ độ mux về display qua plate_source_size.
+        crop = None
+        if frame_plate is not None:
+            crop = self._crop_plate(frame_plate, best_p["bbox"],
+                                    source_size=plate_source_size)
+            if crop.size > 0:
+                result["plate_crop"] = crop.copy()
+
+        # OCR text:
+        #   DS path  → best_p["text"] do combine probe gắn từ SGIE.
+        #   Fallback → ocr_result đã chạy parallel ở trên, hoặc serial _run_ocr.
+        if "text" in best_p:
+            raw_text = best_p["text"]
+            ocr_conf = float(best_p.get("text_conf", 0.0))
+            plate = self.validator(raw_text) if raw_text else ""
+            dt_ocr = 0.0
+        elif ocr_result is not None:
             raw_text, ocr_conf, plate, dt_ocr = ocr_result
         else:
+            if crop is None or crop.size == 0:
+                return result
             raw_text, ocr_conf, plate, dt_ocr = self._run_ocr(crop)
         self.state["timing"]["ocr_ms"] = round(dt_ocr, 1)
-        log.debug(f"ENTRY OCR: raw='{raw_text}' conf={ocr_conf:.2f} "
-                  f"→ '{plate}' ({dt_ocr:.0f}ms)")
+        if raw_text:
+            log.debug(f"ENTRY OCR: raw='{raw_text}' conf={ocr_conf:.2f} "
+                      f"→ '{plate}' ({dt_ocr:.0f}ms)")
 
         # Vote.
         stable = self.plate_voter.vote(plate)
@@ -599,7 +670,10 @@ class ParkingSystem:
 
     def process_exit(self, frame_face, frame_plate,
                      plate_dets=None, face_data=None,
-                     face_source_size=None) -> dict:
+                     face_source_size=None,
+                     plate_source_size=None,
+                     face_stamp=None,
+                     plate_fresh=True, face_fresh=True) -> dict:
         result = {"ok": False, "plate": "", "sim": 0.0,
                   "face_bbox": None, "plate_bbox": None}
 
@@ -615,25 +689,37 @@ class ParkingSystem:
             self.state["timing"] = {}
 
         face_data = self._ensure_quality(face_data, frame_face)
-        # Luôn gọi update_batch (kể cả empty) để _frame_idx tick → stale
-        # purge hoạt động khi tất cả face đã rời frame.
-        self.tracker.update_batch(face_data or [])
+        # Tracker update chỉ khi face fresh — xem ghi chú trong process_entry.
+        if face_fresh:
+            self.tracker.update_batch(face_data or [], frame_stamp=face_stamp)
         if face_data:
             self._fill_display(result, frame_face, face_data,
                                face_source_size=face_source_size)
 
-        if not plate_dets:
-            return result
-        if frame_plate is None:
-            return result
-        best_p = max(plate_dets, key=lambda p: p["conf"])
-        result["plate_bbox"] = best_p["bbox"]
-        crop = self._crop_plate(frame_plate, best_p["bbox"])
-        if crop.size == 0:
-            return result
-        result["plate_crop"] = crop.copy()
+        # Plate display luôn fill cho continuity.
+        best_p = max(plate_dets, key=lambda p: p["conf"]) if plate_dets else None
+        if best_p is not None:
+            result["plate_bbox"] = best_p["bbox"]
 
-        raw_text, _, plate, dt_ocr = self._run_ocr(crop)
+        if not plate_fresh or best_p is None:
+            return result
+
+        # Crop chỉ cho display payload; DS path có text sẵn nên crop optional.
+        crop = None
+        if frame_plate is not None:
+            crop = self._crop_plate(frame_plate, best_p["bbox"],
+                                    source_size=plate_source_size)
+            if crop.size > 0:
+                result["plate_crop"] = crop.copy()
+
+        if "text" in best_p:
+            raw_text = best_p["text"]
+            plate = self.validator(raw_text) if raw_text else ""
+            dt_ocr = 0.0
+        else:
+            if crop is None or crop.size == 0:
+                return result
+            raw_text, _, plate, dt_ocr = self._run_ocr(crop)
         self.state["timing"]["ocr_ms"] = round(dt_ocr, 1)
 
         exit_plate = self.plate_voter.vote(plate)
@@ -876,16 +962,18 @@ class ParkingSystem:
 
         try:
             while self.running:
-                if not ds.wait_new_frame(timeout=0.5):
+                plate_fresh, face_fresh = ds.wait_new_frame(timeout=0.5)
+                if not (plate_fresh or face_fresh):
                     continue
 
                 snap = ds.get_all()
-                fp_full = snap["plate_full"]
+                plate_disp = snap["plate_display"]
                 plate_dets = snap["plate_dets"]
                 face_data = snap["face_data"]
                 face_disp = snap["face_display"]
                 face_src_sz = snap["face_source_size"]
                 plate_src_sz = snap["plate_source_size"]
+                face_stamp = snap["face_stamp"]
 
                 # "Cam ok" = pipeline đã probe ít nhất 1 frame (source_size>0).
                 plate_seen = plate_src_sz[0] > 0
@@ -949,14 +1037,22 @@ class ParkingSystem:
                     result = {"ok": False}
                 elif mode == "entry":
                     result = self.process_entry(
-                        fp_full, plate_dets, face_disp,
+                        plate_disp, plate_dets, face_disp,
                         face_data=face_data if self._ds_face_enabled else None,
-                        face_source_size=face_src_sz)
+                        face_source_size=face_src_sz,
+                        plate_source_size=plate_src_sz,
+                        face_stamp=face_stamp if self._ds_face_enabled else None,
+                        plate_fresh=plate_fresh and self._ds_plate_enabled,
+                        face_fresh=face_fresh and self._ds_face_enabled)
                 else:
                     result = self.process_exit(
-                        face_disp, fp_full, plate_dets,
+                        face_disp, plate_disp, plate_dets,
                         face_data=face_data if self._ds_face_enabled else None,
-                        face_source_size=face_src_sz)
+                        face_source_size=face_src_sz,
+                        plate_source_size=plate_src_sz,
+                        face_stamp=face_stamp if self._ds_face_enabled else None,
+                        plate_fresh=plate_fresh and self._ds_plate_enabled,
+                        face_fresh=face_fresh and self._ds_face_enabled)
 
                 self._last_result = result
 
@@ -973,7 +1069,6 @@ class ParkingSystem:
                     n_fps, t_fps = 0, now
 
                 if show:
-                    plate_disp = snap["plate_display"]
                     if plate_disp is not None and face_disp is not None:
                         self._show_dual(plate_disp, face_disp, result, mode)
                     key = cv2.waitKey(1) & 0xFF
