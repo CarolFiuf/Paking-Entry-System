@@ -20,7 +20,7 @@ camera:
 # DeepStream pipeline (tắt = fallback GStreamer + Python inference)
 deepstream:
   enabled: true
-  plate_enabled: true
+  plate_enabled: false
   face_enabled: true
   plate_config: "./configs/plate_det_config.txt"
   plate_ocr_config: "./configs/plate_ocr_config.txt"
@@ -28,12 +28,12 @@ deepstream:
   # Face chain: SCRFD det → nvdsfaceembed (CUDA align + TensorRT ArcFace,
   # embedding attached as PARKING.FACE_EMBEDDING_META on obj_meta).
   face_embed_engine: "./models/face_embed_arcface_fp16.engine"
-  face_embed_batch_size: 16
+  face_embed_batch_size: 8
   face_embed_align_on_gpu: true
   face_embed_allow_cpu_fallback: true
   # nvdsfaceembed v2+: plugin tự tính blur+brightness quality. Set 0.0 để
   # disable plugin-side skip (vẫn fill meta.quality nếu < min_quality).
-  face_embed_min_quality: 0.0
+  face_embed_min_quality: 0.3
   # SCRFD anchor score threshold. Plugin tự decode + NMS (parser là no-op),
   # giá trị này là source of truth duy nhất — pre-cluster-threshold trong
   # face_det_config.txt KHÔNG dùng nữa.
@@ -53,11 +53,11 @@ deepstream:
   face_tracker_width: 960
   face_tracker_height: 544
   # face_embed_interval=N → plugin chỉ embed lại mỗi N+1 frame cho cùng
-  # track. Property đã có trong plugin nhưng KHÔNG hiệu lực ở kiến trúc
-  # hiện tại (tracker đặt SAU embedder → object_id chưa có lúc plugin chạy
-  # → mọi obj_meta đều UNTRACKED → fallback embed-everything). Để bật thật
-  # sự cần tách plugin thành nvdsfacedet + nvdsfaceembed (Hướng B). Giữ 0.
-  face_embed_interval: 0
+  # track. Sau khi tách scrfddec/embed + tracker chèn giữa, object_id ổn
+  # định trước khi embed plugin chạy → knob này thật sự hiệu lực.
+  # N=2 ≈ embed 1/3 frame mỗi track (cắt ~67% ArcFace inference). Track mới
+  # trong probationAge=2 vẫn embed mỗi frame (object_id=UNTRACKED).
+  face_embed_interval: 2
 
 plate_detector:
   model: "./models/plate_yolov8n.pt"

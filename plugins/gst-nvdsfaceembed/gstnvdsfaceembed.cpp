@@ -3,8 +3,6 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <map>
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -23,7 +21,7 @@
 
 #include "face_align_solver.h"
 #include "nvds_face_embed_meta.h"
-#include "scrfd_decode.h"
+#include "nvds_face_landmarks_meta.h"
 
 extern "C" cudaError_t launch_face_align_rgba_chw_kernel(
     const uint8_t *rgba, int src_w, int src_h, int src_pitch, float *dst,
@@ -45,7 +43,6 @@ static constexpr int FACE_W = 112;
 static constexpr int FACE_H = 112;
 static constexpr int FACE_TENSOR_FLOATS = 3 * FACE_W * FACE_H;
 static constexpr int EMBED_DIMS = PARKING_FACE_EMBED_DIMS;
-static constexpr float DEFAULT_DECODE_CONF_THRESH = 0.30f;
 
 GST_DEBUG_CATEGORY_STATIC(gst_nvdsfaceembed_debug);
 #define GST_CAT_DEFAULT gst_nvdsfaceembed_debug
@@ -61,12 +58,7 @@ struct _GstNvDsFaceEmbed {
     guint face_gie_id;
     gint source_id;
     guint max_batch_size;
-    guint net_width;
-    guint net_height;
-    guint min_object_width;
-    guint min_object_height;
     guint debug_interval;
-    gfloat decode_conf_threshold;
     gboolean align_on_gpu;
     gboolean allow_cpu_fallback;
     gchar *engine_file;
@@ -89,6 +81,7 @@ struct _GstNvDsFaceEmbed {
     gchar *output_name;
 
     NvDsMetaType embed_meta_type;
+    NvDsMetaType landmarks_meta_type;
     guint64 call_count;
     guint64 stat_frames;
     guint64 stat_objs;
@@ -145,12 +138,7 @@ enum {
     PROP_SOURCE_ID,
     PROP_ENGINE_FILE,
     PROP_BATCH_SIZE,
-    PROP_NET_WIDTH,
-    PROP_NET_HEIGHT,
-    PROP_MIN_OBJECT_WIDTH,
-    PROP_MIN_OBJECT_HEIGHT,
     PROP_DEBUG_INTERVAL,
-    PROP_DECODE_CONF_THRESHOLD,
     PROP_ALIGN_ON_GPU,
     PROP_ALLOW_CPU_FALLBACK,
     PROP_MIN_QUALITY,
@@ -167,58 +155,6 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     "src", GST_PAD_SRC, GST_PAD_ALWAYS,
     GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE_WITH_FEATURES(
         GST_CAPS_FEATURE_MEMORY_NVMM, "{ NV12, RGBA }")));
-
-static void decode_scrfd_from_frame(NvDsFrameMeta *fm, int gie_uid, int net_w,
-                                    int net_h, float conf_threshold,
-                                    std::vector<DecodedFace> &out) {
-    out.clear();
-    if (!fm) return;
-
-    ScrfdLayers layers;
-    for (NvDsMetaList *l = fm->frame_user_meta_list; l; l = l->next) {
-        NvDsUserMeta *um = (NvDsUserMeta *)l->data;
-        if (!um || um->base_meta.meta_type != NVDSINFER_TENSOR_OUTPUT_META)
-            continue;
-        NvDsInferTensorMeta *tm = (NvDsInferTensorMeta *)um->user_meta_data;
-        if (!tm || (int)tm->unique_id != gie_uid) continue;
-
-        for (unsigned int i = 0; i < tm->num_output_layers; i++) {
-            NvDsInferLayerInfo &li = tm->output_layers_info[i];
-            int total = 1;
-            for (unsigned int d = 0; d < li.inferDims.numDims; d++)
-                total *= li.inferDims.d[d];
-            int last = li.inferDims.numDims ?
-                li.inferDims.d[li.inferDims.numDims - 1] : 1;
-            if (total <= 0 || last <= 0) continue;
-            int anchors = total / last;
-            const float *buf = (const float *)tm->out_buf_ptrs_host[i];
-            if (!buf) continue;
-            if (last == 1) layers.scores[anchors] = buf;
-            else if (last == 4) layers.boxes[anchors] = buf;
-            else if (last == 10) layers.kps[anchors] = buf;
-        }
-    }
-
-    std::vector<DecodedFace> raw;
-    scrfd_decode(layers, net_w, net_h, conf_threshold, raw);
-    out = scrfd_nms(raw);
-}
-
-static void net_to_frame_lm(const DecodedFace &d, int net_w, int net_h,
-                            int frame_w, int frame_h, float out_lm[5][2],
-                            float out_box[4]) {
-    float scale = std::min((float)net_w / frame_w, (float)net_h / frame_h);
-    float pad_x = (net_w - frame_w * scale) * 0.5f;
-    float pad_y = (net_h - frame_h * scale) * 0.5f;
-    out_box[0] = (d.x1 - pad_x) / scale;
-    out_box[1] = (d.y1 - pad_y) / scale;
-    out_box[2] = (d.x2 - pad_x) / scale;
-    out_box[3] = (d.y2 - pad_y) / scale;
-    for (int i = 0; i < 5; i++) {
-        out_lm[i][0] = (d.lm[i][0] - pad_x) / scale;
-        out_lm[i][1] = (d.lm[i][1] - pad_y) / scale;
-    }
-}
 
 static bool align_face_cpu_rgba_to_slot(const guint8 *rgba, int width,
                                         int height, int pitch,
@@ -410,16 +346,14 @@ static void attach_embedding_meta(GstNvDsFaceEmbed *self,
                                   NvDsBatchMeta *batch_meta,
                                   NvDsObjectMeta *obj_meta,
                                   const float *embedding,
-                                  const float lm[5][2],
-                                  const float bbox[4],
                                   float quality) {
     if (!batch_meta || !obj_meta || !embedding) return;
 
     auto *payload = (ParkingFaceEmbeddingMeta *)g_malloc0(
         sizeof(ParkingFaceEmbeddingMeta));
-    payload->version = 2;
+    payload->version = 3;
     payload->dims = EMBED_DIMS;
-    payload->flags = 1;
+    payload->flags = PARKING_FACE_EMB_FLAG_VALID;
 
     float norm = 0.0f;
     for (int i = 0; i < EMBED_DIMS; i++) norm += embedding[i] * embedding[i];
@@ -427,13 +361,6 @@ static void attach_embedding_meta(GstNvDsFaceEmbed *self,
     for (int i = 0; i < EMBED_DIMS; i++) {
         payload->embedding[i] = norm > 1e-6f ? embedding[i] / norm
                                              : embedding[i];
-    }
-    for (int i = 0; i < 5; i++) {
-        payload->landmarks[i * 2 + 0] = lm[i][0];
-        payload->landmarks[i * 2 + 1] = lm[i][1];
-    }
-    for (int i = 0; i < 4; i++) {
-        payload->bbox[i] = bbox[i];
     }
     payload->quality = quality;
 
@@ -573,6 +500,8 @@ static gboolean gst_nvdsfaceembed_start(GstBaseTransform *btrans) {
 
     self->embed_meta_type = nvds_get_user_meta_type(
         (gchar *)PARKING_FACE_EMBED_META_DESC);
+    self->landmarks_meta_type = nvds_get_user_meta_type(
+        (gchar *)PARKING_FACE_LANDMARKS_META_DESC);
     if (!load_engine(self)) return FALSE;
 
     // Map track_id → last embed frame_counter cho interval skip.
@@ -585,12 +514,13 @@ static gboolean gst_nvdsfaceembed_start(GstBaseTransform *btrans) {
     self->stat_interval_skips = 0;
 
     GST_INFO_OBJECT(self, "started engine=%s face-gie-id=%u source-id=%d "
-                    "batch=%u decode-conf=%.2f align-on-gpu=%d "
-                    "cpu-fallback=%d meta-type=%d interval=%u",
+                    "batch=%u align-on-gpu=%d cpu-fallback=%d "
+                    "embed-meta-type=%d lm-meta-type=%d interval=%u",
                     self->engine_file, self->face_gie_id, self->source_id,
-                    self->max_batch_size, self->decode_conf_threshold,
+                    self->max_batch_size,
                     self->align_on_gpu ? 1 : 0,
-                    self->allow_cpu_fallback ? 1 : 0, self->embed_meta_type,
+                    self->allow_cpu_fallback ? 1 : 0,
+                    self->embed_meta_type, self->landmarks_meta_type,
                     self->interval);
     return TRUE;
 }
@@ -724,16 +654,15 @@ static bool process_jobs_chunk_cpu(GstNvDsFaceEmbed *self,
         float quality = compute_quality_score(blur_var, mean_b, bw, bh,
                                               self->blur_threshold);
         // Cap rate embed cho track theo interval — đánh dấu đã embed ngay
-        // cả khi quality không pass (tránh spam ArcFace frame kế tiếp).
-        // Khi object_id chưa có (kiến trúc hiện tại) đây là no-op.
+        // cả khi quality không pass (tránh spam ArcFace frame kế tiếp cho
+        // track đang ở góc xấu).
         if (self->last_embed_frame &&
             job.obj_meta->object_id != UNTRACKED_OBJECT_ID) {
             (*self->last_embed_frame)[(guint64)job.obj_meta->object_id] =
                 self->frame_counter;
         }
         if (quality < self->min_quality) continue;
-        attach_embedding_meta(self, batch_meta, job.obj_meta, emb, job.lm,
-                              job.bbox, quality);
+        attach_embedding_meta(self, batch_meta, job.obj_meta, emb, quality);
         self->stat_emb++;
         self->stat_cpu++;
     }
@@ -809,8 +738,7 @@ static bool process_jobs_chunk_gpu(GstNvDsFaceEmbed *self,
                 self->frame_counter;
         }
         if (quality < self->min_quality) continue;
-        attach_embedding_meta(self, batch_meta, job.obj_meta, emb, job.lm,
-                              job.bbox, quality);
+        attach_embedding_meta(self, batch_meta, job.obj_meta, emb, quality);
         self->stat_emb++;
         self->stat_gpu++;
     }
@@ -850,10 +778,9 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
         return GST_FLOW_OK;
     }
 
-    // Frame counter cho interval skip + purge map định kỳ. Ở pipeline hiện
-    // tại tracker đặt SAU plugin nên object_id luôn UNTRACKED khi plugin
-    // chạy → skip logic không kích hoạt (safe no-op). Khi tách plugin
-    // facedet+embed sau này, tracker sẽ chèn object_id trước, skip work.
+    // Frame counter cho interval skip + purge map định kỳ. Tracker upstream
+    // (giữa scrfddec và embed) đã gán object_id ổn định cho track committed
+    // qua probationAge → interval skip hoạt động thật sự.
     self->frame_counter++;
     if (self->last_embed_frame &&
         self->interval > 0 &&
@@ -879,89 +806,33 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
             continue;
         self->stat_frames++;
 
-        int frame_w = 0;
-        int frame_h = 0;
-        if (fm->batch_id < surface->numFilled) {
-            frame_w = (int)surface->surfaceList[fm->batch_id].width;
-            frame_h = (int)surface->surfaceList[fm->batch_id].height;
-        }
-        if (frame_w <= 0 || frame_h <= 0) {
-            frame_w = (int)fm->source_frame_width;
-            frame_h = (int)fm->source_frame_height;
-        }
-        if (frame_w <= 0 || frame_h <= 0)
-            continue;
-
-        // Decode SCRFD đúng 1 lần / frame, sau đó tạo obj_meta + job align
-        // trong cùng vòng. Parser là no-op nên nvinfer không sinh obj_meta.
-        std::vector<DecodedFace> raw_faces;
-        decode_scrfd_from_frame(fm, self->face_gie_id,
-                                (int)self->net_width,
-                                (int)self->net_height,
-                                self->decode_conf_threshold, raw_faces);
-
-        std::vector<DecodedFace> valid_faces;
-        valid_faces.reserve(raw_faces.size());
-        for (const auto &d : raw_faces) {
+        // Iterate obj_meta_list, đọc LandmarksMeta do nvdsscrfddec attach
+        // (đã survive tracker). Tracker đã gán object_id ổn định cho track
+        // committed; obj còn trong probation hoặc tracker-predicted có
+        // object_id == UNTRACKED_OBJECT_ID.
+        for (NvDsMetaList *lo = fm->obj_meta_list; lo; lo = lo->next) {
+            NvDsObjectMeta *om = (NvDsObjectMeta *)lo->data;
+            if (!om) continue;
+            if ((guint)om->unique_component_id != self->face_gie_id) continue;
             self->stat_objs++;
-            if (valid_face_geometry(d, (float)self->net_width,
-                                    (float)self->net_height))
-                valid_faces.push_back(d);
-        }
-        auto kept_faces = scrfd_nms(valid_faces);
 
-        for (const auto &d : kept_faces) {
-            float lm[5][2];
-            float box[4];
-            net_to_frame_lm(d, (int)self->net_width, (int)self->net_height,
-                            frame_w, frame_h, lm, box);
-
-            float x1 = std::max(0.0f, box[0]);
-            float y1 = std::max(0.0f, box[1]);
-            float x2 = std::min((float)frame_w, box[2]);
-            float y2 = std::min((float)frame_h, box[3]);
-            if (!std::isfinite(x1) || !std::isfinite(y1) ||
-                !std::isfinite(x2) || !std::isfinite(y2))
-                continue;
-            float bw = x2 - x1;
-            float bh = y2 - y1;
-            if (bw < (float)self->min_object_width ||
-                bh < (float)self->min_object_height)
-                continue;
-
-            bool lm_in_frame = true;
-            for (int i = 0; i < 5; i++) {
-                if (!std::isfinite(lm[i][0]) || !std::isfinite(lm[i][1])) {
-                    lm_in_frame = false;
+            // Tìm LandmarksMeta đã attach upstream. Tracker-predicted obj
+            // (det miss frame này) không có meta → skip silently.
+            ParkingFaceLandmarksMeta *lm_meta = nullptr;
+            for (NvDsMetaList *lu = om->obj_user_meta_list; lu; lu = lu->next) {
+                NvDsUserMeta *um = (NvDsUserMeta *)lu->data;
+                if (!um) continue;
+                if (um->base_meta.meta_type == self->landmarks_meta_type) {
+                    lm_meta = (ParkingFaceLandmarksMeta *)um->user_meta_data;
                     break;
                 }
             }
-            if (!lm_in_frame) continue;
+            if (!lm_meta || !(lm_meta->flags & PARKING_FACE_LM_FLAG_VALID))
+                continue;
 
-            NvDsObjectMeta *om = nvds_acquire_obj_meta_from_pool(batch_meta);
-            if (!om) continue;
-            om->unique_component_id = self->face_gie_id;
-            om->class_id = 0;
-            om->object_id = UNTRACKED_OBJECT_ID;
-            om->confidence = d.conf;
-            om->tracker_confidence = 0.0f;
-            om->rect_params.left = x1;
-            om->rect_params.top = y1;
-            om->rect_params.width = bw;
-            om->rect_params.height = bh;
-            om->rect_params.border_width = 0;
-            om->rect_params.has_bg_color = 0;
-            om->detector_bbox_info.org_bbox_coords.left = x1;
-            om->detector_bbox_info.org_bbox_coords.top = y1;
-            om->detector_bbox_info.org_bbox_coords.width = bw;
-            om->detector_bbox_info.org_bbox_coords.height = bh;
-            g_strlcpy(om->obj_label, "face", MAX_LABEL_SIZE);
-            nvds_add_obj_meta_to_frame(fm, om, nullptr);
-
-            // Interval skip: nếu plugin chạy SAU tracker (kiến trúc tương
-            // lai), object_id sẽ có sẵn → skip embed cho track đã embed gần
-            // đây. Ở kiến trúc hiện tại object_id luôn UNTRACKED ngay sau
-            // khi plugin tạo, nên if này không vào — embed mọi face.
+            // Interval skip — bây giờ object_id đã được tracker gán cho track
+            // đã commit (probationAge=2). Track mới hoặc untracked vẫn embed
+            // mỗi frame để build best-of-N.
             if (self->interval > 0 && self->last_embed_frame &&
                 om->object_id != UNTRACKED_OBJECT_ID) {
                 guint64 tid = (guint64)om->object_id;
@@ -969,7 +840,7 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
                 if (it != self->last_embed_frame->end() &&
                     self->frame_counter - it->second <= self->interval) {
                     self->stat_interval_skips++;
-                    continue;  // skip job — sẽ không có embedding meta
+                    continue;
                 }
             }
 
@@ -977,9 +848,13 @@ static GstFlowReturn gst_nvdsfaceembed_transform_ip(GstBaseTransform *btrans,
             job.frame_meta = fm;
             job.obj_meta = om;
             job.batch_id = fm->batch_id;
-            float box_out[4] = {x1, y1, x2, y2};
-            std::memcpy(job.lm, lm, sizeof(lm));
-            std::memcpy(job.bbox, box_out, sizeof(box_out));
+            for (int i = 0; i < 5; i++) {
+                job.lm[i][0] = lm_meta->landmarks[i * 2 + 0];
+                job.lm[i][1] = lm_meta->landmarks[i * 2 + 1];
+            }
+            for (int i = 0; i < 4; i++) {
+                job.bbox[i] = lm_meta->bbox[i];
+            }
             jobs.push_back(job);
             self->stat_lm++;
         }
@@ -1041,23 +916,8 @@ static void gst_nvdsfaceembed_set_property(GObject *object, guint prop_id,
         case PROP_BATCH_SIZE:
             self->max_batch_size = g_value_get_uint(value);
             break;
-        case PROP_NET_WIDTH:
-            self->net_width = g_value_get_uint(value);
-            break;
-        case PROP_NET_HEIGHT:
-            self->net_height = g_value_get_uint(value);
-            break;
-        case PROP_MIN_OBJECT_WIDTH:
-            self->min_object_width = g_value_get_uint(value);
-            break;
-        case PROP_MIN_OBJECT_HEIGHT:
-            self->min_object_height = g_value_get_uint(value);
-            break;
         case PROP_DEBUG_INTERVAL:
             self->debug_interval = g_value_get_uint(value);
-            break;
-        case PROP_DECODE_CONF_THRESHOLD:
-            self->decode_conf_threshold = (gfloat)g_value_get_double(value);
             break;
         case PROP_ALIGN_ON_GPU:
             self->align_on_gpu = g_value_get_boolean(value);
@@ -1103,23 +963,8 @@ static void gst_nvdsfaceembed_get_property(GObject *object, guint prop_id,
         case PROP_BATCH_SIZE:
             g_value_set_uint(value, self->max_batch_size);
             break;
-        case PROP_NET_WIDTH:
-            g_value_set_uint(value, self->net_width);
-            break;
-        case PROP_NET_HEIGHT:
-            g_value_set_uint(value, self->net_height);
-            break;
-        case PROP_MIN_OBJECT_WIDTH:
-            g_value_set_uint(value, self->min_object_width);
-            break;
-        case PROP_MIN_OBJECT_HEIGHT:
-            g_value_set_uint(value, self->min_object_height);
-            break;
         case PROP_DEBUG_INTERVAL:
             g_value_set_uint(value, self->debug_interval);
-            break;
-        case PROP_DECODE_CONF_THRESHOLD:
-            g_value_set_double(value, self->decode_conf_threshold);
             break;
         case PROP_ALIGN_ON_GPU:
             g_value_set_boolean(value, self->align_on_gpu);
@@ -1158,12 +1003,7 @@ static void gst_nvdsfaceembed_init(GstNvDsFaceEmbed *self) {
     self->face_gie_id = 2;
     self->source_id = 1;
     self->max_batch_size = 16;
-    self->net_width = 640;
-    self->net_height = 640;
-    self->min_object_width = 32;
-    self->min_object_height = 32;
     self->debug_interval = 150;
-    self->decode_conf_threshold = DEFAULT_DECODE_CONF_THRESH;
     self->align_on_gpu = TRUE;
     self->allow_cpu_fallback = TRUE;
     // Default: vẫn attach mọi face (Python filter), không skip embedding nào.
@@ -1231,45 +1071,12 @@ static void gst_nvdsfaceembed_class_init(GstNvDsFaceEmbedClass *klass) {
                           (GParamFlags)(G_PARAM_READWRITE |
                                         G_PARAM_STATIC_STRINGS)));
     g_object_class_install_property(
-        gobject_class, PROP_NET_WIDTH,
-        g_param_spec_uint("net-width", "Detector net width",
-                          "SCRFD detector network width", 1, G_MAXUINT, 640,
-                          (GParamFlags)(G_PARAM_READWRITE |
-                                        G_PARAM_STATIC_STRINGS)));
-    g_object_class_install_property(
-        gobject_class, PROP_NET_HEIGHT,
-        g_param_spec_uint("net-height", "Detector net height",
-                          "SCRFD detector network height", 1, G_MAXUINT, 640,
-                          (GParamFlags)(G_PARAM_READWRITE |
-                                        G_PARAM_STATIC_STRINGS)));
-    g_object_class_install_property(
-        gobject_class, PROP_MIN_OBJECT_WIDTH,
-        g_param_spec_uint("input-object-min-width", "Min object width",
-                          "Minimum face width to embed", 1, G_MAXUINT, 32,
-                          (GParamFlags)(G_PARAM_READWRITE |
-                                        G_PARAM_STATIC_STRINGS)));
-    g_object_class_install_property(
-        gobject_class, PROP_MIN_OBJECT_HEIGHT,
-        g_param_spec_uint("input-object-min-height", "Min object height",
-                          "Minimum face height to embed", 1, G_MAXUINT, 32,
-                          (GParamFlags)(G_PARAM_READWRITE |
-                                        G_PARAM_STATIC_STRINGS)));
-    g_object_class_install_property(
         gobject_class, PROP_DEBUG_INTERVAL,
         g_param_spec_uint("debug-interval", "Debug interval",
                           "Log stats every N transform calls; 0 disables", 0,
                           G_MAXUINT, 150,
                           (GParamFlags)(G_PARAM_READWRITE |
                                         G_PARAM_STATIC_STRINGS)));
-    g_object_class_install_property(
-        gobject_class, PROP_DECODE_CONF_THRESHOLD,
-        g_param_spec_double("decode-conf-threshold",
-                            "Decode confidence threshold",
-                            "SCRFD confidence threshold used when decoding "
-                            "landmarks from tensor meta", 0.0, 1.0,
-                            DEFAULT_DECODE_CONF_THRESH,
-                            (GParamFlags)(G_PARAM_READWRITE |
-                                          G_PARAM_STATIC_STRINGS)));
     g_object_class_install_property(
         gobject_class, PROP_ALIGN_ON_GPU,
         g_param_spec_boolean("align-on-gpu", "Align on GPU",

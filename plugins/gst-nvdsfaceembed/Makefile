@@ -14,6 +14,7 @@ GST_LIBS   := $(shell pkg-config --libs $(PKGS) 2>/dev/null)
 
 CXXFLAGS := -fPIC -O2 -std=c++14 -Wall \
             -I. \
+            -I../common \
             -I../../preprocess \
             -I../../parsers \
             -I$(DS_INC) \
@@ -35,7 +36,7 @@ NVCCFLAGS := -O2 -std=c++14 -Xcompiler -fPIC \
              -I. \
              -I$(CUDA_INC)
 
-OBJS   := gstnvdsfaceembed.o face_align_solver.o face_align_cuda.o scrfd_decode.o
+OBJS   := gstnvdsfaceembed.o face_align_solver.o face_align_cuda.o
 TARGET := libgstnvdsfaceembed.so
 
 all: $(TARGET)
@@ -43,13 +44,10 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CXX) -o $@ $(OBJS) $(LDFLAGS)
 
-%.o: %.cpp nvds_face_embed_meta.h
+%.o: %.cpp nvds_face_embed_meta.h ../common/nvds_face_landmarks_meta.h
 	$(CXX) -c -o $@ $(CXXFLAGS) $<
 
 face_align_solver.o: ../../preprocess/face_align_solver.cpp ../../preprocess/face_align_solver.h
-	$(CXX) -c -o $@ $(CXXFLAGS) $<
-
-scrfd_decode.o: ../../parsers/scrfd_decode.cpp ../../parsers/scrfd_decode.h
 	$(CXX) -c -o $@ $(CXXFLAGS) $<
 
 face_align_cuda.o: face_align_cuda.cu

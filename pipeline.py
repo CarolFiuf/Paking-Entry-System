@@ -49,6 +49,15 @@ class _ProbeStats:
     multi_face_frames: int = 0
     track_ids: set = field(default_factory=set)
     track_hits: dict = field(default_factory=dict)   # track_id → frame count
+    # Monitor obj_user_meta_list trên face obj sau tracker. Pipeline hiện tại:
+    #   scrfddec attach LandmarksMeta → tracker → embed attach EmbeddingMeta
+    # Steady state:
+    #   - with_meta ≈ uid2 (mọi face có ít nhất LandmarksMeta).
+    #   - total_entries ≈ uid2 + emb (LM ở mọi face + EMB ở face không skip).
+    # Predicted-only obj (tracker tự tạo khi det miss frame) sẽ không có meta
+    # → with_meta < uid2; bình thường khi face_det_interval>0.
+    face_with_user_meta: int = 0
+    face_user_meta_total: int = 0   # Σ len(obj_user_meta_list) trên face obj
 
     def reset(self):
         self.last_log = time.time()
@@ -63,6 +72,8 @@ class _ProbeStats:
         self.multi_face_frames = 0
         self.track_ids = set()
         self.track_hits = {}
+        self.face_with_user_meta = 0
+        self.face_user_meta_total = 0
 
     def log_summary(self):
         # Top 5 track theo số frame xuất hiện — phản ánh stability.
@@ -78,9 +89,29 @@ class _ProbeStats:
                  f"unique_ids={len(self.track_ids)} "
                  f"multi_face_frames={self.multi_face_frames} "
                  f"top={top_str}")
+        # Health check: LM meta survive tracker? EMB ratio (interval skip).
+        lm_ratio = (100.0 * self.face_with_user_meta / self.face_uid2
+                    if self.face_uid2 > 0 else 0.0)
+        emb_ratio = (100.0 * self.face_emb / self.face_uid2
+                     if self.face_uid2 > 0 else 0.0)
+        log.info(f"sanity_user_meta: lm={self.face_with_user_meta}/"
+                 f"{self.face_uid2} ({lm_ratio:.0f}%) "
+                 f"emb={self.face_emb}/{self.face_uid2} "
+                 f"({emb_ratio:.0f}%) total_entries={self.face_user_meta_total}")
 
 _FACE_EMBED_META_DESC = "PARKING.FACE_EMBEDDING_META"
 _FACE_EMBED_META_TYPE = None
+_FACE_LANDMARKS_META_DESC = "PARKING.FACE_LANDMARKS_META"
+_FACE_LANDMARKS_META_TYPE = None
+
+# Bit flags — phải khớp định nghĩa trong plugins/common/nvds_face_landmarks_meta.h
+# và plugins/gst-nvdsfaceembed/nvds_face_embed_meta.h.
+_FACE_LM_FLAG_VALID = 0x1
+_FACE_EMB_FLAG_VALID = 0x1
+
+# Struct versions — bump khi C struct thay đổi layout.
+_FACE_EMBED_META_VERSION = 3
+_FACE_LANDMARKS_META_VERSION = 1
 
 # nvtracker dùng UINT64_MAX cho object chưa được gán track_id.
 _UNTRACKED_OBJECT_ID = (1 << 64) - 1
@@ -93,15 +124,27 @@ _MAX_PLATE_CHARS = 9
 
 
 class _FaceEmbeddingMeta(ctypes.Structure):
+    """Slim embedding meta — version=3. Landmarks + bbox sống trong
+    _FaceLandmarksMeta (attached riêng bởi nvdsscrfddec)."""
     _fields_ = [
         ("version", ctypes.c_uint32),
         ("dims", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
         ("embedding", ctypes.c_float * 512),
+        ("quality", ctypes.c_float),
+    ]
+
+
+class _FaceLandmarksMeta(ctypes.Structure):
+    """Landmarks meta attached bởi nvdsscrfddec (hoặc bridge trong monolithic
+    embed). Embed plugin downstream đọc để align face."""
+    _fields_ = [
+        ("version", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
         ("landmarks", ctypes.c_float * 10),
         ("bbox", ctypes.c_float * 4),
-        ("quality", ctypes.c_float),
+        ("det_conf", ctypes.c_float),
     ]
 
 
@@ -111,6 +154,14 @@ def _get_face_embed_meta_type():
         _FACE_EMBED_META_TYPE = pyds.nvds_get_user_meta_type(
             _FACE_EMBED_META_DESC)
     return _FACE_EMBED_META_TYPE
+
+
+def _get_face_landmarks_meta_type():
+    global _FACE_LANDMARKS_META_TYPE
+    if _FACE_LANDMARKS_META_TYPE is None:
+        _FACE_LANDMARKS_META_TYPE = pyds.nvds_get_user_meta_type(
+            _FACE_LANDMARKS_META_DESC)
+    return _FACE_LANDMARKS_META_TYPE
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -331,16 +382,21 @@ class DeepStreamPipeline:
     def _register_local_plugins():
         """Expose repo-local GStreamer plugins without system install."""
         root = os.path.dirname(os.path.abspath(__file__))
-        plugin_dir = os.path.join(root, "plugins", "gst-nvdsfaceembed")
+        plugin_dirs = [
+            os.path.join(root, "plugins", "gst-nvdsfaceembed"),
+            os.path.join(root, "plugins", "gst-nvdsscrfddec"),
+        ]
         old = os.environ.get("GST_PLUGIN_PATH", "")
         paths = [p for p in old.split(os.pathsep) if p]
-        if plugin_dir not in paths:
-            os.environ["GST_PLUGIN_PATH"] = (
-                plugin_dir if not old else plugin_dir + os.pathsep + old)
-        try:
-            Gst.Registry.get().scan_path(plugin_dir)
-        except Exception as e:
-            log.debug(f"Local plugin scan skipped: {e}")
+        for d in plugin_dirs:
+            if d not in paths:
+                paths.insert(0, d)
+        os.environ["GST_PLUGIN_PATH"] = os.pathsep.join(paths)
+        for d in plugin_dirs:
+            try:
+                Gst.Registry.get().scan_path(d)
+            except Exception as e:
+                log.debug(f"Local plugin scan skipped ({d}): {e}")
 
     def _configure_mux(self, mux, batch_size: int = 1):
         mux.set_property("batch-size", batch_size)
@@ -459,6 +515,11 @@ class DeepStreamPipeline:
             "face_det_interval"), "face")
         self._pgie_face = pgie_face
 
+        # Decode SCRFD tensor + tạo obj_meta + attach LandmarksMeta. Chạy
+        # NGAY sau nvinfer (trước nvvideoconvert) để đọc tensor meta khi còn
+        # gần source nhất.
+        scrfddec = self._make_face_scrfddec(pipeline, ds_cfg)
+
         nvconv = self._make_element("nvvideoconvert", "face_nvconv_out",
                                     pipeline)
         capsfilter = self._make_element("capsfilter", "face_caps_rgba",
@@ -466,20 +527,17 @@ class DeepStreamPipeline:
         capsfilter.set_property(
             "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"))
 
-        embedder = self._make_face_embedder(pipeline, ds_cfg)
-        self._face_embedder = embedder
-
-        # nvtracker SAU embedder: parser SCRFD là stub, plugin tự tạo
-        # obj_meta + embedding user_meta → tracker chỉ cần gán object_id
-        # in-place lên obj_meta (user_meta được preserve). Trade-off: plugin
-        # interval skip không có hiệu lực ở vị trí này (object_id chưa biết
-        # lúc plugin chạy); muốn enable cần tách plugin thành facedet+embed.
+        # nvtracker GIỮA scrfddec và embedder — gán object_id ổn định trước
+        # khi embed plugin chạy. Mở khoá face_embed_interval skip.
         tracker = self._make_face_tracker(pipeline, ds_cfg)
         self._face_tracker = tracker
 
+        embedder = self._make_face_embedder(pipeline, ds_cfg)
+        self._face_embedder = embedder
+
         tee = self._make_element("tee", "face_tee", pipeline)
-        self._link_many([mux, pgie_face, nvconv, capsfilter,
-                         embedder, tracker, tee])
+        self._link_many([mux, pgie_face, scrfddec, nvconv, capsfilter,
+                         tracker, embedder, tee])
 
         # Nhánh META: probe đọc obj_meta + embedding, KHÔNG materialize BGR.
         meta_queue = self._make_queue("face_meta_queue", pipeline,
@@ -497,17 +555,38 @@ class DeepStreamPipeline:
         appsink.connect("new-sample", self._on_face_appsink_sample)
 
         self._attach_bus(pipeline)
-        log.info("Face pipeline: src → mux → face_det → nvtracker → "
-                 "nvdsfaceembed → tee [meta_probe | display(640×360@10fps)]")
+        log.info("Face pipeline: src → mux → face_det → scrfddec → "
+                 "nvvideoconvert(RGBA) → nvtracker → nvdsfaceembed → "
+                 "tee [meta_probe | display(640×360@10fps)]")
+
+    def _make_face_scrfddec(self, pipeline, ds_cfg):
+        """nvdsscrfddec — decode SCRFD tensor → obj_meta + LandmarksMeta.
+        Đặt giữa nvinfer SCRFD và nvtracker để tracker thấy obj_meta hợp lệ
+        và gán object_id ổn định trước khi embed plugin chạy.
+        """
+        dec = self._make_element("nvdsscrfddec", "face_scrfd_dec", pipeline)
+        dec.set_property("face-gie-id", self._face_gie_uid)
+        dec.set_property("source-id", self._face_source_id)
+        dec.set_property("net-width", self._net_w)
+        dec.set_property("net-height", self._net_w)
+        decode_thr = ds_cfg.get("face_embed_decode_conf_threshold")
+        if decode_thr is not None:
+            dec.set_property("decode-conf-threshold", float(decode_thr))
+        dec.set_property("input-object-min-width", 32)
+        dec.set_property("input-object-min-height", 32)
+        return dec
 
     def _make_face_tracker(self, pipeline, ds_cfg):
-        """nvtracker đặt SAU nvdsfaceembed — gán object_id lên obj_meta đã
-        có sẵn (SCRFD parser stub nên obj_meta do plugin tạo). Tracker chỉ
-        đọc bbox + pixel source để track, không đụng đến embedding user_meta.
+        """nvtracker đặt GIỮA nvdsscrfddec và nvdsfaceembed — gán object_id
+        ổn định lên obj_meta do scrfddec tạo, trước khi embed plugin chạy.
+        Tracker preserve obj_user_meta_list (verified DS 7.1) nên LandmarksMeta
+        đính trên obj_meta survive qua tracker, embed plugin downstream đọc lại.
 
-        Mặc định NvDCF (visual feature) thay vì IOU vì face cam parking thường
+        Lý do chọn NvDCF (visual feature) thay vì IOU: face cam parking thường
         có driver+passenger sát nhau và face hay bị che tạm (cúi xuống mở
         khoá xe). NvDCF chống ID-switch tốt hơn ~5-10× với cost 1-2 ms/frame.
+        Với object_id stable, plugin embed bật face_embed_interval=N để skip
+        embed lại track đã embed gần đây (giảm ArcFace inference rate).
         """
         tracker = self._make_element("nvtracker", "face_tracker", pipeline)
         tracker.set_property(
@@ -530,6 +609,9 @@ class DeepStreamPipeline:
         return tracker
 
     def _make_face_embedder(self, pipeline, ds_cfg):
+        """Slim embedder — chỉ align + ArcFace + quality. Decode SCRFD đã
+        chuyển sang nvdsscrfddec; landmarks đọc từ ParkingFaceLandmarksMeta
+        do scrfddec attach và tracker preserve."""
         embedder = self._make_element("nvdsfaceembed", "face_embed_aligned",
                                       pipeline)
         engine_path = ds_cfg.get(
@@ -538,6 +620,7 @@ class DeepStreamPipeline:
         embedder.set_property("engine-file", os.path.abspath(engine_path))
         embedder.set_property("gpu-id", 0)
         embedder.set_property("unique-id", 7)
+        # face-gie-id để filter obj_meta_list (chỉ embed face từ SCRFD det).
         embedder.set_property("face-gie-id", self._face_gie_uid)
         embedder.set_property("source-id", self._face_source_id)
         embedder.set_property(
@@ -548,21 +631,13 @@ class DeepStreamPipeline:
         embedder.set_property(
             "allow-cpu-fallback",
             bool(ds_cfg.get("face_embed_allow_cpu_fallback", True)))
-        # Source of truth duy nhất: config.yaml.
-        # Nếu thiếu, dùng plugin C default (0.30f).
-        decode_thr = ds_cfg.get("face_embed_decode_conf_threshold")
-        if decode_thr is not None:
-            embedder.set_property("decode-conf-threshold", float(decode_thr))
-        embedder.set_property("net-width", self._net_w)
-        embedder.set_property("net-height", self._net_w)
-        embedder.set_property("input-object-min-width", 32)
-        embedder.set_property("input-object-min-height", 32)
         embedder.set_property("min-quality",
             float(ds_cfg.get("face_embed_min_quality", 0.0)))
         embedder.set_property("blur-threshold",
             float(self.cfg.get("face", {}).get("blur_threshold", 10.0)))
         # interval=N → mỗi track chỉ embed lại sau N frame kể từ lần embed
-        # gần nhất. Yêu cầu nvtracker upstream gán object_id ổn định.
+        # gần nhất. Sau khi tách plugin + tracker upstream, knob này thật sự
+        # hiệu lực: track đã commit object_id ổn định → embed skip work.
         embed_interval = ds_cfg.get("face_embed_interval")
         if embed_interval is not None:
             try:
@@ -907,6 +982,10 @@ class DeepStreamPipeline:
         face_data = []
         total_obj = 0
         uid_match = 0
+        # SANITY_TEST counters — đếm obj_user_meta_list trên face obj_meta
+        # SAU khi tracker chạy. Xem _ProbeStats docstring.
+        user_meta_total = 0
+        face_with_um = 0
         l_obj = frame_meta.obj_meta_list
         while l_obj is not None:
             try:
@@ -916,6 +995,18 @@ class DeepStreamPipeline:
             total_obj += 1
             if obj_meta.unique_component_id == self._face_gie_uid:
                 uid_match += 1
+                # SANITY_TEST: count user_meta entries on this face obj.
+                n_um = 0
+                l_user = obj_meta.obj_user_meta_list
+                while l_user is not None:
+                    n_um += 1
+                    try:
+                        l_user = l_user.next
+                    except StopIteration:
+                        break
+                user_meta_total += n_um
+                if n_um > 0:
+                    face_with_um += 1
                 rect = obj_meta.rect_params
                 bbox = (int(rect.left), int(rect.top),
                         int(rect.left + rect.width),
@@ -927,7 +1018,7 @@ class DeepStreamPipeline:
                 l_obj = l_obj.next
             except StopIteration:
                 break
-        return face_data, total_obj, uid_match
+        return face_data, total_obj, uid_match, user_meta_total, face_with_um
 
     def _handle_plate_meta(self, buf, frame_meta):
         plate_dets = self._collect_plate_dets(frame_meta)
@@ -956,7 +1047,8 @@ class DeepStreamPipeline:
     def _handle_face_meta(self, frame_meta, now):
         size = self._frame_size_from_meta(frame_meta)
         self._face_stamp += 1
-        face_data, total_obj, uid_match = self._collect_face_data(
+        (face_data, total_obj, uid_match,
+         user_meta_total, face_with_um) = self._collect_face_data(
             frame_meta, size, self._face_stamp)
         with self._lock:
             self._face_data = face_data
@@ -974,6 +1066,9 @@ class DeepStreamPipeline:
             s.face_dets += len(face_data)
             s.face_emb += sum(
                 1 for f in face_data if f.get("embedding") is not None)
+            # SANITY_TEST accumulate.
+            s.face_with_user_meta += face_with_um
+            s.face_user_meta_total += user_meta_total
             tids_this_frame = [f.get("object_id") for f in face_data]
             tracked_now = [t for t in tids_this_frame if t is not None]
             s.face_tracked += len(tracked_now)
@@ -1004,15 +1099,28 @@ class DeepStreamPipeline:
             return None
         return (x1, y1, x2, y2)
 
-    def _read_face_embed_meta(self, obj_meta):
+    def _read_face_metas(self, obj_meta):
         """
-        Đọc PARKING.FACE_EMBEDDING_META do plugin gst-nvdsfaceembed attach
-        vào obj_meta. Plugin đã L2-normalize embedding, decode bbox từ
-        landmarks, và (v2+) tính quality score trên aligned tensor.
+        Đọc cả 2 user_meta trên obj_meta:
+          - PARKING.FACE_LANDMARKS_META  (scrfddec / bridge gắn)
+          - PARKING.FACE_EMBEDDING_META  (embed plugin gắn)
 
-        Returns: (embedding | None, face_bbox | None, quality | None)
+        Iterate obj_user_meta_list 1 lượt, tìm cả 2 meta_type. Return:
+          (embedding | None, face_bbox | None, quality | None)
+
+        - embedding chỉ None nếu plugin embed skip frame này (interval skip,
+          quality fail, hoặc chưa có embed plugin chạy).
+        - face_bbox lấy từ LandmarksMeta nếu hợp lệ; fallback None để caller
+          dùng obj_meta.rect_params.
+        - quality từ EmbeddingMeta (only set khi embed đã chạy).
         """
-        meta_type = _get_face_embed_meta_type()
+        emb_meta_type = _get_face_embed_meta_type()
+        lm_meta_type = _get_face_landmarks_meta_type()
+
+        emb = None
+        face_bbox = None
+        quality = None
+
         l_user = obj_meta.obj_user_meta_list
         while l_user is not None:
             try:
@@ -1020,48 +1128,54 @@ class DeepStreamPipeline:
             except StopIteration:
                 break
 
-            if u.base_meta.meta_type == meta_type:
-                try:
+            mt = u.base_meta.meta_type
+            try:
+                if mt == emb_meta_type:
                     ptr = pyds.get_ptr(u.user_meta_data)
                     meta = _FaceEmbeddingMeta.from_address(ptr)
-                    if meta.version not in (1, 2) or meta.dims != 512:
-                        return None, None, None
-                    emb = np.ctypeslib.as_array(meta.embedding,
-                                                shape=(512,)).copy()
-                    face_bbox = None
-                    quality = None
-                    if meta.version >= 2:
-                        b = np.ctypeslib.as_array(meta.bbox,
-                                                  shape=(4,)).copy()
-                        if np.all(np.isfinite(b)) and b[2] > b[0] and b[3] > b[1]:
-                            face_bbox = tuple(int(round(v)) for v in b)
+                    if meta.version == _FACE_EMBED_META_VERSION \
+                            and meta.dims == 512 \
+                            and (meta.flags & _FACE_EMB_FLAG_VALID):
+                        emb = np.ctypeslib.as_array(
+                            meta.embedding, shape=(512,)).copy()
                         q = float(meta.quality)
-                        # Plugin sets 0.0 nếu chưa compute (back-compat).
                         if np.isfinite(q) and q > 0.0:
                             quality = q
-                    return emb, face_bbox, quality
-                except Exception as e:
-                    self._stats.emb_read_err += 1
-                    if self._stats.emb_read_err <= 3:
-                        log.warning(f"face embed meta read err: {e}")
-                    return None, None, None
+                elif mt == lm_meta_type:
+                    ptr = pyds.get_ptr(u.user_meta_data)
+                    lm = _FaceLandmarksMeta.from_address(ptr)
+                    if lm.version == _FACE_LANDMARKS_META_VERSION \
+                            and (lm.flags & _FACE_LM_FLAG_VALID):
+                        b = np.ctypeslib.as_array(
+                            lm.bbox, shape=(4,)).copy()
+                        if np.all(np.isfinite(b)) \
+                                and b[2] > b[0] and b[3] > b[1]:
+                            face_bbox = tuple(int(round(v)) for v in b)
+            except Exception as e:
+                self._stats.emb_read_err += 1
+                if self._stats.emb_read_err <= 3:
+                    log.warning(f"face meta read err: {e}")
 
             try:
                 l_user = l_user.next
             except StopIteration:
                 break
-        return None, None, None
+
+        return emb, face_bbox, quality
 
     def _extract_face_meta(self, obj_meta, bbox: tuple,
                            frame_size=None, frame_stamp=None) -> dict:
         """
-        Trích face data từ obj_meta. Plugin attach embedding + (v2) bbox
-        decode từ landmarks + quality. PGIE rect_params làm fallback bbox.
+        Trích face data từ obj_meta:
+          - embedding + quality từ ParkingFaceEmbeddingMeta (plugin embed).
+          - bbox-from-landmarks từ ParkingFaceLandmarksMeta (scrfddec / bridge);
+            override `bbox` (= obj_meta.rect_params) khi hợp lệ — chính xác hơn
+            vì tight quanh face thật chứ không phải SCRFD anchor bbox.
         frame_size: (width, height) — dùng để clip bbox về biên frame.
         frame_stamp: counter monotonic của face probe; IdentityTracker dùng
             để dedup snapshot stale.
         """
-        emb, face_bbox, quality = self._read_face_embed_meta(obj_meta)
+        emb, face_bbox, quality = self._read_face_metas(obj_meta)
 
         final_bbox = bbox
         clipped_face_bbox = self._clip_bbox(face_bbox, frame_size)
@@ -1204,6 +1318,13 @@ class DeepStreamPipeline:
         elif t == Gst.MessageType.STREAM_START:
             src = message.src.get_name() if message.src else "?"
             log.info(f"Stream started: {src}")
+            # RTMP reconnect / publisher restart reset PTS về ~0 → key cũ
+            # trong _plate_text_by_pts có thể trùng với frame mới và bị meta
+            # probe pop nhầm. Clear cache khi stream của plate pipeline start
+            # lại (tên element plate_* đặt trong _build_plate_pipeline).
+            if "plate" in src:
+                with self._ocr_text_lock:
+                    self._plate_text_by_pts.clear()
         elif t == Gst.MessageType.EOS:
             log.warning("End of stream")
 
