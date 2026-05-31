@@ -43,7 +43,7 @@ except ImportError:
 
 
 # ──────────────────────────────────────────────
-# DeepStream Pipeline (FIXED)
+# DeepStream Pipeline
 # ──────────────────────────────────────────────
 class DeepStreamPipeline:
     """
@@ -252,7 +252,7 @@ class DeepStreamPipeline:
             self._probe_count = 0
             self._probe_t0 = now
 
-        # Early-skip: bỏ batch trước khi copy + cvtColor (Lỗi #1)
+        # Early-skip: bỏ batch trước khi copy + cvtColor
         self._probe_counter += 1
         if self._skip_n > 1 and self._probe_counter % self._skip_n != 0:
             return Gst.PadProbeReturn.OK

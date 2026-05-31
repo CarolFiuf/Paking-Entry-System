@@ -48,7 +48,7 @@ class ParkingDB:
         self.max_cap = max_cap
 
         # Connection pool: min 1, max 5 connections
-        # Tránh tạo connection mới mỗi query (FIX #2)
+        # Tránh tạo connection mới mỗi query
         self._pool = pool.ThreadedConnectionPool(
             minconn=1, maxconn=5,
             host=host, port=port, dbname=dbname,
@@ -59,7 +59,7 @@ class ParkingDB:
 
         self._init_schema()
         self._stats_lock = threading.Lock()
-        # Cache stats — chỉ cập nhật khi entry/exit (FIX #1)
+        # Cache stats — chỉ cập nhật khi entry/exit
         self._stats_cache = self._query_stats()
         log.info(f"DB ready: {self._stats_cache['current']} vehicles loaded")
 

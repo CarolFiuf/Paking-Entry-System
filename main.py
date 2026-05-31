@@ -706,7 +706,7 @@ class ParkingSystem:
                 self.state["plate_cam_ok"] = True
                 self.state["face_cam_ok"] = True
 
-                # Skip đã được xử lý trong DeepStream probe (Lỗi #1)
+                # Skip đã được xử lý trong DeepStream probe
                 ff = self._rotate_face(ff)
 
                 t0 = time.time()
