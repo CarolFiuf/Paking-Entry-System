@@ -20,7 +20,7 @@ camera:
 # DeepStream pipeline (tắt = fallback GStreamer + Python inference)
 deepstream:
   enabled: true
-  plate_enabled: false
+  plate_enabled: true
   face_enabled: true
   plate_config: "./configs/plate_det_config.txt"
   plate_ocr_config: "./configs/plate_ocr_config.txt"
