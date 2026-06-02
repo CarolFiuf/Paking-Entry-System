@@ -119,7 +119,7 @@ class PlateOCRYolo:
         self.model = YOLO(model_path, task="detect")
         # Warmup
         self.model(np.zeros((imgsz, imgsz, 3), dtype=np.uint8),
-                   verbose=False)
+                   imgsz=imgsz, verbose=False)
         log.info(f"PlateOCRYolo ready: {model_path} "
                  f"(imgsz={imgsz}, conf={conf})")
 
